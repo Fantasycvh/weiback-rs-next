@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}WeiBack - 微博列表{% endblock %}
+{% block content %}
+
+<div class="card">
+    <h2>筛选</h2>
+    <form method="get" style="display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap;">
+        <select name="uid">
+            <option value="">全部用户</option>
+            {% for u in users %}
+            <option value="{{ u.uid }}" {% if current_uid == u.uid %}selected{% endif %}>{{ u.screen_name or u.uid }}</option>
+            {% endfor %}
+        </select>
+        <button type="submit" class="btn btn-primary btn-sm">筛选</button>
+    </form>
+</div>
+
+<div class="card">
+    <h2>微博列表 (共 {{ total }} 条)</h2>
+    {% if posts %}
+    <table>
+        <tr><th>ID</th><th>用户</th><th>内容</th><th>时间</th><th>赞</th><th>评</th><th>转</th><th>图</th></tr>
+        {% for p in posts %}
+        <tr>
+            <td>{{ p.id }}</td>
+            <td>{{ p.screen_name or p.uid }}</td>
+            <td><div class="text-clamp">{{ p.text }}</div></td>
+            <td style="white-space:nowrap; font-size:0.85rem;">{{ p.created_at[:10] if p.created_at else '-' }}</td>
+            <td>{{ p.attitudes_count }}</td>
+            <td>{{ p.comments_count }}</td>
+            <td>{{ p.reposts_count }}</td>
+            <td>{{ p.pic_num }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+    {% else %}
+    <p style="color:#888">暂无微博数据</p>
+    {% endif %}
+
+    {% if total_pages > 1 %}
+    <div class="pagination">
+        {% if page > 1 %}
+        <a href="?page={{ page - 1 }}{% if current_uid %}&uid={{ current_uid }}{% endif %}">上一页</a>
+        {% endif %}
+        <span>第 {{ page }} / {{ total_pages }} 页</span>
+        {% if page < total_pages %}
+        <a href="?page={{ page + 1 }}{% if current_uid %}&uid={{ current_uid }}{% endif %}">下一页</a>
+        {% endif %}
+    </div>
+    {% endif %}
+</div>
+
+{% endblock %}

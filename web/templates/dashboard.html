@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}WeiBack - 概览{% endblock %}
+{% block content %}
+
+<div class="card">
+    <h2>同步概览</h2>
+    <div class="stat-grid">
+        <div class="stat">
+            <div class="num">{{ status.posts_count }}</div>
+            <div class="label">微博总数</div>
+        </div>
+        <div class="stat">
+            <div class="num">{{ status.total_syncs }}</div>
+            <div class="label">同步次数</div>
+        </div>
+        <div class="stat">
+            <div class="num">{{ status.total_posts }}</div>
+            <div class="label">新增微博累计</div>
+        </div>
+        <div class="stat">
+            <div class="num">{{ status.watched_users }}</div>
+            <div class="label">监控用户</div>
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <h2>操作</h2>
+    <form action="/sync/now" method="post" style="display:inline">
+        <button type="submit" class="btn btn-primary">立即同步</button>
+    </form>
+</div>
+
+<div class="card">
+    <h2>最近同步</h2>
+    {% if status.latest %}
+    <table>
+        <tr><th>时间</th><th>新增</th><th>状态</th></tr>
+        <tr>
+            <td>{{ status.latest.sync_time }}</td>
+            <td>{{ status.latest.new_posts_count }}</td>
+            <td><span class="badge {% if status.latest.status == 'success' %}badge-success{% else %}badge-failed{% endif %}">{{ status.latest.status }}</span></td>
+        </tr>
+    </table>
+    {% else %}
+    <p style="color:#888">暂无同步记录</p>
+    {% endif %}
+</div>
+
+<div class="card">
+    <h2>监控用户 ({{ users|length }})</h2>
+    {% if users %}
+    <table>
+        <tr><th>UID</th><th>昵称</th><th>活跃</th><th>最后同步</th></tr>
+        {% for u in users %}
+        <tr>
+            <td>{{ u.uid }}</td>
+            <td>{{ u.screen_name or '-' }}</td>
+            <td>{% if u.is_active %}✅{% else %}❌{% endif %}</td>
+            <td>{{ u.last_sync_at or '-' }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+    {% else %}
+    <p style="color:#888">暂无监控用户</p>
+    {% endif %}
+</div>
+
+{% endblock %}

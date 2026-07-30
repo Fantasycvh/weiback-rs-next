@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}WeiBack - 监控用户{% endblock %}
+{% block content %}
+
+<div class="card">
+    <h2>添加监控用户</h2>
+    <form action="/users/add" method="post" style="display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap;">
+        <input type="text" name="uid" placeholder="微博 UID" required>
+        <input type="text" name="screen_name" placeholder="昵称（可选）">
+        <button type="submit" class="btn btn-primary btn-sm">添加</button>
+    </form>
+</div>
+
+<div class="card">
+    <h2>监控列表 ({{ users|length }})</h2>
+    {% if users %}
+    <table>
+        <tr><th>UID</th><th>昵称</th><th>活跃</th><th>添加时间</th><th>最后同步</th><th>操作</th></tr>
+        {% for u in users %}
+        <tr>
+            <td>{{ u.uid }}</td>
+            <td>{{ u.screen_name or '-' }}</td>
+            <td>{% if u.is_active %}✅{% else %}❌{% endif %}</td>
+            <td>{{ u.added_at or '-' }}</td>
+            <td>{{ u.last_sync_at or '-' }}</td>
+            <td>
+                <form action="/users/remove" method="post" class="inline" onsubmit="return confirm('确定移除 {{ u.screen_name or u.uid }}？')">
+                    <input type="hidden" name="uid" value="{{ u.uid }}">
+                    <button type="submit" class="btn btn-danger btn-sm">移除</button>
+                </form>
+            </td>
+        </tr>
+        {% endfor %}
+    </table>
+    {% else %}
+    <p style="color:#888">暂无监控用户</p>
+    {% endif %}
+</div>
+
+{% endblock %}

@@ -1,0 +1,21 @@
+[project]
+name = "weiback"
+version = "0.4.0"
+description = "微博数据备份工具：基于 Crawl4Weibo 的增量同步 + Web GUI"
+requires-python = ">=3.11"
+dependencies = [
+    "crawl4weibo>=0.3.0",
+    "apscheduler>=3.10.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "jinja2>=3.1.0",
+]
+
+[project.scripts]
+weiback = "weibo_monitor:main"
+
+[tool.setuptools.packages.find]
+include = ["weiback*", "web*"]
+
+[tool.setuptools.package-data]
+"*" = ["templates/*.html", "static/*"]
