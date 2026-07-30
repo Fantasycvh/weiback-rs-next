@@ -1,50 +1,76 @@
-name: Build
+name: Build and Release
 
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 jobs:
   build:
+    name: Build for ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [windows-latest]
         include:
           - os: windows-latest
-            asset_name: weibo-monitor-windows-x64.exe
-
-    runs-on: ${{ matrix.os }}
+            platform: windows
+            ext: .exe
+          - os: ubuntu-latest
+            platform: linux
+            ext: ''
+          - os: macos-latest
+            platform: darwin
+            ext: ''
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller
+          pip install pyinstaller playwright
+
+      - name: Install Playwright browsers
+        run: python -m playwright install chromium
 
       - name: Build with PyInstaller
-        run: pyinstaller weibo-monitor.spec --clean
+        run: |
+          pyinstaller weibo-monitor.spec --clean --noconfirm
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset_name }}
-          path: dist/weibo-monitor.exe
+          name: weibo-monitor-${{ matrix.platform }}
+          path: dist/weibo-monitor${{ matrix.ext }}
 
   release:
+    name: Create Release
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/v')
+
     steps:
-      - uses: actions/download-artifact@v4
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
         with:
-          files: '**/*.exe'
-          draft: true
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/weibo-monitor-windows/weibo-monitor.exe
+            artifacts/weibo-monitor-linux/weibo-monitor
+            artifacts/weibo-monitor-darwin/weibo-monitor
+          draft: false
+          prerelease: false
+          generate_release_notes: true
