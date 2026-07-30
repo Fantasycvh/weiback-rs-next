@@ -10,8 +10,9 @@ datas = []
 
 try:
     datas += collect_data_files('crawl4weibo')
+    crawl4weibo_mods = collect_submodules('crawl4weibo')
 except:
-    pass
+    crawl4weibo_mods = []
 
 try:
     import playwright
@@ -24,10 +25,7 @@ datas += [
     ('web/static', 'web/static'),
 ]
 
-hiddenimports = [
-    'crawl4weibo',
-    'crawl4weibo.models',
-    'crawl4weibo.utils',
+hiddenimports = list(crawl4weibo_mods) + [
     'apscheduler',
     'apscheduler.triggers.cron',
     'apscheduler.triggers.interval',
@@ -36,6 +34,8 @@ hiddenimports = [
     'fastapi',
     'fastapi.templating',
     'fastapi.staticfiles',
+    'starlette',
+    'starlette.templating',
     'uvicorn',
     'uvicorn.lifespan.on',
     'uvicorn.protocols.http.httptools_impl',
@@ -47,10 +47,25 @@ hiddenimports = [
     'datetime',
     'logging',
     'signal',
+    'requests',
+    'lxml',
+    'lxml._elementpath',
+    'lxml.etree',
+    'tqdm',
+    'dateutil',
+    'dateutil.parser',
+    'playwright',
+    'playwright.sync_api',
+    'weiback',
+    'weiback.writer',
+    'weiback.collector',
+    'weiback.scheduler',
+    'weiback.models',
+    'web.main',
 ]
 
 a = Analysis(
-    ['weibo-monitor.py'],
+    ['weibo_monitor.py'],
     pathex=[],
     binaries=[],
     datas=datas,

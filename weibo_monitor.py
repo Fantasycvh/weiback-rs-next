@@ -11,9 +11,37 @@
 import argparse
 import logging
 import os
+import platform
+import runpy
 import sys
 import threading
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+def setup_playwright():
+    """确保 Playwright 浏览器可用（兼容 PyInstaller 打包后路径）"""
+    if platform.system() == "Windows":
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    else:
+        base = Path.home() / ".cache"
+    browsers_path = base / "ms-playwright"
+    browsers_path.mkdir(parents=True, exist_ok=True)
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(browsers_path)
+
+    if any(p.name.startswith("chromium") for p in browsers_path.iterdir()):
+        return
+
+    original_argv = sys.argv[:]
+    try:
+        sys.argv = ["playwright", "install", "chromium"]
+        runpy.run_module("playwright.__main__", run_name="__main__", alter_sys=True)
+    except Exception as e:
+        print(f"❌ 浏览器下载失败: {e}")
+        print("💡 请手动运行: playwright install chromium")
+        raise
+    finally:
+        sys.argv = original_argv
+
 
 from weiback import writer, collector
 from weiback.scheduler import SyncScheduler
@@ -73,6 +101,7 @@ def main():
 
 
 def _cmd_backfill(args):
+    setup_playwright()
     from crawl4weibo import WeiboClient
     conn = writer.connect(args.db_path)
     client = WeiboClient()
@@ -82,6 +111,7 @@ def _cmd_backfill(args):
 
 
 def _cmd_now(args):
+    setup_playwright()
     from crawl4weibo import WeiboClient
     conn = writer.connect(args.db_path)
     client = WeiboClient()
@@ -108,6 +138,7 @@ def _cmd_now(args):
 
 
 def _start_daemon(args):
+    setup_playwright()
     import uvicorn
     from web.main import create_app
 
