@@ -1,0 +1,11 @@
+{% if media %}
+<div class="media-grid">
+    {% for item in media %}
+        {% if item.media_type == 'image' or item.media_type == 'avatar' %}
+        <a href="{{ item.display_url }}" target="_blank" rel="noopener"><img src="{{ item.display_url }}" loading="lazy" alt="媒体图片"></a>
+        {% else %}
+        <a href="{{ item.display_url }}" target="_blank" rel="noopener">查看{{ '视频' if item.media_type == 'video' else '媒体' }}</a>
+        {% endif %}
+    {% endfor %}
+</div>
+{% endif %}

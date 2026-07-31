@@ -76,6 +76,30 @@ class TestSavePosts:
         assert get_last_post_id(conn, 2) == 20
         assert get_last_post_id(conn, 3) == 0
 
+    def test_refresh_preserves_local_state(self, conn):
+        from weiback.writer import save_posts
+
+        save_posts(conn, [{"id": 1, "uid": 2, "text": "old", "created_at": ""}])
+        conn.execute("UPDATE posts SET deleted=1, favorited=1, edit_count=4 WHERE id=1")
+        save_posts(conn, [{
+            "id": 1,
+            "uid": 2,
+            "text": "new",
+            "created_at": "",
+            "comments_count": 9,
+        }])
+
+        row = conn.execute(
+            "SELECT text, comments_count, deleted, favorited, edit_count FROM posts WHERE id=1"
+        ).fetchone()
+        assert dict(row) == {
+            "text": "new",
+            "comments_count": 9,
+            "deleted": 1,
+            "favorited": 1,
+            "edit_count": 4,
+        }
+
 
 class TestSaveComments:
     def test_save_and_count(self, conn):
@@ -97,6 +121,39 @@ class TestSaveComments:
         row = conn.execute("SELECT text FROM comments WHERE id='c1'").fetchone()
         assert row["text"] == "new"
 
+    def test_saves_comment_media_and_avatar(self, conn):
+        from weiback.writer import save_comments
+
+        save_comments(conn, [{
+            "id": "c1",
+            "post_id": 100,
+            "user_id": "9",
+            "user_screen_name": "评论者",
+            "text": "图评",
+            "pic_url": "https://example.com/comment.jpg",
+            "user_avatar_url": "https://example.com/avatar.jpg",
+            "root_id": "c1",
+            "depth": 0,
+        }])
+
+        rows = conn.execute(
+            "SELECT owner_type, owner_id, media_type, url FROM media ORDER BY media_type"
+        ).fetchall()
+        assert [dict(row) for row in rows] == [
+            {
+                "owner_type": "user",
+                "owner_id": "9",
+                "media_type": "avatar",
+                "url": "https://example.com/avatar.jpg",
+            },
+            {
+                "owner_type": "comment",
+                "owner_id": "c1",
+                "media_type": "image",
+                "url": "https://example.com/comment.jpg",
+            },
+        ]
+
 
 class TestSavePictures:
     def test_save_pictures(self, conn):
@@ -114,6 +171,20 @@ class TestSavePictures:
         save_pictures(conn, 1001, [])
         count = conn.execute("SELECT COUNT(*) FROM picture WHERE post_id=1001").fetchone()[0]
         assert count == 0
+
+    def test_duplicate_url_keeps_downloaded_path(self, conn):
+        from weiback.writer import save_pictures, update_picture_path
+
+        url = "https://example.com/pic.jpg?token=first"
+        save_pictures(conn, 1001, [url], user_id=12345)
+        update_picture_path(conn, "https://example.com/pic.jpg", "1001/pic.jpg")
+        save_pictures(conn, 1001, ["https://example.com/pic.jpg?token=second"], user_id=12345)
+
+        rows = conn.execute(
+            "SELECT url, path FROM picture WHERE post_id=1001"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["path"] == "1001/pic.jpg"
 
 
 class TestMonitoredUsers:
@@ -196,6 +267,12 @@ class TestCommentsProgress:
         assert len(uncommented) == 2
         assert 2 not in {r["id"] for r in uncommented}
 
+        conn.execute(
+            "UPDATE comments_sync_progress SET status='failed' WHERE post_id=2"
+        )
+        uncommented = get_uncommented_posts(conn, limit=10)
+        assert 2 in {r["id"] for r in uncommented}
+
     def test_empty_uncommented(self, conn):
         from weiback.writer import get_uncommented_posts
         result = get_uncommented_posts(conn, limit=10)
@@ -209,3 +286,17 @@ class TestSaveVideo:
         row = conn.execute("SELECT * FROM video WHERE post_id=1001").fetchone()
         assert row is not None
         assert row["url"] == "https://example.com/video.mp4"
+
+    def test_duplicate_video_keeps_downloaded_path(self, conn):
+        from weiback.writer import save_video
+
+        url = "https://example.com/video.mp4"
+        save_video(conn, url, "/local/video.mp4", 1001)
+        save_video(conn, url, "", 1001)
+
+        rows = conn.execute(
+            "SELECT url, path FROM video WHERE post_id=? AND url=?",
+            (1001, url),
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["path"] == "/local/video.mp4"

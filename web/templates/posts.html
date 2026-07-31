@@ -5,13 +5,23 @@
 <div class="card">
     <h2>筛选</h2>
     <form method="get" style="display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap;">
+        <input type="search" name="q" value="{{ q }}" placeholder="搜索正文">
         <select name="uid">
             <option value="">全部用户</option>
             {% for u in users %}
             <option value="{{ u.uid }}" {% if current_uid == u.uid %}selected{% endif %}>{{ u.screen_name or u.uid }}</option>
             {% endfor %}
         </select>
+        <input type="date" name="date_from" value="{{ date_from }}" aria-label="起始日期">
+        <input type="date" name="date_to" value="{{ date_to }}" aria-label="结束日期">
+        <select name="content_status">
+            <option value="">全部内容状态</option>
+            <option value="complete" {% if content_status == 'complete' %}selected{% endif %}>完整</option>
+            <option value="partial" {% if content_status == 'partial' %}selected{% endif %}>不完整</option>
+            <option value="failed" {% if content_status == 'failed' %}selected{% endif %}>失败</option>
+        </select>
         <button type="submit" class="btn btn-primary btn-sm">筛选</button>
+        <a href="/posts" class="btn btn-sm">清空</a>
     </form>
 </div>
 
@@ -24,7 +34,7 @@
         <tr>
             <td>{{ p.id }}</td>
             <td>{{ p.screen_name or p.uid }}</td>
-            <td><div class="text-clamp">{{ p.text }}</div></td>
+            <td><a href="/posts/{{ p.id }}"><div class="text-clamp">{{ p.text }}</div></a></td>
             <td style="white-space:nowrap; font-size:0.85rem;">{{ p.created_at[:10] if p.created_at else '-' }}</td>
             <td>{{ p.attitudes_count }}</td>
             <td>{{ p.comments_count }}</td>
@@ -40,11 +50,11 @@
     {% if total_pages > 1 %}
     <div class="pagination">
         {% if page > 1 %}
-        <a href="?page={{ page - 1 }}{% if current_uid %}&uid={{ current_uid }}{% endif %}">上一页</a>
+        <a href="?page={{ page - 1 }}{% if filter_query %}&{{ filter_query }}{% endif %}">上一页</a>
         {% endif %}
         <span>第 {{ page }} / {{ total_pages }} 页</span>
         {% if page < total_pages %}
-        <a href="?page={{ page + 1 }}{% if current_uid %}&uid={{ current_uid }}{% endif %}">下一页</a>
+        <a href="?page={{ page + 1 }}{% if filter_query %}&{{ filter_query }}{% endif %}">下一页</a>
         {% endif %}
     </div>
     {% endif %}

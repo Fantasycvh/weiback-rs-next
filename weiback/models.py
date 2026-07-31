@@ -1,3 +1,6 @@
+SCHEMA_VERSION = 2
+
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY,
@@ -35,7 +38,18 @@ CREATE TABLE IF NOT EXISTS posts (
     url_struct TEXT,
     deleted INTEGER DEFAULT 0,
     edit_count INTEGER DEFAULT 0,
-    favorited INTEGER DEFAULT 0
+    favorited INTEGER DEFAULT 0,
+    bid TEXT,
+    location TEXT,
+    topic_ids TEXT,
+    at_users TEXT,
+    is_long_text INTEGER DEFAULT 0,
+    video_url TEXT,
+    raw_data TEXT,
+    content_status TEXT NOT NULL DEFAULT 'partial',
+    fetch_error TEXT,
+    first_fetched_at TEXT,
+    last_refreshed_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS comments (
@@ -46,7 +60,19 @@ CREATE TABLE IF NOT EXISTS comments (
     text TEXT,
     created_at TEXT,
     like_count INTEGER DEFAULT 0,
-    reply_id TEXT
+    reply_id TEXT,
+    root_id TEXT,
+    parent_id TEXT,
+    depth INTEGER NOT NULL DEFAULT 0,
+    source TEXT,
+    user_avatar_url TEXT,
+    user_verified INTEGER DEFAULT 0,
+    liked INTEGER DEFAULT 0,
+    reply_text TEXT,
+    pic_url TEXT,
+    child_count INTEGER DEFAULT 0,
+    raw_data TEXT,
+    last_refreshed_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_comments_post_id ON comments(post_id);
@@ -87,9 +113,86 @@ CREATE INDEX IF NOT EXISTS idx_sync_history_uid ON sync_history(uid);
 
 CREATE TABLE IF NOT EXISTS comments_sync_progress (
     post_id INTEGER PRIMARY KEY,
-    synced_at TEXT DEFAULT (datetime('now'))
+    status TEXT NOT NULL DEFAULT 'pending',
+    cursor TEXT,
+    fetched_count INTEGER DEFAULT 0,
+    error_message TEXT,
+    synced_at TEXT,
+    updated_at TEXT DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS comment_reply_progress (
+    root_comment_id TEXT PRIMARY KEY,
+    post_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    max_id TEXT DEFAULT '0',
+    max_id_type INTEGER DEFAULT 0,
+    fetched_count INTEGER DEFAULT 0,
+    error_message TEXT,
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_reply_progress_post_id
+ON comment_reply_progress(post_id);
+
+CREATE TABLE IF NOT EXISTS media (
+    id TEXT PRIMARY KEY,
+    owner_type TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    post_id INTEGER,
+    user_id TEXT,
+    media_type TEXT NOT NULL,
+    url TEXT NOT NULL,
+    path TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    error_message TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(owner_type, owner_id, media_type, url)
+);
+
+CREATE INDEX IF NOT EXISTS idx_media_post_id ON media(post_id);
+CREATE INDEX IF NOT EXISTS idx_media_owner ON media(owner_type, owner_id);
 """
+
+
+POST_MIGRATION_COLUMNS = {
+    "bid": "TEXT",
+    "location": "TEXT",
+    "topic_ids": "TEXT",
+    "at_users": "TEXT",
+    "is_long_text": "INTEGER DEFAULT 0",
+    "video_url": "TEXT",
+    "raw_data": "TEXT",
+    "content_status": "TEXT NOT NULL DEFAULT 'partial'",
+    "fetch_error": "TEXT",
+    "first_fetched_at": "TEXT",
+    "last_refreshed_at": "TEXT",
+}
+
+COMMENT_MIGRATION_COLUMNS = {
+    "root_id": "TEXT",
+    "parent_id": "TEXT",
+    "depth": "INTEGER NOT NULL DEFAULT 0",
+    "source": "TEXT",
+    "user_avatar_url": "TEXT",
+    "user_verified": "INTEGER DEFAULT 0",
+    "liked": "INTEGER DEFAULT 0",
+    "reply_text": "TEXT",
+    "pic_url": "TEXT",
+    "child_count": "INTEGER DEFAULT 0",
+    "raw_data": "TEXT",
+    "last_refreshed_at": "TEXT",
+}
+
+COMMENT_PROGRESS_MIGRATION_COLUMNS = {
+    "status": "TEXT NOT NULL DEFAULT 'pending'",
+    "cursor": "TEXT",
+    "fetched_count": "INTEGER DEFAULT 0",
+    "error_message": "TEXT",
+    "updated_at": "TEXT",
+}
 
 INSERT_MONITORED_USER = """
 INSERT OR IGNORE INTO monitored_users (uid, screen_name)
@@ -139,11 +242,35 @@ SELECT_UNCOMMENTED_POSTS = """
 SELECT p.id, p.uid
 FROM posts p
 LEFT JOIN comments_sync_progress csp ON p.id = csp.post_id
-WHERE csp.post_id IS NULL
+WHERE csp.post_id IS NULL OR csp.status != 'complete'
 ORDER BY p.id DESC
 LIMIT ?
 """
 
 INSERT_COMMENTS_PROGRESS = """
-INSERT OR IGNORE INTO comments_sync_progress (post_id) VALUES (?)
+INSERT INTO comments_sync_progress (post_id, status, synced_at, updated_at)
+VALUES (?, 'complete', datetime('now'), datetime('now'))
+ON CONFLICT(post_id) DO UPDATE SET
+    status='complete', error_message=NULL,
+    synced_at=datetime('now'), updated_at=datetime('now')
+"""
+
+
+SELECT_PICTURES_WITHOUT_PATH = """
+SELECT id, url, post_id, user_id
+FROM picture
+WHERE path IS NULL OR path = ''
+ORDER BY post_id DESC
+LIMIT ?
+"""
+
+SELECT_PICTURES_WITHOUT_PATH_LIMITLESS = """
+SELECT id, url, post_id, user_id
+FROM picture
+WHERE path IS NULL OR path = ''
+ORDER BY post_id DESC
+"""
+
+UPDATE_PICTURE_PATH = """
+UPDATE picture SET path=? WHERE url=?
 """

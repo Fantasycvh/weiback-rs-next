@@ -1,13 +1,18 @@
 import logging
 import time
 import random
+import json
 from datetime import datetime, timezone, timedelta
 
 from . import writer
+from .task_manager import TaskManager, TaskType
+from .weibo_adapter import parse_child_comment, unpack_child_comment_page
 
 logger = logging.getLogger(__name__)
 
 TZ_CST = timezone(timedelta(hours=8))
+
+DEFAULT_PAGE_DELAY = 3.0
 
 
 def _pic_urls_to_list(post) -> list[str]:
@@ -32,7 +37,7 @@ def _post_to_dict(post, uid: int) -> dict:
         "pic_infos": None,
         "pic_num": len(_pic_urls_to_list(post)),
         "geo": None,
-        "mblogid": getattr(post, "mblogid", None),
+        "mblogid": getattr(post, "mblogid", None) or getattr(post, "bid", None),
         "mix_media_ids": None,
         "mix_media_info": None,
         "page_info": None,
@@ -40,19 +45,68 @@ def _post_to_dict(post, uid: int) -> dict:
         "source": getattr(post, "source", None),
         "tag_struct": None,
         "url_struct": None,
+        "bid": getattr(post, "bid", None),
+        "location": getattr(post, "location", None),
+        "topic_ids": _json_value(getattr(post, "topic_ids", None)),
+        "at_users": _json_value(getattr(post, "at_users", None)),
+        "is_long_text": bool(getattr(post, "is_long_text", False)),
+        "video_url": getattr(post, "video_url", None),
+        "raw_data": _json_value(getattr(post, "raw_data", None)),
+        "content_status": "complete",
     }
 
 
-def _comment_to_dict(comment, post_id: int) -> dict:
+def _json_value(value) -> str | None:
+    if value is None:
+        return None
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _post_uid(post, fallback_uid: int) -> int:
+    value = getattr(post, "user_id", None)
+    try:
+        return int(value) if value is not None else fallback_uid
+    except (TypeError, ValueError):
+        return fallback_uid
+
+
+def _post_tree(post, fallback_uid: int):
+    yield post, _post_uid(post, fallback_uid)
+    retweeted = getattr(post, "retweeted_status", None)
+    if retweeted is not None:
+        yield from _post_tree(retweeted, fallback_uid)
+
+
+def _comment_to_dict(
+    comment,
+    post_id: int,
+    *,
+    root_id: str | None = None,
+    parent_id: str | None = None,
+    depth: int = 0,
+) -> dict:
+    comment_id = str(comment.id) if comment.id else f"{post_id}_{hash(comment)}"
+    reply_id = getattr(comment, "reply_id", None)
     return {
-        "id": str(comment.id) if comment.id else f"{post_id}_{hash(comment)}",
+        "id": comment_id,
         "post_id": post_id,
         "user_id": getattr(comment, "user_id", None),
         "user_screen_name": getattr(comment, "user_screen_name", None),
         "text": getattr(comment, "text", None),
         "created_at": _to_rfc3339(comment.created_at) if hasattr(comment, "created_at") and comment.created_at else None,
         "like_count": getattr(comment, "like_counts", 0) or 0,
-        "reply_id": getattr(comment, "reply_id", None),
+        "reply_id": reply_id,
+        "root_id": root_id or comment_id,
+        "parent_id": parent_id,
+        "depth": depth,
+        "source": getattr(comment, "source", None),
+        "user_avatar_url": getattr(comment, "user_avatar_url", None),
+        "user_verified": bool(getattr(comment, "user_verified", False)),
+        "liked": bool(getattr(comment, "liked", False)),
+        "reply_text": getattr(comment, "reply_text", None),
+        "pic_url": getattr(comment, "pic_url", None),
+        "child_count": getattr(comment, "child_count", 0) or 0,
+        "raw_data": _json_value(getattr(comment, "raw_data", None)),
     }
 
 
@@ -62,10 +116,14 @@ def _to_rfc3339(dt: datetime) -> str:
     return dt.isoformat()
 
 
-def sync_user(conn, client, uid: str, max_pages: int = 5, with_comments: bool = False) -> int:
+SAFETY_MAX_PAGES = 1000
+
+
+def sync_user(conn, client, uid: str, max_pages: int | None = None, with_comments: bool = False,
+              task_manager: TaskManager | None = None, page_delay: float | None = None) -> int:
     self_uid = int(uid)
     last_id = writer.get_last_post_id(conn, self_uid)
-    logger.info("同步 uid=%s (最后ID=%d)", uid, last_id)
+    logger.info("同步 uid=%s (最后ID=%s, max_pages=%s)", uid, last_id, max_pages or "不限")
 
     user_obj = client.get_user_by_uid(uid=uid)
     writer.save_user(conn, {
@@ -78,37 +136,80 @@ def sync_user(conn, client, uid: str, max_pages: int = 5, with_comments: bool = 
         "following": getattr(user_obj, "following", False),
         "follow_me": getattr(user_obj, "follow_me", False),
     })
+    avatar_url = (
+        getattr(user_obj, "avatar_hd", None)
+        or getattr(user_obj, "avatar_large", None)
+        or getattr(user_obj, "profile_image_url", None)
+    )
+    if avatar_url:
+        writer.save_media(
+            conn,
+            owner_type="user",
+            owner_id=str(self_uid),
+            media_type="avatar",
+            url=avatar_url,
+            user_id=str(self_uid),
+        )
 
     new_count = 0
-    for page in range(1, max_pages + 1):
-        posts = client.get_user_posts(
-            uid=uid, page=page, expand="all",
-            with_comments=with_comments, comment_limit=10,
-        )
+    page_limit = max_pages if max_pages and max_pages > 0 else SAFETY_MAX_PAGES
+    for page in range(1, page_limit + 1):
+        try:
+            posts = client.get_user_posts(
+                uid=uid, page=page, expand=True,
+                with_comments=with_comments, comment_limit=10,
+            )
+        except Exception as e:
+            logger.warning("第 %d 页获取失败: %s", page, e)
+            if task_manager:
+                task_manager.report_error("fetch_page", str(e), f"page_{page}")
+            if page_delay:
+                time.sleep(page_delay)
+            continue
+
         if not posts:
+            if max_pages is None:
+                logger.info("翻页结束: uid=%s, 第 %d 页无数据", uid, page)
             break
 
         batch = []
+        batch_ids: set[int] = set()
         for post in posts:
             post_id = int(post.id)
-            if post_id <= last_id:
-                conn.commit()
-                return new_count
+            was_present = writer.post_exists(conn, post_id)
+            if not was_present:
+                new_count += 1
 
-            post_data = _post_to_dict(post, self_uid)
-            batch.append(post_data)
+            for tree_post, tree_uid in _post_tree(post, self_uid):
+                tree_post_id = int(tree_post.id)
+                if tree_post_id not in batch_ids:
+                    batch.append(_post_to_dict(tree_post, tree_uid))
+                    batch_ids.add(tree_post_id)
 
-            if post.pic_urls:
-                writer.save_pictures(conn, post_id, post.pic_urls, self_uid)
+                pic_urls = _pic_urls_to_list(tree_post)
+                if pic_urls:
+                    writer.save_pictures(conn, tree_post_id, pic_urls, tree_uid)
+                video_url = getattr(tree_post, "video_url", None)
+                if video_url:
+                    writer.save_video(conn, video_url, "", tree_post_id)
 
             if with_comments and getattr(post, "comments", None):
                 comments = [_comment_to_dict(c, post_id) for c in post.comments if c]
                 writer.save_comments(conn, comments)
                 writer.mark_comments_synced(conn, post_id)
 
-        writer.save_posts(conn, batch)
-        conn.commit()
-        new_count += len(batch)
+        if batch:
+            writer.save_posts(conn, batch)
+            conn.commit()
+
+        if task_manager:
+            task_manager.update_progress(page, page_limit)
+
+        if new_count > 0:
+            logger.info("同步进度: uid=%s, 已获取 %d 条 (第 %d/%d 页)", uid, new_count, page, page_limit)
+
+        if page_delay and page < page_limit:
+            time.sleep(page_delay)
 
     conn.commit()
     logger.info("同步完成: uid=%s, 新增 %d 条", uid, new_count)
@@ -124,21 +225,154 @@ def backfill_comments(conn, client, limit: int = 50, post_delay: tuple[float, fl
     fetched = 0
     for i, row in enumerate(posts, 1):
         post_id = str(row["id"])
-        try:
-            comments = client.get_all_comments(post_id, max_pages=max_pages, use_proxy=True)
-        except Exception as e:
-            logger.warning("[%d/%d] 帖子 %s 评论抓取失败: %s", i, len(posts), post_id, e)
-            continue
+        progress = writer.get_comments_progress(conn, row["id"])
+        page = int(progress["cursor"] or 1) if progress else 1
+        total_fetched = int(progress["fetched_count"] or 0) if progress else 0
+        pages_this_run = 0
+        got_comments = False
 
-        if comments:
-            writer.save_comments(conn, [_comment_to_dict(c, row["id"]) for c in comments])
+        while max_pages is None or pages_this_run < max_pages:
+            try:
+                comments, pagination = client.get_comments(
+                    post_id, page=page, use_proxy=True
+                )
+                pages_this_run += 1
+                if comments:
+                    writer.save_comments(
+                        conn,
+                        [_comment_to_dict(c, row["id"]) for c in comments],
+                    )
+                    got_comments = True
+                    total_fetched += len(comments)
+
+                next_page = page + 1
+                max_page = int(pagination.get("max", 0) or 0)
+                complete = not comments or (max_page > 0 and page >= max_page)
+                writer.save_comments_progress(
+                    conn,
+                    post_id=row["id"],
+                    status="complete" if complete else "running",
+                    cursor=str(next_page),
+                    fetched_count=total_fetched,
+                )
+                conn.commit()
+                page = next_page
+                if complete:
+                    break
+            except Exception as e:
+                writer.save_comments_progress(
+                    conn,
+                    post_id=row["id"],
+                    status="failed",
+                    cursor=str(page),
+                    fetched_count=total_fetched,
+                    error_message=str(e),
+                )
+                conn.commit()
+                logger.warning(
+                    "[%d/%d] 帖子 %s 评论第 %d 页抓取失败: %s",
+                    i,
+                    len(posts),
+                    post_id,
+                    page,
+                    e,
+                )
+                break
+
+        if got_comments:
             fetched += 1
-
-        writer.mark_comments_synced(conn, row["id"])
-        conn.commit()
 
         if post_delay and i < len(posts):
             time.sleep(random.uniform(*post_delay))
 
     logger.info("评论回补完成: 处理 %d 帖, 有评论 %d 帖", len(posts), fetched)
     return fetched
+
+
+def fetch_comment_replies(
+    conn,
+    client,
+    post_id: int,
+    root_comment_id: str,
+    *,
+    page_delay: float = DEFAULT_PAGE_DELAY,
+) -> int:
+    """Fetch all replies for one root comment, resuming from its last cursor."""
+    root_comment_id = str(root_comment_id)
+    progress = writer.get_comment_reply_progress(conn, root_comment_id)
+    max_id = str(progress["max_id"]) if progress else "0"
+    max_id_type = int(progress["max_id_type"]) if progress else 0
+    total_fetched = int(progress["fetched_count"]) if progress else 0
+    fetched_this_run = 0
+
+    while True:
+        try:
+            response = client._request(
+                "https://m.weibo.cn/comments/hotFlowChild",
+                params={
+                    "cid": root_comment_id,
+                    "max_id": int(max_id) if max_id.isdigit() else max_id,
+                    "max_id_type": max_id_type,
+                },
+                use_proxy=True,
+            )
+            raw_comments, next_max_id, next_max_id_type = (
+                unpack_child_comment_page(response)
+            )
+            comments = []
+            for raw in raw_comments:
+                if not isinstance(raw, dict):
+                    continue
+                parsed = parse_child_comment(raw)
+                reply_id = getattr(parsed, "reply_id", None)
+                parent_id = str(reply_id) if reply_id else root_comment_id
+                comments.append(
+                    _comment_to_dict(
+                        parsed,
+                        post_id,
+                        root_id=root_comment_id,
+                        parent_id=parent_id,
+                        depth=1,
+                    )
+                )
+
+            writer.save_comments(conn, comments)
+            fetched_this_run += len(comments)
+            total_fetched += len(comments)
+            max_id = next_max_id
+            max_id_type = next_max_id_type
+            status = "complete" if max_id == "0" else "running"
+            writer.save_comment_reply_progress(
+                conn,
+                root_comment_id=root_comment_id,
+                post_id=post_id,
+                status=status,
+                max_id=max_id,
+                max_id_type=max_id_type,
+                fetched_count=total_fetched,
+            )
+            conn.commit()
+
+            if max_id == "0":
+                return fetched_this_run
+            if page_delay:
+                time.sleep(page_delay)
+        except Exception as exc:
+            writer.save_comment_reply_progress(
+                conn,
+                root_comment_id=root_comment_id,
+                post_id=post_id,
+                status="failed",
+                max_id=max_id,
+                max_id_type=max_id_type,
+                fetched_count=total_fetched,
+                error_message=str(exc),
+            )
+            conn.commit()
+            logger.warning(
+                "评论 %s 的二级回复抓取失败，保留游标 %s: %s",
+                root_comment_id,
+                max_id,
+                exc,
+            )
+            return fetched_this_run

@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}WeiBack - 微博 {{ post.id }}{% endblock %}
+{% block content %}
+
+<p style="margin-bottom:1rem;"><a href="/posts">返回微博列表</a></p>
+
+<article class="card">
+    <h2>{{ post.screen_name or post.uid }}</h2>
+    <div class="post-text">{{ post.text }}</div>
+    {% with media=post.media %}{% include "post_media.html" %}{% endwith %}
+    <div class="post-meta">
+        {{ post.created_at or '时间未知' }} · 赞 {{ post.attitudes_count }} · 评论 {{ post.comments_count }} · 转发 {{ post.reposts_count }}
+        · 内容状态 {{ post.content_status }}
+    </div>
+
+    {% if retweeted %}
+    <section class="repost">
+        <h2>转发原文 · {{ retweeted.screen_name or retweeted.uid }}</h2>
+        <div class="post-text">{{ retweeted.text }}</div>
+        {% with media=retweeted.media %}{% include "post_media.html" %}{% endwith %}
+        <div class="post-meta">{{ retweeted.created_at or '时间未知' }}</div>
+    </section>
+    {% elif post.retweeted_id %}
+    <section class="repost"><p style="color:#888;">转发原文未收录或已不可用（ID {{ post.retweeted_id }}）</p></section>
+    {% endif %}
+</article>
+
+<section class="card">
+    <h2>评论 ({{ comments|length }} 条一级评论)</h2>
+    {% if comments %}
+        {% for comment in comments %}
+        <article class="comment">
+            <div class="comment-author">{{ comment.user_screen_name or comment.user_id or '未知用户' }}</div>
+            <div class="post-text">{{ comment.text or '' }}</div>
+            {% with media=comment.media %}{% include "post_media.html" %}{% endwith %}
+            <div class="post-meta">{{ comment.created_at or '时间未知' }} · 赞 {{ comment.like_count }}</div>
+            <form method="post" action="/comments/{{ comment.id }}/replies" style="margin-top:.5rem;">
+                <button type="submit">{{ '刷新回复' if comment.replies else '加载回复' }}</button>
+            </form>
+            {% if comment.replies %}
+            <div class="comment-replies">
+                {% for reply in comment.replies %}
+                <article class="comment">
+                    <div class="comment-author">{{ reply.user_screen_name or reply.user_id or '未知用户' }}</div>
+                    <div class="post-text">{{ reply.text or '' }}</div>
+                    {% with media=reply.media %}{% include "post_media.html" %}{% endwith %}
+                    <div class="post-meta">{{ reply.created_at or '时间未知' }} · 赞 {{ reply.like_count }}</div>
+                </article>
+                {% endfor %}
+            </div>
+            {% endif %}
+        </article>
+        {% endfor %}
+    {% else %}
+    <p style="color:#888;">暂无评论数据</p>
+    {% endif %}
+</section>
+
+{% endblock %}

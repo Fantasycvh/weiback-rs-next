@@ -22,7 +22,6 @@ except:
 
 datas += [
     ('web/templates', 'web/templates'),
-    ('web/static', 'web/static'),
 ]
 
 hiddenimports = list(crawl4weibo_mods) + [
@@ -55,8 +54,10 @@ hiddenimports = list(crawl4weibo_mods) + [
     'dateutil',
     'dateutil.parser',
     'playwright',
+    'playwright.__main__',
     'playwright.sync_api',
     'weiback',
+    'weiback.browser',
     'weiback.writer',
     'weiback.collector',
     'weiback.scheduler',

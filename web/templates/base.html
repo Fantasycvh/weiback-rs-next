@@ -40,6 +40,21 @@
         .flash { padding: 0.75rem; border-radius: 6px; margin-bottom: 1rem; }
         .flash-info { background: #e3f2fd; color: #1565c0; }
         form.inline { display: inline; }
+        .post-text { white-space: pre-wrap; line-height: 1.7; overflow-wrap: anywhere; }
+        .post-meta { color: #777; font-size: 0.85rem; margin-top: 0.75rem; }
+        .repost { border-left: 3px solid #ddd; padding-left: 1rem; margin-top: 1rem; }
+        .media-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 0.75rem; margin-top: 1rem; }
+        .media-grid img { width: 100%; max-height: 320px; object-fit: contain; background: #f2f2f2; }
+        .comment { padding: 0.9rem 0; border-bottom: 1px solid #eee; }
+        .comment-author { font-weight: 600; margin-bottom: 0.3rem; }
+        .comment-replies { margin: 0.6rem 0 0 1.5rem; padding-left: 1rem; border-left: 2px solid #eee; }
+        @media (max-width: 640px) {
+            nav { padding: 0.8rem 1rem; gap: 0.4rem; flex-wrap: wrap; }
+            .container { margin: 1rem auto; }
+            .card { padding: 1rem; }
+            table { display: block; overflow-x: auto; }
+            .comment-replies { margin-left: 0.5rem; }
+        }
     </style>
 </head>
 <body>

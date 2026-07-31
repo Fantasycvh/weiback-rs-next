@@ -97,6 +97,35 @@ class TestPostToDict:
         assert d["comments_count"] == 0
         assert d["reposts_count"] == 0
 
+    def test_complete_fields_are_serialized(self):
+        import json
+        from weiback.collector import _post_to_dict
+
+        post = MockPost(
+            id="1",
+            bid="bid-1",
+            user_id="22",
+            text="完整内容",
+            created_at=None,
+            pic_urls=["https://example.com/a.jpg"],
+            video_url="https://example.com/a.mp4",
+            location="北京",
+            topic_ids=["话题A"],
+            at_users=["用户B"],
+            is_long_text=True,
+            raw_data={"source": "crawl4weibo", "nested": {"ok": True}},
+        )
+
+        result = _post_to_dict(post, uid=22)
+
+        assert result["bid"] == "bid-1"
+        assert result["video_url"] == "https://example.com/a.mp4"
+        assert result["location"] == "北京"
+        assert json.loads(result["topic_ids"]) == ["话题A"]
+        assert json.loads(result["at_users"]) == ["用户B"]
+        assert json.loads(result["raw_data"])["nested"]["ok"] is True
+        assert result["content_status"] == "complete"
+
 
 class TestCommentToDict:
     def test_basic_fields(self):
@@ -137,3 +166,295 @@ class TestCommentToDict:
         assert d["user_id"] is None
         assert d["text"] is None
         assert d["like_count"] == 0
+
+    def test_complete_comment_fields_and_media(self):
+        import json
+        from weiback.collector import _comment_to_dict
+
+        comment = MockPost(
+            id="child-1",
+            user_id="9",
+            user_screen_name="回复者",
+            user_avatar_url="https://example.com/avatar.jpg",
+            user_verified=True,
+            text="二级回复",
+            created_at=None,
+            source="Android",
+            like_counts=2,
+            liked=True,
+            reply_id="other-child",
+            reply_text="被回复内容",
+            pic_url="https://example.com/comment.jpg",
+            raw_data={"id": "child-1"},
+        )
+
+        result = _comment_to_dict(
+            comment,
+            post_id=100,
+            root_id="root-1",
+            parent_id="other-child",
+            depth=1,
+        )
+
+        assert result["root_id"] == "root-1"
+        assert result["parent_id"] == "other-child"
+        assert result["depth"] == 1
+        assert result["user_avatar_url"].endswith("avatar.jpg")
+        assert result["pic_url"].endswith("comment.jpg")
+        assert json.loads(result["raw_data"])["id"] == "child-1"
+
+
+class TestSyncUser:
+    def test_refreshes_existing_post_and_saves_retweet_media(self, conn):
+        from weiback.collector import sync_user
+        from weiback.writer import save_posts
+
+        save_posts(conn, [{"id": 100, "uid": 7, "text": "旧正文", "created_at": ""}])
+        retweet = MockPost(
+            id="90",
+            user_id="8",
+            text="转发原文",
+            created_at=None,
+            pic_urls=["https://example.com/retweet.jpg"],
+            video_url="https://example.com/retweet.mp4",
+            retweeted_status=None,
+        )
+        post = MockPost(
+            id="100",
+            user_id="7",
+            text="更新正文",
+            created_at=None,
+            pic_urls=["https://example.com/post.jpg"],
+            video_url="https://example.com/post.mp4",
+            retweeted_status=retweet,
+        )
+        user = MockPost(
+            screen_name="作者",
+            avatar_hd="https://example.com/avatar.jpg",
+            avatar_large=None,
+            profile_image_url=None,
+            domain=None,
+            following=False,
+            follow_me=False,
+        )
+
+        class Client:
+            def get_user_by_uid(self, uid):
+                return user
+
+            def get_user_posts(self, **kwargs):
+                return [post] if kwargs["page"] == 1 else []
+
+        count = sync_user(conn, Client(), "7", max_pages=2)
+
+        assert count == 0
+        outer = conn.execute("SELECT text, retweeted_id, video_url FROM posts WHERE id=100").fetchone()
+        assert dict(outer) == {
+            "text": "更新正文",
+            "retweeted_id": 90,
+            "video_url": "https://example.com/post.mp4",
+        }
+        assert conn.execute("SELECT text FROM posts WHERE id=90").fetchone()[0] == "转发原文"
+        media = conn.execute(
+            "SELECT owner_id, media_type, url FROM media ORDER BY owner_id, media_type"
+        ).fetchall()
+        assert {(r["owner_id"], r["media_type"], r["url"]) for r in media} == {
+            ("90", "image", "https://example.com/retweet.jpg"),
+            ("90", "video", "https://example.com/retweet.mp4"),
+            ("100", "image", "https://example.com/post.jpg"),
+            ("100", "video", "https://example.com/post.mp4"),
+            ("7", "avatar", "https://example.com/avatar.jpg"),
+        }
+
+
+class TestFetchCommentReplies:
+    def test_follows_cursor_and_saves_comment_tree(self, conn):
+        from weiback.collector import fetch_comment_replies
+
+        responses = [
+            {
+                "data": [self._raw_comment("child-1", reply_id="root-1")],
+                "max_id": 12,
+                "max_id_type": 0,
+            },
+            {
+                "data": [self._raw_comment("child-2", reply_id="child-1")],
+                "max_id": 0,
+                "max_id_type": 0,
+            },
+        ]
+
+        class Client:
+            def __init__(self):
+                self.params = []
+
+            def _request(self, url, params, use_proxy=True):
+                self.params.append(params.copy())
+                return responses.pop(0)
+
+        client = Client()
+        fetched = fetch_comment_replies(conn, client, 100, "root-1", page_delay=0)
+
+        assert fetched == 2
+        assert [p["max_id"] for p in client.params] == [0, 12]
+        rows = conn.execute(
+            "SELECT id, root_id, parent_id, depth FROM comments ORDER BY id"
+        ).fetchall()
+        assert [dict(row) for row in rows] == [
+            {"id": "child-1", "root_id": "root-1", "parent_id": "root-1", "depth": 1},
+            {"id": "child-2", "root_id": "root-1", "parent_id": "child-1", "depth": 1},
+        ]
+        progress = conn.execute(
+            "SELECT status, max_id, fetched_count FROM comment_reply_progress WHERE root_comment_id='root-1'"
+        ).fetchone()
+        assert dict(progress) == {"status": "complete", "max_id": "0", "fetched_count": 2}
+
+    def test_failure_keeps_next_cursor_for_retry(self, conn):
+        from weiback.collector import fetch_comment_replies
+
+        class FailingClient:
+            def __init__(self):
+                self.calls = 0
+
+            def _request(self, url, params, use_proxy=True):
+                self.calls += 1
+                if self.calls == 1:
+                    return {
+                        "data": [TestFetchCommentReplies._raw_comment("child-1")],
+                        "max_id": 99,
+                        "max_id_type": 1,
+                    }
+                raise RuntimeError("rate limited")
+
+        assert fetch_comment_replies(
+            conn, FailingClient(), 100, "root-1", page_delay=0
+        ) == 1
+        failed = conn.execute(
+            "SELECT status, max_id, max_id_type, fetched_count, error_message "
+            "FROM comment_reply_progress WHERE root_comment_id='root-1'"
+        ).fetchone()
+        assert failed["status"] == "failed"
+        assert failed["max_id"] == "99"
+        assert failed["max_id_type"] == 1
+        assert failed["fetched_count"] == 1
+        assert "rate limited" in failed["error_message"]
+
+        seen = []
+
+        class RetryClient:
+            def _request(self, url, params, use_proxy=True):
+                seen.append(params.copy())
+                return {"data": [], "max_id": 0, "max_id_type": 0}
+
+        assert fetch_comment_replies(
+            conn, RetryClient(), 100, "root-1", page_delay=0
+        ) == 0
+        assert seen[0]["max_id"] == 99
+        assert seen[0]["max_id_type"] == 1
+
+    @staticmethod
+    def _raw_comment(comment_id, reply_id=None):
+        return {
+            "id": comment_id,
+            "text": "回复内容",
+            "created_at": "Fri Jul 31 12:00:00 +0800 2026",
+            "source": "Android",
+            "like_counts": 3,
+            "reply_id": reply_id,
+            "user": {
+                "id": "9",
+                "screen_name": "回复者",
+                "profile_image_url": "https://example.com/avatar.jpg",
+                "verified": True,
+            },
+            "pic": {"url": "https://example.com/comment.jpg"},
+        }
+
+
+class TestBackfillComments:
+    def test_failure_keeps_next_page_and_retry_completes(self, conn):
+        from weiback.collector import backfill_comments
+        from weiback.writer import save_posts
+
+        save_posts(conn, [{"id": 100, "uid": 7, "text": "正文", "created_at": ""}])
+        first_comment = MockPost(id="c1", text="第一页", reply_id=None)
+
+        class FailingClient:
+            def __init__(self):
+                self.pages = []
+
+            def get_comments(self, post_id, page=1, use_proxy=True):
+                self.pages.append(page)
+                if page == 1:
+                    return [first_comment], {"max": 3, "total_number": 2}
+                raise RuntimeError("rate limited")
+
+        failing = FailingClient()
+        assert backfill_comments(
+            conn, failing, limit=1, post_delay=(0, 0), max_pages=None
+        ) == 1
+        assert failing.pages == [1, 2]
+        progress = conn.execute(
+            "SELECT status, cursor, fetched_count, error_message "
+            "FROM comments_sync_progress WHERE post_id=100"
+        ).fetchone()
+        assert progress["status"] == "failed"
+        assert progress["cursor"] == "2"
+        assert progress["fetched_count"] == 1
+        assert "rate limited" in progress["error_message"]
+
+        second_comment = MockPost(id="c2", text="第二页", reply_id=None)
+
+        class RetryClient:
+            def __init__(self):
+                self.pages = []
+
+            def get_comments(self, post_id, page=1, use_proxy=True):
+                self.pages.append(page)
+                return [second_comment], {"max": 2, "total_number": 2}
+
+        retry = RetryClient()
+        assert backfill_comments(
+            conn, retry, limit=1, post_delay=(0, 0), max_pages=None
+        ) == 1
+        assert retry.pages == [2]
+        progress = conn.execute(
+            "SELECT status, cursor, fetched_count, error_message "
+            "FROM comments_sync_progress WHERE post_id=100"
+        ).fetchone()
+        assert dict(progress) == {
+            "status": "complete",
+            "cursor": "3",
+            "fetched_count": 2,
+            "error_message": None,
+        }
+
+    def test_page_limit_keeps_post_eligible_for_next_run(self, conn):
+        from weiback.collector import backfill_comments
+        from weiback.writer import save_posts
+
+        save_posts(conn, [{"id": 101, "uid": 7, "text": "正文", "created_at": ""}])
+
+        class Client:
+            def __init__(self):
+                self.pages = []
+
+            def get_comments(self, post_id, page=1, use_proxy=True):
+                self.pages.append(page)
+                comment = MockPost(id=f"c{page}", text="评论", reply_id=None)
+                return [comment], {"max": 3, "total_number": 3}
+
+        client = Client()
+        backfill_comments(conn, client, limit=1, post_delay=(0, 0), max_pages=1)
+        backfill_comments(conn, client, limit=1, post_delay=(0, 0), max_pages=1)
+
+        assert client.pages == [1, 2]
+        progress = conn.execute(
+            "SELECT status, cursor, fetched_count FROM comments_sync_progress "
+            "WHERE post_id=101"
+        ).fetchone()
+        assert dict(progress) == {
+            "status": "running",
+            "cursor": "3",
+            "fetched_count": 2,
+        }
