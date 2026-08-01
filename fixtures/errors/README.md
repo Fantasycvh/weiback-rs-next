@@ -10,7 +10,7 @@
 | `INVALID_COMMAND` | false | request | 命令信封或 payload 非法 |
 | `INVALID_CHECKPOINT` | false | request | 回传的 checkpoint 无法解析/已失效 |
 | `AUTH_REQUIRED` | true | request | 需要登录态 |
-| `UPSTREAM_RATE_LIMITED` | true | endpoint | 上游限流，带 `retry_after_ms` |
+| `UPSTREAM_RATE_LIMITED` | true | request | 上游限流，带 `retry_after_ms`；`endpoint`/`account` 级限流用 `rate_limited` 事件表达 |
 | `UPSTREAM_UNAVAILABLE` | true | request | 上游临时不可用 |
 | `RESPONSE_SCHEMA_CHANGED` | false | request | 上游返回结构变化 |
 | `BROWSER_NOT_INSTALLED` | true | sidecar | Playwright 浏览器缺失 |

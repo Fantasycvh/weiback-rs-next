@@ -1,0 +1,40 @@
+{
+  "ok": 1,
+  "data": [
+    {
+      "id": "c200000000000000001",
+      "text": "回复楼层一的评论 <a href=\"//weibo.com/10001\">@用户A</a>",
+      "created_at": "Sat Aug 01 03:10:00 +0800 2026",
+      "user": {
+        "id": "2000000011",
+        "screen_name": "回复用户A",
+        "avatar_hd": "https://tva1.sinaimg.cn/rA.jpg",
+        "verified": true
+      },
+      "like_counts": 5,
+      "source": "iPhone客户端",
+      "reply_id": "c200000000000000000",
+      "reply_text": "一楼正文",
+      "total_number": 0
+    },
+    {
+      "id": "c200000000000000002",
+      "text": "又一条回复",
+      "created_at": "Sat Aug 01 03:11:00 +0800 2026",
+      "user": {
+        "id": "2000000012",
+        "screen_name": "回复用户B",
+        "avatar_hd": "https://tva1.sinaimg.cn/rB.jpg",
+        "verified": false
+      },
+      "like_counts": 2,
+      "source": "微博 weibo.com",
+      "reply_id": "c200000000000000000",
+      "reply_text": "一楼正文",
+      "total_number": 0
+    }
+  ],
+  "max_id": "0",
+  "max_id_type": 0,
+  "total_number": 2
+}

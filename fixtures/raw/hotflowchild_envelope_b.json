@@ -1,0 +1,26 @@
+{
+  "ok": 1,
+  "data": {
+    "comments": [
+      {
+        "id": "c200000000000000003",
+        "text": "嵌套 data 格式下的回复",
+        "created_at": "Sat Aug 01 03:12:00 +0800 2026",
+        "user": {
+          "id": "2000000013",
+          "screen_name": "回复用户C",
+          "avatar_hd": "https://tva1.sinaimg.cn/rC.jpg",
+          "verified": false
+        },
+        "like_counts": 1,
+        "source": "微博 weibo.com",
+        "reply_id": "c200000000000000000",
+        "reply_text": "一楼正文",
+        "total_number": 0
+      }
+    ],
+    "max_id": "0",
+    "max_id_type": 0,
+    "total_number": 1
+  }
+}

@@ -602,12 +602,12 @@ running --进程退出--> interrupted -> pending/running
 
 交付物：
 
-- [ ] collector 与 Python writer 解耦。
-- [ ] 用户、帖子、评论、媒体引用规范化事件。
-- [ ] 两种已知 `hotFlowChild` 响应格式 fixture。
-- [ ] 分页后 checkpoint。
-- [ ] 异常分类、指数退避、随机抖动和认证状态。
-- [ ] Sidecar 专用瘦 PyInstaller spec。
+- [x] collector 与 Python writer 解耦。
+- [x] 用户、帖子、评论、媒体引用规范化事件。
+- [x] 两种已知 `hotFlowChild` 响应格式 fixture。
+- [x] 分页后 checkpoint。
+- [x] 异常分类、指数退避、随机抖动和认证状态。
+- [x] Sidecar 专用瘦 PyInstaller spec。
 
 完成门槛：
 

@@ -25,6 +25,7 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
+        # P1-A：Sidecar 绝不加载采集之外的职责（交付物 6）
         "fastapi",
         "uvicorn",
         "jinja2",
@@ -33,6 +34,13 @@ a = Analysis(
         "PIL",
         "crawl4weibo",
         "playwright",
+        # 写库/媒体下载/调度/Web 服务路径全在 Rust 侧，禁止进入打包产物
+        "weiback.writer",
+        "weiback.media_downloader",
+        "weiback.scheduler",
+        "weiback.web",
+        "weiback.weibo_adapter",
+        "weiback.collector",
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
