@@ -1,0 +1,20 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-capability",
+  "description": "Capability for the main window",
+  "windows": ["main"],
+  "permissions": [
+    "opener:allow-default-urls",
+    "opener:allow-open-url",
+    "dialog:allow-ask",
+    "dialog:allow-open",
+    "core:app:allow-version",
+    "core:event:default",
+    "core:window:allow-close",
+    "core:window:allow-destroy",
+    {
+      "identifier": "http:default",
+      "allow": [{ "url": "https://api.github.com/*" }]
+    }
+  ]
+}

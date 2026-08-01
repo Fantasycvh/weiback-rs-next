@@ -1,0 +1,153 @@
+//! This module provides an API for fetching detailed information about a single Weibo status (post).
+//!
+//! It includes functionality to retrieve the full content of a post, including its long text
+//! and potentially nested retweeted status, by its unique ID.
+use async_trait::async_trait;
+use serde::Deserialize;
+use serde_json::from_slice;
+use tracing::{debug, error};
+use weibosdk_rs::http_client::HttpResponse;
+
+use super::{HttpClient, internal::post::PostInternal};
+use crate::api::ApiClientImpl;
+use crate::models::post::Post;
+use crate::{
+    error::{Error, Result},
+    models::err_response::ErrResponse,
+};
+
+/// Configuration related to post editing status in the API response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EditConfig {
+    /// Indicates whether the post has been edited.
+    #[allow(unused)]
+    pub edited: bool,
+}
+
+/// An enum representing the possible responses from the statuses show API endpoint,
+/// which can either be a successful `PostInternal` data payload or an `ErrResponse`.
+#[derive(Debug, Deserialize)]
+struct StatusesShowResponse {
+    #[serde(flatten)]
+    body: Option<PostInternal>,
+    #[serde(flatten)]
+    error: Option<ErrResponse>,
+}
+
+/// Trait for API clients that can fetch detailed information about a Weibo status.
+#[async_trait]
+pub trait StatusesShowApi {
+    /// Fetches the full details of a single Weibo post by its ID.
+    ///
+    /// This includes resolving long text content and processing any retweeted status.
+    ///
+    /// # Arguments
+    /// * `id` - The unique ID of the status (post) to fetch.
+    ///
+    /// # Returns
+    /// A `Result` containing the `Post` model on success, or an `Error` on failure.
+    async fn statuses_show(&self, id: i64) -> Result<Post>;
+}
+
+impl<C: HttpClient> ApiClientImpl<C> {
+    /// Internal helper to fetch a `PostInternal` by its ID, primarily used for resolving
+    /// long texts and retweeted statuses.
+    ///
+    /// # Arguments
+    /// * `id` - The ID of the post to fetch.
+    ///
+    /// # Returns
+    /// A `Result` containing the `PostInternal` on success, or an `Error` on failure.
+    pub(super) async fn statuses_show_internal(&self, id: i64) -> Result<PostInternal> {
+        debug!("getting long text, id: {id}");
+
+        let response = self.client.statuses_show(id).await.inspect_err(|e| {
+            error!("statuses_show({id}) SDK call failed: {e}");
+        })?;
+        let bytes = response.bytes().await.inspect_err(|e| {
+            error!("fetch StatusesShowResponse for post {id} failed: {e}");
+        })?;
+        let parsed = serde_json::from_slice::<StatusesShowResponse>(&bytes).inspect_err(|e| {
+            error!("parse StatusesShowResponse for post {id} failed: {e}");
+        })?;
+        if let Some(statuses_show) = parsed.body {
+            debug!("got statuses success");
+            Ok(statuses_show)
+        } else if let Some(err) = parsed.error {
+            error!("failed to get long text: {err:?}");
+            Err(Error::ApiError(err))
+        } else {
+            error!(
+                "cannot convert StatusesShowResponse to PostInternal: {:?}",
+                from_slice::<serde_json::Value>(&bytes)
+            );
+            Err(Error::ApiError(ErrResponse {
+                errmsg: format!("unexpected empty StatusesShowResponse for id {id}"),
+                ..Default::default()
+            }))
+        }
+    }
+}
+#[async_trait]
+impl<C: HttpClient> StatusesShowApi for ApiClientImpl<C> {
+    /// Fetches the full details of a single Weibo post by its ID.
+    ///
+    /// This method leverages `statuses_show_internal` to get the raw `PostInternal`
+    /// and then uses `process_post` (from the main `ApiClientImpl` for hydration.
+    ///
+    /// # Arguments
+    /// * `id` - The unique ID of the status (post) to fetch.
+    ///
+    /// # Returns
+    /// A `Result` containing the `Post` model on success, or an `Error` on failure.
+    async fn statuses_show(&self, id: i64) -> Result<Post> {
+        let ss = self.statuses_show_internal(id).await?;
+        self.process_post(ss).await
+    }
+}
+
+#[cfg(test)]
+mod local_tests {
+    use std::path::Path;
+
+    use super::*;
+    use weibosdk_rs::{ApiClient as SdkApiClient, mock::MockClient, session::Session};
+
+    #[tokio::test]
+    async fn test_get_statuses_show() {
+        let mock_client = MockClient::new();
+        let session = Session {
+            gsid: "test_gsid".to_string(),
+            uid: "test_uid".to_string(),
+            user: serde_json::Value::Null,
+            cookie_store: Default::default(),
+        };
+        let weibo_api =
+            ApiClientImpl::new(SdkApiClient::from_session(mock_client.clone(), session));
+
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let testcase_path = manifest_dir.join("tests/data/statuses_show.json");
+        mock_client
+            .set_statuses_show_response_from_file(&testcase_path)
+            .unwrap();
+
+        let _post = weibo_api.statuses_show(12345).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod real_tests {
+    use super::*;
+    use weibosdk_rs::{ApiClient as SdkApiClient, http_client, session::Session};
+
+    #[tokio::test]
+    #[ignore = "requires a local session.json and live Weibo access"]
+    async fn test_real_get_statuses_show() {
+        let session_file = "session.json";
+        if let Ok(session) = Session::load(session_file) {
+            let client = http_client::Client::new().unwrap();
+            let weibo_api = ApiClientImpl::new(SdkApiClient::from_session(client, session));
+            let _ = weibo_api.statuses_show(5179586393932632).await.unwrap();
+        }
+    }
+}

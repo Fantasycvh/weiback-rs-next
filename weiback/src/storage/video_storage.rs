@@ -1,0 +1,361 @@
+//! This module provides file system storage and retrieval for videos,
+//! integrating with the database to manage video metadata.
+//! It handles saving, retrieving, and deleting video blobs,
+//! and ensures consistency between file system presence and database records.
+
+use std::fs::create_dir_all;
+use std::path::{Path, PathBuf};
+
+use bytes::Bytes;
+use sqlx::{Acquire, Executor, Sqlite};
+use tracing::{debug, error, warn};
+use url::Url;
+
+use super::internal::video;
+use crate::error::{Error, Result};
+use crate::models::Video;
+use crate::utils::livephoto_video_url_to_path_str;
+
+/// A struct responsible for storing and retrieving video files on the file system.
+/// It works in conjunction with the database to manage video metadata.
+#[derive(Debug, Clone, Default)]
+pub struct FileSystemVideoStorage;
+
+impl FileSystemVideoStorage {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl FileSystemVideoStorage {
+    /// Retrieves the binary content (blob) of a video from the file system.
+    ///
+    /// # Arguments
+    ///
+    /// * `video_path` - The base directory where videos are stored.
+    /// * `executor` - A database executor.
+    /// * `url` - The URL of the video to retrieve.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing an `Option<Bytes>`. `Some(Bytes)` if the video is found, `None` otherwise.
+    pub async fn get_video_blob<'e, E>(
+        &self,
+        video_path: &Path,
+        executor: E,
+        url: &Url,
+    ) -> Result<Option<Bytes>>
+    where
+        E: Executor<'e, Database = Sqlite>,
+    {
+        let Some(relative_path) = video::get_video_path(executor, url).await? else {
+            return Ok(None);
+        };
+        let absolute_path = video_path.join(relative_path);
+        match tokio::fs::read(&absolute_path).await {
+            Ok(blob) => Ok(Some(Bytes::from(blob))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                warn!(
+                    "video has db entry, but file not found at {:?}",
+                    absolute_path
+                );
+                Ok(None)
+            }
+            Err(e) => {
+                error!("read video file {:?} failed: {e}", absolute_path);
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Saves a video's binary content to the file system and its metadata to the database.
+    ///
+    /// Creates necessary parent directories if they don't exist.
+    ///
+    /// # Arguments
+    ///
+    /// * `video_path` - The base directory where videos should be stored.
+    /// * `executor` - A database executor.
+    /// * `video` - The `Video` object containing metadata and binary blob.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` indicating success or failure.
+    pub async fn save_video<'e, E>(
+        &self,
+        video_path: &Path,
+        executor: E,
+        video: &Video,
+    ) -> Result<()>
+    where
+        E: Executor<'e, Database = Sqlite>,
+    {
+        let url = video.meta.url();
+        let relative_path =
+            PathBuf::from(livephoto_video_url_to_path_str(url).inspect_err(|e| {
+                error!("convert livephoto video URL to path failed: {e}");
+            })?);
+        let absolute_path = video_path.join(&relative_path);
+        create_dir_all(absolute_path.parent().ok_or_else(|| {
+            let msg = "cannot get parent of video path".to_string();
+            error!("save_video failed: {msg}");
+            Error::Io(std::io::Error::other(msg))
+        })?)?;
+        if let Some(parent) = absolute_path.parent() {
+            tokio::fs::create_dir_all(parent).await.inspect_err(|e| {
+                error!("create parent directory {:?} for video failed: {e}", parent);
+            })?;
+        }
+        tokio::fs::write(&absolute_path, &video.blob)
+            .await
+            .inspect_err(|e| {
+                error!("write video file {:?} failed: {e}", absolute_path);
+            })?;
+        video::save_video_meta(executor, url, video.meta.post_id, relative_path.as_path()).await?;
+        debug!("video {} saved to {:?}", video.meta.url(), absolute_path);
+        Ok(())
+    }
+
+    /// Checks if a video is saved (both in the database and on the file system).
+    ///
+    /// # Arguments
+    ///
+    /// * `video_path` - The base directory where videos are stored.
+    /// * `executor` - A database executor.
+    /// * `url` - The URL of the video to check.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing `true` if the video is saved, `false` otherwise.
+    pub async fn video_saved<'e, E>(
+        &self,
+        video_path: &Path,
+        executor: E,
+        url: &Url,
+    ) -> Result<bool>
+    where
+        E: Executor<'e, Database = Sqlite>,
+    {
+        let Some(relative_path) = video::get_video_path(executor, url).await? else {
+            return Ok(false);
+        };
+        let absolute_path = video_path.join(relative_path);
+        if absolute_path.exists() {
+            Ok(true)
+        } else {
+            warn!(
+                "video has db entry, but file not found at {:?}",
+                absolute_path
+            );
+            Ok(false)
+        }
+    }
+
+    /// Deletes all videos associated with a given post from both the file system and the database.
+    ///
+    /// # Arguments
+    ///
+    /// * `video_path` - The base directory where videos are stored.
+    /// * `acquirer` - A database acquirer.
+    /// * `post_id` - The ID of the post whose videos are to be deleted.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` indicating success or failure.
+    pub async fn delete_post_videos<'c, A>(
+        &self,
+        video_path: &Path,
+        acquirer: A,
+        post_id: i64,
+    ) -> Result<()>
+    where
+        A: Acquire<'c, Database = Sqlite>,
+    {
+        self.batch_delete_posts_videos(video_path, acquirer, &[post_id])
+            .await
+    }
+
+    /// Deletes all videos associated with a given list of posts from both the file system and the database.
+    ///
+    /// # Arguments
+    ///
+    /// * `video_path` - The base directory where videos are stored.
+    /// * `acquirer` - A database acquirer.
+    /// * `post_ids` - A slice of IDs of the posts whose videos are to be deleted.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` indicating success or failure.
+    pub async fn batch_delete_posts_videos<'c, A>(
+        &self,
+        video_path: &Path,
+        acquirer: A,
+        post_ids: &[i64],
+    ) -> Result<()>
+    where
+        A: Acquire<'c, Database = Sqlite>,
+    {
+        let mut conn = acquirer.acquire().await?;
+        let video_paths = video::get_video_paths_by_post_ids(&mut *conn, post_ids).await?;
+        video::delete_videos_by_post_ids(&mut *conn, post_ids).await?;
+
+        for path in video_paths {
+            let absolute_path = video_path.join(path);
+            if absolute_path.exists()
+                && let Err(e) = tokio::fs::remove_file(&absolute_path).await
+            {
+                error!(
+                    "Failed to delete video file {}: {}",
+                    absolute_path.display(),
+                    e
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod local_tests {
+    use sqlx::SqlitePool;
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::models::{Video, VideoMeta};
+
+    async fn setup_db() -> SqlitePool {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        pool
+    }
+
+    fn create_test_video(url: &str) -> Video {
+        Video {
+            meta: VideoMeta::new(url, 42).unwrap(),
+            blob: Bytes::from_static(b"test video data"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_save_video() {
+        let temp_dir = tempdir().unwrap();
+        let storage = FileSystemVideoStorage;
+        let video = create_test_video(
+            "https://video.weibo.com/media/play?livephoto=https%3A%2F%2Fus.sinaimg.cn%2F0023jbLigx081byvTnCw0f0f01004O5e0k01.mov",
+        );
+
+        let db = setup_db().await;
+        let result = storage.save_video(temp_dir.path(), &db, &video).await;
+        assert!(result.is_ok());
+
+        let expected_path = temp_dir
+            .path()
+            .join("us.sinaimg.cn/0023jbLigx081byvTnCw0f0f01004O5e0k01.mov");
+        assert!(expected_path.exists());
+        let data = tokio::fs::read(expected_path).await.unwrap();
+        assert_eq!(data, video.blob);
+    }
+
+    #[tokio::test]
+    async fn test_get_video_blob() {
+        let temp_dir = tempdir().unwrap();
+        let storage = FileSystemVideoStorage;
+        let video = create_test_video(
+            "https://video.weibo.com/media/play?livephoto=https%3A%2F%2Fus.sinaimg.cn%2F0023jbLigx081byvTnCw0f0f01004O5e0k01.mov",
+        );
+
+        let db = setup_db().await;
+        storage
+            .save_video(temp_dir.path(), &db, &video)
+            .await
+            .unwrap();
+
+        let blob = storage
+            .get_video_blob(
+                temp_dir.path(),
+                &db,
+                &Url::parse("https://video.weibo.com/media/play?livephoto=https%3A%2F%2Fus.sinaimg.cn%2F0023jbLigx081byvTnCw0f0f01004O5e0k01.mov").unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(blob.is_some());
+        assert_eq!(blob.unwrap(), video.blob);
+    }
+
+    #[tokio::test]
+    async fn test_get_non_existent_video_blob() {
+        let temp_dir = tempdir().unwrap();
+        let storage = FileSystemVideoStorage;
+
+        let db = setup_db().await;
+        let blob = storage
+            .get_video_blob(
+                temp_dir.path(),
+                &db,
+                &Url::parse("http://example.com/non-existent.mp4").unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(blob.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_batch_delete_post_videos() {
+        let temp_dir = tempdir().unwrap();
+        let storage = FileSystemVideoStorage;
+        let post_id1 = 1;
+        let post_id2 = 2;
+
+        let video1 = create_test_video(
+            "https://video.weibo.com/media/play?livephoto=https%3A%2F%2Fus.sinaimg.cn%2F0023jbLigx081byvTnCw0f0f01004O5e0k01.mov",
+        );
+        let mut video1 = video1;
+        video1.meta.post_id = post_id1;
+
+        let video2 = create_test_video(
+            "https://video.weibo.com/media/play?livephoto=https%3A%2F%2Fus.sinaimg.cn%2F0023jbLigx081byvTnCw0f0f01004O5e0k02.mov",
+        );
+        let mut video2 = video2;
+        video2.meta.post_id = post_id2;
+
+        let db = setup_db().await;
+        storage
+            .save_video(temp_dir.path(), &db, &video1)
+            .await
+            .unwrap();
+        storage
+            .save_video(temp_dir.path(), &db, &video2)
+            .await
+            .unwrap();
+
+        let file_path1 = temp_dir
+            .path()
+            .join("us.sinaimg.cn/0023jbLigx081byvTnCw0f0f01004O5e0k01.mov");
+        let file_path2 = temp_dir
+            .path()
+            .join("us.sinaimg.cn/0023jbLigx081byvTnCw0f0f01004O5e0k02.mov");
+
+        assert!(file_path1.exists());
+        assert!(file_path2.exists());
+
+        storage
+            .batch_delete_posts_videos(temp_dir.path(), &db, &[post_id1, post_id2])
+            .await
+            .unwrap();
+
+        assert!(!file_path1.exists());
+        assert!(!file_path2.exists());
+        assert!(
+            video::get_video_paths_by_post_id(&db, post_id1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            video::get_video_paths_by_post_id(&db, post_id2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+}

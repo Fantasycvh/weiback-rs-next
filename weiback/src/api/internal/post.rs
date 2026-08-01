@@ -1,0 +1,175 @@
+//! This module defines the internal `PostInternal` structure used for deserializing
+//! post data directly from the Weibo API.
+//!
+//! It includes custom deserializers for various fields to handle inconsistencies
+//! or specific formats in the API responses. It also provides a conversion
+//! from `PostInternal` to the public `Post` model.
+use std::borrow::Cow;
+use std::collections::HashMap;
+
+use chrono::{DateTime, FixedOffset};
+use serde::{Deserialize, Deserializer};
+use serde_json::Value;
+
+use super::{page_info::PageInfoInternal, url_struct::UrlStructInternal, user::UserInternal};
+use crate::error::Error;
+use crate::models::{MixMediaInfo, PicInfoItem, Post, TagStruct};
+
+/// Internal representation of a Weibo post as received directly from the API.
+///
+/// This struct is used for deserialization and contains many optional fields
+/// due to the varied nature of Weibo API responses. It includes custom deserializers
+/// for specific data types and handles nested structures like `LongText`, `PageInfo`,
+/// `UrlStruct`, and `User`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PostInternal {
+    pub attitudes_count: Option<i64>,
+    #[serde(default)]
+    pub attitudes_status: i64,
+    #[serde(deserialize_with = "deserialize_created_at")]
+    pub created_at: DateTime<FixedOffset>,
+    pub comments_count: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_bool_from_anything")]
+    pub deleted: bool,
+    pub edit_count: Option<i64>,
+    #[serde(default)]
+    pub favorited: bool,
+    pub geo: Option<Value>,
+    pub id: i64,
+    pub idstr: String,
+    #[serde(default, rename = "isLongText")]
+    pub is_long_text: bool,
+    #[serde(default, rename = "longText")]
+    pub long_text: Option<LongText>,
+    pub mblogid: String,
+    #[serde(default, deserialize_with = "deserialize_ids")]
+    pub mix_media_ids: Option<Vec<String>>,
+    pub mix_media_info: Option<MixMediaInfo>,
+    pub page_info: Option<PageInfoInternal>,
+    #[serde(default, deserialize_with = "deserialize_ids")]
+    pub pic_ids: Option<Vec<String>>,
+    pub pic_infos: Option<HashMap<String, PicInfoItem>>,
+    pub pic_num: Option<i64>,
+    pub region_name: Option<String>,
+    pub reposts_count: Option<i64>,
+    pub repost_type: Option<i64>,
+    pub retweeted_status: Option<Box<PostInternal>>,
+    pub source: Option<String>,
+    pub tag_struct: Option<TagStruct>,
+    pub text: String,
+    pub url_struct: Option<UrlStructInternal>,
+    #[serde(default, deserialize_with = "deserialize_user")]
+    pub user: Option<UserInternal>,
+}
+
+/// Represents the extended content of a long Weibo post.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct LongText {
+    pub content: String,
+}
+
+impl TryFrom<PostInternal> for Post {
+    type Error = Error;
+    fn try_from(value: PostInternal) -> std::result::Result<Self, Self::Error> {
+        let res = Self {
+            attitudes_count: value.attitudes_count,
+            attitudes_status: value.attitudes_status,
+            created_at: value.created_at,
+            comments_count: value.comments_count,
+            deleted: value.deleted,
+            edit_count: value.edit_count,
+            favorited: value.favorited,
+            geo: value.geo,
+            id: value.id,
+            idstr: value.idstr,
+            mblogid: value.mblogid,
+            mix_media_ids: value.mix_media_ids,
+            mix_media_info: value.mix_media_info,
+            page_info: value.page_info.map(|p| p.into()),
+            pic_ids: value.pic_ids,
+            pic_infos: value.pic_infos,
+            pic_num: value.pic_num,
+            region_name: value.region_name,
+            reposts_count: value.reposts_count,
+            repost_type: value.repost_type,
+            retweeted_status: value
+                .retweeted_status
+                .map(|r| TryInto::try_into(*r))
+                .transpose()?
+                .map(Box::new),
+            source: value.source,
+            tag_struct: value.tag_struct,
+            text: value.text,
+            url_struct: value.url_struct.map(|u| u.try_into()).transpose()?,
+            user: value.user.map(|u| u.into()),
+        };
+        Ok(res)
+    }
+}
+
+/// Custom deserializer for `UserInternal` that filters out users with ID `0`.
+///
+/// This is a workaround for cases where the API might return a placeholder user object
+/// with an ID of `0` when no actual user is associated.
+fn deserialize_user<'de, D>(deserializer: D) -> std::result::Result<Option<UserInternal>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let user = Option::<UserInternal>::deserialize(deserializer)?;
+    Ok(user.filter(|u| u.id != 0))
+}
+
+/// Custom deserializer for `Vec<String>` IDs that converts empty vectors to `None`.
+///
+/// This simplifies handling of optional ID lists where an empty list is semantically equivalent to no list.
+pub fn deserialize_ids<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let ids = Vec::<String>::deserialize(deserializer)?;
+    if ids.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(ids))
+    }
+}
+
+/// Custom deserializer for `created_at` timestamps.
+///
+/// It parses RFC 3339 formatted date-time strings, handling the specific format
+/// used by the Weibo API (e.g., "Tue May 31 17:46:55 +0800 2022").
+pub fn deserialize_created_at<'de, D>(deserializer: D) -> Result<DateTime<FixedOffset>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let created_at = Cow::<'_, str>::deserialize(deserializer)?;
+    DateTime::parse_from_str(&created_at, "%a %b %d %T %z %Y").map_err(serde::de::Error::custom)
+}
+
+pub fn deserialize_bool_from_anything<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Anything {
+        Bool(bool),
+        Int(i64),
+        String(String),
+    }
+
+    match Anything::deserialize(deserializer)? {
+        Anything::Bool(b) => Ok(b),
+        Anything::Int(i) => Ok(i != 0),
+        Anything::String(s) => match s.to_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Ok(true),
+            "false" | "0" | "no" | "off" | "" => Ok(false),
+            _ => Err(serde::de::Error::custom(format!(
+                "invalid bool string: {}",
+                s
+            ))),
+        },
+    }
+}
