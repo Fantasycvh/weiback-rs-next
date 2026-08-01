@@ -350,6 +350,52 @@ fn detect_legacy_sources() -> Vec<weiback::legacy::LegacyDetection> {
     weiback::legacy::detect_legacy_sources(&dirs::data_dir().unwrap_or_default())
 }
 
+/// Sidecar 握手诊断：解析并启动 collector，完成握手后返回
+/// `ready`/`capabilities` 的 JSON 摘要；任何失败都返回可诊断错误。
+///
+/// 解析顺序：环境变量 `WEIBACK_COLLECTOR_CMD` → 可执行文件同目录的
+/// `weiback-collector(.exe)`。额外的命令行参数可由
+/// `WEIBACK_COLLECTOR_ARGS`（空格分隔）指定，开发时可用它指向
+/// `-u -m weiback_collector`；发布后使用 externalBin 打包的二进制时留空。
+#[tauri::command]
+fn sidecar_diagnostics() -> Result<serde_json::Value> {
+    let Some(program) = weiback::sidecar::supervisor::resolve_sidecar_command() else {
+        return Err(Error(
+            "Sidecar not found: set WEIBACK_COLLECTOR_CMD or place weiback-collector(.exe) next to the app".to_string(),
+        ));
+    };
+
+    let args = std::env::var("WEIBACK_COLLECTOR_ARGS")
+        .map(|s| {
+            s.split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
+
+    let options = weiback::sidecar::SpawnOptions {
+        program,
+        args,
+        env: vec![("PYTHONUTF8".into(), "1".into())],
+        cwd: None,
+        handshake_timeout: std::time::Duration::from_secs(10),
+    };
+
+    match weiback::sidecar::Sidecar::spawn_with_handshake(&options) {
+        Ok((mut sidecar, ready, capabilities)) => {
+            let _ = sidecar.shutdown(std::time::Duration::from_millis(500));
+            Ok(serde_json::json!({
+                "ok": true,
+                "ready": ready,
+                "capabilities": capabilities,
+            }))
+        }
+        Err(e) => Err(Error(format!(
+            "sidecar handshake failed: {e} (set WEIBACK_COLLECTOR_CMD to the collector executable)"
+        ))),
+    }
+}
+
 pub fn run() -> Result<()> {
     info!("Starting application");
 
@@ -357,6 +403,7 @@ pub fn run() -> Result<()> {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_http::init())
+        .plugin(tauri_plugin_shell::init())
         .setup(setup)
         .invoke_handler(tauri::generate_handler![
             get_backend_status,
@@ -385,7 +432,8 @@ pub fn run() -> Result<()> {
             cleanup_outdated_avatars,
             cleanup_invalid_posts,
             cleanup_invalid_pictures,
-            detect_legacy_sources
+            detect_legacy_sources,
+            sidecar_diagnostics
         ])
         .build(tauri::generate_context!())
         .expect("tauri app build failed")

@@ -568,12 +568,12 @@ running --进程退出--> interrupted -> pending/running
 
 交付物：
 
-- [ ] Python headless JSONL 入口。
-- [ ] `hello/health/cancel/shutdown` 命令。
-- [ ] `ready/capabilities/started/error/done` 事件。
-- [ ] Rust Sidecar supervisor 和协议解析器。
-- [ ] Tauri `externalBin`、shell plugin 和最小 capabilities。
-- [ ] fixture 驱动的假采集流。
+- [x] Python headless JSONL 入口。
+- [x] `hello/health/cancel/shutdown` 命令。
+- [x] `ready/capabilities/started/error/done` 事件。
+- [x] Rust Sidecar supervisor 和协议解析器。
+- [x] Tauri `externalBin`、shell plugin 和最小 capabilities。
+- [x] fixture 驱动的假采集流。
 
 完成门槛：
 

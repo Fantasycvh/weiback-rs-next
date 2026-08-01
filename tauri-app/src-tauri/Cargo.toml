@@ -19,6 +19,7 @@ tauri = { workspace = true }
 tauri-plugin-dialog = { workspace = true }
 tauri-plugin-http = { workspace = true }
 tauri-plugin-opener = { workspace = true }
+tauri-plugin-shell = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-log = { workspace = true }

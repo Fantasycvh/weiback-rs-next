@@ -8,6 +8,7 @@
 pub mod api;
 pub mod builder;
 pub mod config;
+pub mod sidecar;
 pub mod core;
 pub mod emoji_map;
 pub mod error;

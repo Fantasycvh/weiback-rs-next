@@ -15,6 +15,15 @@
     {
       "identifier": "http:default",
       "allow": [{ "url": "https://api.github.com/*" }]
+    },
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        {
+          "name": "binaries/weiback-collector",
+          "sidecar": true
+        }
+      ]
     }
   ]
 }
