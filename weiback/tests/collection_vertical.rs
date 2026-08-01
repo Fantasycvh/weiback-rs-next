@@ -19,7 +19,7 @@ use weiback::sidecar::{
     run_collection,
 };
 use weiback::storage::database::create_db_pool_with_url;
-use weiback::storage::internal::entities::SyncCheckpointDto;
+use weiback::storage::internal::entities::{CheckpointOwner, SyncCheckpointDto};
 use weiback::storage::internal::entities::{get_sync_checkpoint, save_sync_checkpoint};
 
 /// 仓库根目录（`tests/` 的上两级）。
@@ -331,6 +331,11 @@ async fn resume_from_committed_checkpoint_skips_covered_pages() {
             fetched_count: 20,
             last_sequence: Some(3),
             updated_at: now(),
+            job_id: None,
+            run_id: None,
+            generation: None,
+            owner_token: None,
+            owner: CheckpointOwner::AdHoc,
         },
     )
     .await
@@ -411,4 +416,131 @@ async fn resume_from_committed_checkpoint_skips_covered_pages() {
     sidecar2
         .shutdown(Duration::from_millis(500))
         .expect("clean shutdown");
+}
+
+/// Sidecar sequence is scoped to one request. A resumed request may restart at 1.
+#[tokio::test]
+async fn resumed_request_sequence_restarts_at_one_and_advances_by_fetched_count() {
+    let Some(py) = python() else {
+        eprintln!("python not found, skipping");
+        return;
+    };
+    let pool = setup_db().await;
+    save_sync_checkpoint(
+        &pool,
+        &SyncCheckpointDto {
+            stream: "user:reset:posts".into(),
+            cursor_json: Some(json!({"cursor": {"max_id": "old", "max_id_type": 0}}).to_string()),
+            fetched_count: 20,
+            last_sequence: Some(99),
+            updated_at: now(),
+            job_id: None,
+            run_id: None,
+            generation: None,
+            owner_token: None,
+            owner: CheckpointOwner::AdHoc,
+        },
+    )
+    .await
+    .unwrap();
+
+    let script = concat!(
+        "import json,sys\n",
+        "print('{\"protocol_version\":1,\"request_id\":null,\"event_id\":\"019fbbd7-ea26-7b7c-b113-c89ac2788901\",\"type\":\"ready\",\"occurred_at\":\"2026-08-01T00:00:00Z\",\"payload\":{\"sidecar_name\":\"weiback-collector\",\"sidecar_version\":\"0.4.0\",\"protocol_version\":1}}')\n",
+        "print('{\"protocol_version\":1,\"request_id\":null,\"event_id\":\"019fbbd7-ea26-7b7c-b113-c89ac2788902\",\"type\":\"capabilities\",\"occurred_at\":\"2026-08-01T00:00:00Z\",\"payload\":{\"protocol_versions\":[1],\"commands\":[\"hello\",\"collect_user_posts\",\"shutdown\"],\"browser_installed\":false}}')\n",
+        "sys.stdout.flush();sys.stdin.readline();cmd=json.loads(sys.stdin.readline());rid=cmd['request_id']\n",
+        "base={'protocol_version':1,'request_id':rid,'stream':'user:reset:posts','occurred_at':'2026-08-01T00:00:01Z'}\n",
+        "print(json.dumps({**base,'event_id':'019fbbd7-ea26-7b7c-b113-c89ac2788903','type':'post','sequence':1,'payload':{'id':'9911','text':'new request'}}))\n",
+        "print(json.dumps({**base,'event_id':'019fbbd7-ea26-7b7c-b113-c89ac2788904','type':'checkpoint','sequence':2,'payload':{'cursor':{'max_id':'new','max_id_type':0},'fetched_count':40}}))\n",
+        "print(json.dumps({**base,'event_id':'019fbbd7-ea26-7b7c-b113-c89ac2788905','type':'done','sequence':3,'payload':{'status':'completed','fetched_count':40}}));sys.stdout.flush()\n",
+    );
+    let (mut sidecar, _, _) = Sidecar::spawn_with_handshake(&SpawnOptions {
+        program: py,
+        args: vec!["-u".into(), "-c".into(), script.into()],
+        env: vec![("PYTHONUTF8".into(), "1".into())],
+        cwd: None,
+        handshake_timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let summary = run_collection(
+        &mut sidecar,
+        &pool,
+        &user_posts_request("reset"),
+        |_, _| {},
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert_eq!(summary.status, CollectionStatus::Completed);
+    let checkpoint = get_sync_checkpoint(&pool, "user:reset:posts")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(checkpoint.fetched_count, 40);
+    assert_eq!(checkpoint.last_sequence, Some(2));
+}
+
+/// Rejected progress must roll back business rows and the processed-event marker.
+#[tokio::test]
+async fn regressing_checkpoint_rolls_back_the_whole_commit_plan() {
+    let Some(py) = python() else {
+        eprintln!("python not found, skipping");
+        return;
+    };
+    let pool = setup_db().await;
+    save_sync_checkpoint(
+        &pool,
+        &SyncCheckpointDto {
+            stream: "user:rollback:posts".into(),
+            cursor_json: Some(json!({"cursor": {"max_id": "new", "max_id_type": 0}}).to_string()),
+            fetched_count: 40,
+            last_sequence: Some(9),
+            updated_at: now(),
+            job_id: None,
+            run_id: None,
+            generation: None,
+            owner_token: None,
+            owner: CheckpointOwner::AdHoc,
+        },
+    )
+    .await
+    .unwrap();
+    let script = concat!(
+        "import json,sys\n",
+        "print('{\"protocol_version\":1,\"request_id\":null,\"event_id\":\"019fbbd7-ea26-7b7c-b113-c89ac2788911\",\"type\":\"ready\",\"occurred_at\":\"2026-08-01T00:00:00Z\",\"payload\":{\"sidecar_name\":\"weiback-collector\",\"sidecar_version\":\"0.4.0\",\"protocol_version\":1}}')\n",
+        "print('{\"protocol_version\":1,\"request_id\":null,\"event_id\":\"019fbbd7-ea26-7b7c-b113-c89ac2788912\",\"type\":\"capabilities\",\"occurred_at\":\"2026-08-01T00:00:00Z\",\"payload\":{\"protocol_versions\":[1],\"commands\":[\"hello\",\"collect_user_posts\"],\"browser_installed\":false}}')\n",
+        "sys.stdout.flush();sys.stdin.readline();cmd=json.loads(sys.stdin.readline());rid=cmd['request_id']\n",
+        "base={'protocol_version':1,'request_id':rid,'stream':'user:rollback:posts','occurred_at':'2026-08-01T00:00:01Z'}\n",
+        "print(json.dumps({**base,'event_id':'019fbbd7-ea26-7b7c-b113-c89ac2788913','type':'post','sequence':1,'payload':{'id':'9922','text':'must rollback'}}))\n",
+        "print(json.dumps({**base,'event_id':'019fbbd7-ea26-7b7c-b113-c89ac2788914','type':'checkpoint','sequence':2,'payload':{'cursor':{'max_id':'old','max_id_type':0},'fetched_count':20}}));sys.stdout.flush()\n",
+    );
+    let (mut sidecar, _, _) = Sidecar::spawn_with_handshake(&SpawnOptions {
+        program: py,
+        args: vec!["-u".into(), "-c".into(), script.into()],
+        env: vec![("PYTHONUTF8".into(), "1".into())],
+        cwd: None,
+        handshake_timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let error = run_collection(
+        &mut sidecar,
+        &pool,
+        &user_posts_request("rollback"),
+        |_, _| {},
+        Duration::from_secs(5),
+    )
+    .await
+    .expect_err("regressing checkpoint must fail");
+    assert!(error.to_string().contains("checkpoint"));
+    let posts: i64 = query_scalar("SELECT COUNT(*) FROM posts WHERE id=9922")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let processed: i64 = query_scalar(
+        "SELECT COUNT(*) FROM processed_events WHERE event_id='019fbbd7-ea26-7b7c-b113-c89ac2788914'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((posts, processed), (0, 0));
 }

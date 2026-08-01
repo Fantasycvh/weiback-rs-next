@@ -8,7 +8,13 @@
 //! - 重启后从 `sync_checkpoints` 读取最后已提交游标续传，已提交页不丢不重；
 //! - 认证失效/限流以事件上报，不损坏任务或数据库。
 
-use std::time::Duration;
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, SyncSender, TryRecvError},
+    },
+    time::{Duration, Instant},
+};
 
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -21,7 +27,8 @@ use crate::sidecar::protocol::{CommandEnvelope, CommandType, EventType, new_uuid
 use crate::sidecar::supervisor::{Sidecar, SidecarError};
 use crate::storage::internal::entities::transactional::CommitPlan;
 use crate::storage::internal::entities::{
-    CommentDto, MediaDto, SyncCheckpointDto, get_sync_checkpoint,
+    CheckpointOwner, CommentDto, MediaDto, SyncCheckpointDto, get_sync_checkpoint, get_sync_job,
+    heartbeat_sync_run_at,
 };
 use crate::storage::internal::post::PostInternal;
 
@@ -43,10 +50,73 @@ pub enum CollectionStatus {
     Completed,
     /// 被取消或提前停止（done status=stopped / cancelled / REQUEST_CANCELLED）。
     Stopped,
+    /// 持久任务被人工暂停。
+    Paused,
+    /// 持久任务被人工取消。
+    Cancelled,
     /// Sidecar 崩溃或超时，任务应标记为 `Interrupted`。
     Interrupted,
+    /// 应用正常退出，任务中断并重排但不消耗故障恢复预算。
+    Shutdown,
     /// 上游错误（认证失效等），任务应标记为 `Failed`。
     Failed,
+    /// Persistent executor must persist a gate and requeue the job.
+    RateLimited,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitScope {
+    Account,
+    Endpoint,
+    Request,
+}
+
+impl RateLimitScope {
+    pub fn parse_protocol(value: &str) -> Result<Self> {
+        match value {
+            "request" => Ok(Self::Request),
+            "endpoint" => Ok(Self::Endpoint),
+            "account" => Ok(Self::Account),
+            _ => Err(Error::FormatError(format!(
+                "unknown rate-limit scope: {value}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RateLimitInfo {
+    pub scope: RateLimitScope,
+    pub retry_after_ms: Option<u64>,
+}
+
+/// Worker registry 发给持久采集器的控制动作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionControl {
+    Pause,
+    Cancel,
+    Shutdown,
+}
+
+/// 控制请求携带一次性 ack；ack 仅在 kill+wait 确认后发送。
+#[derive(Debug)]
+pub struct ExecutionControlRequest {
+    pub action: ExecutionControl,
+    pub ack: SyncSender<std::result::Result<(), String>>,
+}
+
+/// 持久运行的 fencing 身份和轮询参数。
+pub struct PersistentExecution<'a> {
+    pub job_id: i64,
+    pub run_id: i64,
+    pub generation: i64,
+    pub owner_token: &'a str,
+    /// Account-scoped durable key; distinct from the protocol event stream.
+    pub checkpoint_stream: &'a str,
+    pub control_rx: &'a Receiver<ExecutionControlRequest>,
+    pub poll_interval: Duration,
+    pub heartbeat_interval: Duration,
+    pub lease_duration: Duration,
 }
 
 /// 采集结果摘要。
@@ -60,6 +130,7 @@ pub struct CollectionSummary {
     pub pages: u64,
     /// 失败/中断时的可诊断错误。
     pub error: Option<String>,
+    pub rate_limit: Option<RateLimitInfo>,
 }
 
 impl Default for CollectionSummary {
@@ -69,6 +140,7 @@ impl Default for CollectionSummary {
             fetched_count: 0,
             pages: 0,
             error: None,
+            rate_limit: None,
         }
     }
 }
@@ -81,12 +153,99 @@ pub async fn run_collection(
     sidecar: &mut Sidecar,
     pool: &SqlitePool,
     request: &CollectionRequest,
+    on_progress: impl FnMut(u64, u64),
+    event_timeout: Duration,
+) -> Result<CollectionSummary> {
+    run_collection_with_execution(
+        sidecar,
+        pool,
+        request,
+        &mut None,
+        None,
+        on_progress,
+        event_timeout,
+    )
+    .await
+}
+
+pub async fn run_collection_cancellable(
+    sidecar: &mut Sidecar,
+    pool: &SqlitePool,
+    request: &CollectionRequest,
+    cancelled: &AtomicBool,
+    on_progress: impl FnMut(u64, u64),
+    event_timeout: Duration,
+) -> Result<CollectionSummary> {
+    run_collection_with_execution(
+        sidecar,
+        pool,
+        request,
+        &mut None,
+        Some(ExternalStop::Cancel(cancelled)),
+        on_progress,
+        event_timeout,
+    )
+    .await
+}
+
+/// Runs an ad-hoc collection that becomes interrupted when the process shuts down.
+pub async fn run_collection_interruptible(
+    sidecar: &mut Sidecar,
+    pool: &SqlitePool,
+    request: &CollectionRequest,
+    interrupted: &AtomicBool,
+    on_progress: impl FnMut(u64, u64),
+    event_timeout: Duration,
+) -> Result<CollectionSummary> {
+    run_collection_with_execution(
+        sidecar,
+        pool,
+        request,
+        &mut None,
+        Some(ExternalStop::Interrupt(interrupted)),
+        on_progress,
+        event_timeout,
+    )
+    .await
+}
+
+/// 持久模式采集；ad-hoc 调用继续走 [`run_collection`]。
+pub async fn run_collection_persistent(
+    sidecar: &mut Sidecar,
+    pool: &SqlitePool,
+    request: &CollectionRequest,
+    execution: &mut PersistentExecution<'_>,
+    on_progress: impl FnMut(u64, u64),
+    event_timeout: Duration,
+) -> Result<CollectionSummary> {
+    run_collection_with_execution(
+        sidecar,
+        pool,
+        request,
+        &mut Some(execution),
+        None,
+        on_progress,
+        event_timeout,
+    )
+    .await
+}
+
+async fn run_collection_with_execution(
+    sidecar: &mut Sidecar,
+    pool: &SqlitePool,
+    request: &CollectionRequest,
+    execution: &mut Option<&mut PersistentExecution<'_>>,
+    external_stop: Option<ExternalStop<'_>>,
     mut on_progress: impl FnMut(u64, u64),
     event_timeout: Duration,
 ) -> Result<CollectionSummary> {
     // 1. 加载已有 checkpoint（续传），并把游标注入命令 payload。
     let mut payload = request.payload.clone();
-    if let Some(checkpoint) = load_checkpoint_cursor(pool, &request.stream).await? {
+    let checkpoint_stream = execution
+        .as_deref()
+        .map(|persistent| persistent.checkpoint_stream)
+        .unwrap_or(&request.stream);
+    if let Some(checkpoint) = load_checkpoint_cursor(pool, checkpoint_stream).await? {
         payload["checkpoint"] = checkpoint;
     }
     let initial_fetched_count = payload
@@ -111,14 +270,81 @@ pub async fn run_collection(
     let mut batch = PendingBatch::default();
     let mut done = false;
     let mut last_sequence = 0;
+    let mut event_deadline = Instant::now() + event_timeout;
+    let mut next_heartbeat = Instant::now();
 
     while !done {
-        let event = match sidecar.next_event(event_timeout) {
+        if external_stop.is_some_and(ExternalStop::triggered) {
+            sidecar
+                .kill_and_wait()
+                .map_err(|error| Error::FormatError(error.to_string()))?;
+            summary.status = external_stop
+                .map(ExternalStop::status)
+                .unwrap_or(CollectionStatus::Interrupted);
+            break;
+        }
+        if let Some(status) = poll_persistent_control(sidecar, execution)? {
+            summary.status = status;
+            break;
+        }
+        if let Some(persistent) = execution.as_deref_mut()
+            && Instant::now() >= next_heartbeat
+        {
+            let now = Utc::now();
+            let lease_until = now.timestamp()
+                + i64::try_from(persistent.lease_duration.as_secs()).unwrap_or(i64::MAX);
+            if !heartbeat_sync_run_at(
+                pool,
+                persistent.job_id,
+                persistent.run_id,
+                persistent.owner_token,
+                persistent.generation,
+                now.timestamp(),
+                lease_until,
+                &now.to_rfc3339(),
+            )
+            .await?
+            {
+                if let Ok(request) = persistent.control_rx.recv_timeout(persistent.poll_interval) {
+                    let stopped = sidecar.kill_and_wait().map_err(|error| error.to_string());
+                    let _ = request.ack.send(stopped.clone());
+                    stopped.map_err(Error::FormatError)?;
+                    summary.status = match request.action {
+                        ExecutionControl::Pause => CollectionStatus::Paused,
+                        ExecutionControl::Cancel => CollectionStatus::Cancelled,
+                        ExecutionControl::Shutdown => CollectionStatus::Shutdown,
+                    };
+                    break;
+                }
+                sidecar
+                    .kill_and_wait()
+                    .map_err(|error| Error::FormatError(error.to_string()))?;
+                summary.status = controlled_status_from_db(pool, persistent.job_id).await?;
+                break;
+            }
+            next_heartbeat = Instant::now() + persistent.heartbeat_interval;
+        }
+
+        let remaining = event_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            summary.status = CollectionStatus::Interrupted;
+            summary.error = Some("sidecar event receive timed out".to_string());
+            break;
+        }
+        let slice = execution
+            .as_deref()
+            .map(|persistent| persistent.poll_interval.min(remaining))
+            .or_else(|| external_stop.map(|_| Duration::from_millis(100).min(remaining)))
+            .unwrap_or(remaining);
+        let event = match sidecar.next_event(slice) {
             Ok(event) => event,
             Err(SidecarError::Exited { code, .. }) => {
                 summary.status = CollectionStatus::Interrupted;
                 summary.error = Some(format!("sidecar exited with code {code:?}"));
                 break;
+            }
+            Err(SidecarError::RecvTimeout(_)) if execution.is_some() || external_stop.is_some() => {
+                continue;
             }
             Err(SidecarError::RecvTimeout(_)) => {
                 summary.status = CollectionStatus::Interrupted;
@@ -152,6 +378,7 @@ pub async fn run_collection(
             .ok_or_else(|| Error::FormatError("sidecar event sequence missing".to_string()))?;
         validate_event_sequence(last_sequence, sequence)?;
         last_sequence = sequence;
+        event_deadline = Instant::now() + event_timeout;
         match event.event_type {
             EventType::User => {
                 let user = user_from_payload(&event.payload).ok_or_else(|| {
@@ -169,11 +396,23 @@ pub async fn run_collection(
                 batch.media.push(media_from_payload(&event.payload)?);
             }
             EventType::Checkpoint => {
-                let checkpoint = checkpoint_from_payload(&stream, &event.payload, sequence)?;
+                let mut checkpoint =
+                    checkpoint_from_payload(checkpoint_stream, &event.payload, sequence)?;
+                if let Some(persistent) = execution.as_deref() {
+                    checkpoint.job_id = Some(persistent.job_id);
+                    checkpoint.run_id = Some(persistent.run_id);
+                    checkpoint.generation = Some(persistent.generation);
+                    checkpoint.owner_token = Some(persistent.owner_token.to_string());
+                    checkpoint.owner = CheckpointOwner::Persistent {
+                        run_id: persistent.run_id,
+                        generation: persistent.generation,
+                        owner_token: persistent.owner_token.to_string(),
+                    };
+                }
                 let event_id = event.event_id.clone();
                 let plan = CommitPlan {
                     request_id: Some(command.request_id.clone()),
-                    stream: stream.clone(),
+                    stream: checkpoint_stream.to_string(),
                     sequence: sequence as i64,
                     event_id: event_id.clone(),
                     users: std::mem::take(&mut batch.users),
@@ -183,7 +422,22 @@ pub async fn run_collection(
                     checkpoint: checkpoint.clone(),
                     processed_at: now(),
                 };
-                plan.execute(pool).await?;
+                if let Err(error) = plan.execute_at(pool, Utc::now().timestamp()).await {
+                    if let Some(persistent) = execution.as_deref_mut() {
+                        let status = controlled_status_from_db(pool, persistent.job_id).await?;
+                        if matches!(
+                            status,
+                            CollectionStatus::Paused | CollectionStatus::Cancelled
+                        ) {
+                            sidecar
+                                .kill_and_wait()
+                                .map_err(|error| Error::FormatError(error.to_string()))?;
+                            summary.status = status;
+                            break;
+                        }
+                    }
+                    return Err(error);
+                }
                 summary.pages += 1;
                 summary.fetched_count = checkpoint.fetched_count as u64;
                 let total = event.total_expected.unwrap_or(0);
@@ -239,7 +493,27 @@ pub async fn run_collection(
                 done = true;
             }
             EventType::RateLimited => {
-                warn!("collection rate limited: stream={stream}");
+                let scope = RateLimitScope::parse_protocol(
+                    event
+                        .payload
+                        .get("scope")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| Error::FormatError("rate-limit scope missing".into()))?,
+                )?;
+                let retry_after_ms = event.payload.get("retry_after_ms").and_then(Value::as_u64);
+                summary.rate_limit = Some(RateLimitInfo {
+                    scope,
+                    retry_after_ms,
+                });
+                if execution.is_some() {
+                    sidecar
+                        .kill_and_wait()
+                        .map_err(|error| Error::FormatError(error.to_string()))?;
+                    summary.status = CollectionStatus::RateLimited;
+                    done = true;
+                } else {
+                    warn!("collection rate limited: stream={stream}");
+                }
             }
             EventType::Warning => {
                 if let Some(message) = event.payload.get("message").and_then(Value::as_str) {
@@ -257,6 +531,60 @@ pub async fn run_collection(
     }
 
     Ok(summary)
+}
+
+#[derive(Clone, Copy)]
+enum ExternalStop<'a> {
+    Cancel(&'a AtomicBool),
+    Interrupt(&'a AtomicBool),
+}
+
+impl ExternalStop<'_> {
+    fn triggered(self) -> bool {
+        match self {
+            Self::Cancel(flag) | Self::Interrupt(flag) => flag.load(Ordering::Acquire),
+        }
+    }
+
+    fn status(self) -> CollectionStatus {
+        match self {
+            Self::Cancel(_) => CollectionStatus::Cancelled,
+            Self::Interrupt(_) => CollectionStatus::Interrupted,
+        }
+    }
+}
+
+fn poll_persistent_control(
+    sidecar: &mut Sidecar,
+    execution: &mut Option<&mut PersistentExecution<'_>>,
+) -> Result<Option<CollectionStatus>> {
+    let Some(persistent) = execution.as_deref_mut() else {
+        return Ok(None);
+    };
+    let request = match persistent.control_rx.try_recv() {
+        Ok(request) => request,
+        Err(TryRecvError::Empty) => return Ok(None),
+        Err(TryRecvError::Disconnected) => return Ok(None),
+    };
+    let stopped = sidecar.kill_and_wait().map_err(|error| error.to_string());
+    let _ = request.ack.send(stopped.clone());
+    stopped.map_err(Error::FormatError)?;
+    Ok(Some(match request.action {
+        ExecutionControl::Pause => CollectionStatus::Paused,
+        ExecutionControl::Cancel => CollectionStatus::Cancelled,
+        ExecutionControl::Shutdown => CollectionStatus::Shutdown,
+    }))
+}
+
+async fn controlled_status_from_db(pool: &SqlitePool, job_id: i64) -> Result<CollectionStatus> {
+    let job = get_sync_job(pool, job_id)
+        .await?
+        .ok_or_else(|| Error::InconsistentTask(format!("sync job {job_id} not found")))?;
+    Ok(match job.status.as_str() {
+        "paused" => CollectionStatus::Paused,
+        "cancelled" => CollectionStatus::Cancelled,
+        _ => CollectionStatus::Interrupted,
+    })
 }
 
 /// 从 `sync_checkpoints` 读取游标并还原为命令的 `checkpoint` payload。
@@ -313,6 +641,11 @@ fn checkpoint_from_payload(
         fetched_count,
         last_sequence: Some(sequence as i64),
         updated_at: now(),
+        job_id: None,
+        run_id: None,
+        generation: None,
+        owner_token: None,
+        owner: CheckpointOwner::AdHoc,
     })
 }
 

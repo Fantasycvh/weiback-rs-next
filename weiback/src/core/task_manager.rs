@@ -326,6 +326,11 @@ impl TaskManager {
         )
     }
 
+    /// Pauses the matching active task.
+    pub fn pause_for(&self, task_id: u64) -> Result<()> {
+        self.transition_for(task_id, TaskStatus::Paused, None, "pause")
+    }
+
     /// 取消当前任务（`InProgress`/`Paused` → `Cancelled`）。
     pub fn cancel_current(&self) -> Result<()> {
         let mut task_guard = self.current_task.lock()?;

@@ -55,9 +55,7 @@ pub fn detect_legacy_sources(data_root: &Path) -> Vec<LegacyDetection> {
 
     let kind = classify(schema_version);
     let (picture_dir, video_dir) = match kind {
-        LegacySourceKind::PythonV2 => {
-            (Some(legacy_root.join("images")), None)
-        }
+        LegacySourceKind::PythonV2 => (Some(legacy_root.join("images")), None),
         LegacySourceKind::RustV1 => (
             Some(legacy_root.join("pictures")),
             Some(legacy_root.join("videos")),
@@ -95,7 +93,9 @@ fn read_sqlite_user_version(path: &Path) -> Option<u32> {
     if &header[0..16] != b"SQLite format 3\0" {
         return None;
     }
-    Some(u32::from_be_bytes([header[60], header[61], header[62], header[63]]))
+    Some(u32::from_be_bytes([
+        header[60], header[61], header[62], header[63],
+    ]))
 }
 
 #[cfg(test)]
@@ -187,10 +187,7 @@ mod local_tests {
             detection.picture_dir,
             Some(tmp.path().join("weiback/pictures"))
         );
-        assert_eq!(
-            detection.video_dir,
-            Some(tmp.path().join("weiback/videos"))
-        );
+        assert_eq!(detection.video_dir, Some(tmp.path().join("weiback/videos")));
     }
 
     #[tokio::test]

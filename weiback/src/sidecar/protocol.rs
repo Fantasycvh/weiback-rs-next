@@ -273,9 +273,8 @@ pub fn parse_event_line(line: &str) -> Result<EventEnvelope, ProtocolError> {
         return Err(ProtocolError::UnsupportedVersion(version));
     }
 
-    let event_type = get_str(obj, "type").ok_or_else(|| {
-        ProtocolError::MissingField("type".to_string())
-    })?;
+    let event_type =
+        get_str(obj, "type").ok_or_else(|| ProtocolError::MissingField("type".to_string()))?;
     let event_type = EventType::parse(event_type)
         .ok_or_else(|| ProtocolError::UnknownEvent(event_type.to_string()))?;
 
@@ -286,9 +285,8 @@ pub fn parse_event_line(line: &str) -> Result<EventEnvelope, ProtocolError> {
         return Err(ProtocolError::InvalidRequestId(rid.to_string()));
     }
 
-    let event_id = get_str(obj, "event_id").ok_or_else(|| {
-        ProtocolError::MissingField("event_id".to_string())
-    })?;
+    let event_id = get_str(obj, "event_id")
+        .ok_or_else(|| ProtocolError::MissingField("event_id".to_string()))?;
     if !is_uuid_v7(event_id) {
         return Err(ProtocolError::InvalidEventId(event_id.to_string()));
     }
@@ -328,8 +326,8 @@ pub fn parse_command_line(line: &str) -> Result<CommandEnvelope, ProtocolError> 
         return Err(ProtocolError::UnsupportedVersion(version));
     }
 
-    let command_type = get_str(obj, "type")
-        .ok_or_else(|| ProtocolError::MissingField("type".to_string()))?;
+    let command_type =
+        get_str(obj, "type").ok_or_else(|| ProtocolError::MissingField("type".to_string()))?;
     let command_type = CommandType::parse(command_type)
         .ok_or_else(|| ProtocolError::UnknownCommand(command_type.to_string()))?;
 

@@ -8,7 +8,6 @@
 pub mod api;
 pub mod builder;
 pub mod config;
-pub mod sidecar;
 pub mod core;
 pub mod emoji_map;
 pub mod error;
@@ -19,7 +18,12 @@ pub mod legacy;
 pub mod media_downloader;
 pub mod message;
 pub mod models;
+pub mod rate_limit;
+pub mod refresh_scheduler;
+pub mod sidecar;
+mod sqlite_write;
 pub mod storage;
+pub mod sync_executor;
 pub mod utils;
 
 #[cfg(test)]

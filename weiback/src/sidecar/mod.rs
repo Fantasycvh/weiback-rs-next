@@ -7,8 +7,14 @@ pub mod collector;
 pub mod protocol;
 pub mod supervisor;
 
-pub use collector::{CollectionRequest, CollectionStatus, CollectionSummary, run_collection};
+pub use collector::{
+    CollectionRequest, CollectionStatus, CollectionSummary, ExecutionControl,
+    ExecutionControlRequest, PersistentExecution, RateLimitInfo, RateLimitScope, run_collection,
+    run_collection_cancellable, run_collection_interruptible, run_collection_persistent,
+};
 pub use protocol::{
     CommandEnvelope, CommandType, EventEnvelope, EventType, MAX_MESSAGE_BYTES, PROTOCOL_VERSION,
 };
-pub use supervisor::{Sidecar, SidecarError, SpawnOptions, collection_spawn_options};
+pub use supervisor::{
+    DEFAULT_HANDSHAKE_TIMEOUT, Sidecar, SidecarError, SpawnOptions, collection_spawn_options,
+};

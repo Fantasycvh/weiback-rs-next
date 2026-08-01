@@ -28,6 +28,8 @@ use super::protocol::{
     new_uuid_v7, parse_event_line,
 };
 
+pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Sidecar 命令解析：优先使用环境变量 `WEIBACK_COLLECTOR_CMD`，
 /// 否则使用当前可执行文件同目录下的 `weiback-collector.exe`（Windows）
 /// 或 `weiback-collector`（其它平台）。
@@ -69,7 +71,7 @@ pub fn collection_spawn_options(session_path: &Path) -> Result<SpawnOptions, Sid
             ),
         ],
         cwd: None,
-        handshake_timeout: Duration::from_secs(10),
+        handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
     })
 }
 
@@ -95,7 +97,7 @@ impl Default for SpawnOptions {
             args: Vec::new(),
             env: Vec::new(),
             cwd: None,
-            handshake_timeout: Duration::from_secs(10),
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         }
     }
 }
@@ -115,6 +117,9 @@ pub enum SidecarError {
     /// 握手超时，进程可能仍在运行。
     #[error("sidecar handshake timed out after {0:?}")]
     HandshakeTimeout(Duration),
+    /// 上层在握手期间请求停止，子进程已回收。
+    #[error("sidecar handshake cancelled")]
+    HandshakeCancelled,
     /// 进程在握手或事件读取期间提前退出。
     #[error("sidecar exited with code {code:?}: {detail}")]
     Exited { code: Option<i32>, detail: String },
@@ -165,6 +170,10 @@ impl std::fmt::Debug for Sidecar {
 }
 
 impl Sidecar {
+    /// 子进程 PID，用于 worker registry 诊断与退出确认。
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
     /// 启动 Sidecar 并立即接管三路管道，随后等待握手完成。
     ///
     /// 握手流程：spawn 后先发送 `hello`，再等待 `ready` 与 `capabilities`。
@@ -172,10 +181,28 @@ impl Sidecar {
     pub fn spawn_with_handshake(
         options: &SpawnOptions,
     ) -> Result<(Self, Value, Value), SidecarError> {
+        Self::spawn_with_handshake_cancellable(options, || false)
+    }
+
+    /// 启动 Sidecar，并在握手期间周期检查上层取消信号。
+    pub fn spawn_with_handshake_cancellable<F>(
+        options: &SpawnOptions,
+        cancelled: F,
+    ) -> Result<(Self, Value, Value), SidecarError>
+    where
+        F: Fn() -> bool,
+    {
         let mut process = Self::spawn_raw(options)?;
-        process.send_hello()?;
-        let (ready, capabilities) = process.wait_handshake(options.handshake_timeout)?;
-        Ok((process, ready, capabilities))
+        let handshake = process
+            .send_hello()
+            .and_then(|()| process.wait_handshake(options.handshake_timeout, cancelled));
+        match handshake {
+            Ok((ready, capabilities)) => Ok((process, ready, capabilities)),
+            Err(error) => {
+                let _ = process.kill_and_wait();
+                Err(error)
+            }
+        }
     }
 
     /// 启动 Sidecar 并接管管道，不等待握手。
@@ -221,18 +248,27 @@ impl Sidecar {
     /// 或超时 / 进程退出 / 收到 error。
     ///
     /// 返回 `(ready_payload, capabilities_payload)`。
-    fn wait_handshake(&mut self, timeout: Duration) -> Result<(Value, Value), SidecarError> {
+    fn wait_handshake<F>(
+        &mut self,
+        timeout: Duration,
+        cancelled: F,
+    ) -> Result<(Value, Value), SidecarError>
+    where
+        F: Fn() -> bool,
+    {
         let deadline = Instant::now() + timeout;
         let mut ready: Option<Value> = None;
         let mut capabilities: Option<Value> = None;
 
         while ready.is_none() || capabilities.is_none() {
+            if cancelled() {
+                return Err(SidecarError::HandshakeCancelled);
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                let _ = self.kill();
                 return Err(SidecarError::HandshakeTimeout(timeout));
             }
-            match self.next_event(remaining) {
+            match self.next_event(remaining.min(Duration::from_millis(100))) {
                 Ok(EventEnvelope {
                     event_type: EventType::Ready,
                     payload,
@@ -254,7 +290,6 @@ impl Sidecar {
                     payload,
                     ..
                 }) => {
-                    let _ = self.kill();
                     return Err(SidecarError::HandshakeFailed(format!(
                         "sidecar reported error: {payload}"
                     )));
@@ -262,10 +297,7 @@ impl Sidecar {
                 Ok(_) => {
                     // 忽略握手前的其它事件（progress/warning 等）
                 }
-                Err(SidecarError::RecvTimeout(_)) => {
-                    let _ = self.kill();
-                    return Err(SidecarError::HandshakeTimeout(timeout));
-                }
+                Err(SidecarError::RecvTimeout(_)) => continue,
                 Err(e) => return Err(e),
             }
         }
@@ -369,8 +401,22 @@ impl Sidecar {
 
     /// 强制终止子进程。
     pub fn kill(&mut self) -> Result<(), SidecarError> {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        match self.child.try_wait()? {
+            Some(_) => return Ok(()),
+            None => self.child.kill()?,
+        }
+        self.child.wait()?;
+        Ok(())
+    }
+
+    /// 强制终止并等待，只有确认进程已退出才返回。
+    pub fn kill_and_wait(&mut self) -> Result<(), SidecarError> {
+        self.kill()?;
+        if self.child.try_wait()?.is_none() {
+            return Err(SidecarError::HandshakeFailed(
+                "sidecar remained alive after kill+wait".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -383,6 +429,15 @@ impl Sidecar {
     fn wait_code(&mut self) -> Result<Option<i32>, SidecarError> {
         let status = self.child.wait()?;
         Ok(status.code())
+    }
+}
+
+impl Drop for Sidecar {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 }
 

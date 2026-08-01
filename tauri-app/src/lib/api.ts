@@ -10,6 +10,14 @@ import {
   ResolutionPolicy,
   CleanupInvalidPostsOptions,
   DeletePostOptions,
+  MonitoredUser,
+  SyncAccount,
+  SaveMonitoredUserInput,
+  SaveSyncAccountInput,
+  SyncJob,
+  SyncJobControlOutcome,
+  SyncJobSpec,
+  SyncRun,
 } from '../types'
 import { Config } from '../types/config'
 import { LegacyDetection } from '../types/legacy'
@@ -31,6 +39,27 @@ export const login = (smsCode: string) => invoke<User>('login', { smsCode })
 // Tasks
 export const getCurrentTaskStatus = () => invoke<Task | null>('get_current_task_status')
 export const getAndClearTaskErrors = () => invoke<TaskError[]>('get_and_clear_task_errors')
+
+// Persistent sync
+export const getSyncAccounts = () => invoke<SyncAccount[]>('get_sync_accounts')
+export const saveSyncAccount = (input: SaveSyncAccountInput) =>
+  invoke<string>('save_sync_account', { input })
+export const deleteSyncAccount = (id: string) => invoke<boolean>('delete_sync_account', { id })
+export const getMonitoredUsers = () => invoke<MonitoredUser[]>('get_monitored_users')
+export const saveMonitoredUser = (input: SaveMonitoredUserInput) =>
+  invoke<void>('save_monitored_user', { input })
+export const deleteMonitoredUser = (accountId: string, uid: string) =>
+  invoke<boolean>('delete_monitored_user', { accountId, uid })
+export const enqueueSyncJob = (spec: SyncJobSpec) => invoke<string>('enqueue_sync_job', { spec })
+export const getSyncJobs = () => invoke<SyncJob[]>('get_sync_jobs')
+export const getSyncRunHistory = (jobId: string, limit = 100) =>
+  invoke<SyncRun[]>('get_sync_run_history', { jobId, limit })
+export const pauseSyncJob = (jobId: string) =>
+  invoke<SyncJobControlOutcome>('pause_sync_job', { jobId })
+export const resumeSyncJob = (jobId: string) => invoke<SyncJob>('resume_sync_job', { jobId })
+export const cancelSyncJob = (jobId: string) =>
+  invoke<SyncJobControlOutcome>('cancel_sync_job', { jobId })
+export const retrySyncJob = (jobId: string) => invoke<SyncJob>('retry_sync_job', { jobId })
 
 // Backup
 export const backupUser = (uid: string, numPages: number, backupType: BackupType) =>

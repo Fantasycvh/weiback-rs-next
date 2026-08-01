@@ -4,11 +4,13 @@
 //! `WEIBACK_COLLECTOR_PYTHON` 或常见候选路径定位 Python；找不到时跳过
 //! 该轮测试，避免在无 Python 的 CI 环境误报失败。
 use std::{
+    fs,
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
 };
 
+use tempfile::tempdir;
 use weiback::sidecar::{
     CommandEnvelope, CommandType, EventType, Sidecar, SidecarError, SpawnOptions,
     protocol::{self, new_uuid_v7},
@@ -39,6 +41,14 @@ fn python() -> Option<PathBuf> {
             .map(|s| s.success())
             .unwrap_or(false)
     })
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    let output = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+        .expect("tasklist should run");
+    String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
 }
 
 /// 启动真实 Python sidecar 并完成握手的选项。
@@ -74,13 +84,31 @@ fn handshake_succeeds_with_real_collector() {
     assert_eq!(ready["protocol_version"], 1);
     assert!(ready["sidecar_version"].is_string());
 
-    let versions = capabilities["protocol_versions"].as_array().expect("protocol_versions");
+    let versions = capabilities["protocol_versions"]
+        .as_array()
+        .expect("protocol_versions");
     assert!(versions.contains(&serde_json::json!(1)));
 
     let commands = capabilities["commands"].as_array().expect("commands");
     assert!(commands.iter().any(|c| c == "hello"));
 
-    sidecar.shutdown(Duration::from_millis(500)).expect("clean shutdown");
+    sidecar
+        .shutdown(Duration::from_millis(500))
+        .expect("clean shutdown");
+}
+
+#[test]
+fn dropping_sidecar_kills_and_reaps_child() {
+    let Some(py) = python() else {
+        eprintln!("python not found, skipping");
+        return;
+    };
+    let (sidecar, _, _) =
+        Sidecar::spawn_with_handshake(&collector_options(&py)).expect("handshake should succeed");
+    let pid = sidecar.pid();
+    assert!(process_is_alive(pid));
+    drop(sidecar);
+    assert!(!process_is_alive(pid));
 }
 
 /// 无效 JSON：supervisor 丢弃非法行并继续读取下一条合法事件。
@@ -104,7 +132,9 @@ fn invalid_json_line_is_skipped_and_next_event_read() {
     assert_eq!(event.event_type, EventType::Error);
     assert_eq!(event.payload["code"], "INVALID_COMMAND");
 
-    sidecar.shutdown(Duration::from_millis(500)).expect("clean shutdown");
+    sidecar
+        .shutdown(Duration::from_millis(500))
+        .expect("clean shutdown");
 }
 
 /// 协议不兼容：sidecar 输出 protocol_version=2 时握手失败。
@@ -136,6 +166,42 @@ fn incompatible_protocol_version_fails_handshake() {
     }
 }
 
+/// spawn_raw 成功后，任何协议失败都必须在返回前 kill+wait。
+#[test]
+fn protocol_failure_kills_and_reaps_spawned_process_before_return() {
+    let Some(py) = python() else {
+        eprintln!("python not found, skipping");
+        return;
+    };
+    let dir = tempdir().unwrap();
+    let pid_path = dir.path().join("sidecar.pid");
+    let script = format!(
+        "import os,pathlib,sys,time\npathlib.Path(r'{}').write_text(str(os.getpid()))\nprint('{{\"protocol_version\":2,\"request_id\":null,\"event_id\":\"019fbbd7-ea26-7b7c-b113-c89ac2788780\",\"type\":\"ready\",\"occurred_at\":\"2026-08-01T00:00:00Z\",\"payload\":{{}}}}')\nsys.stdout.flush()\ntime.sleep(30)\n",
+        pid_path.display()
+    );
+    let options = SpawnOptions {
+        program: py,
+        args: vec!["-u".into(), "-c".into(), script],
+        env: vec![("PYTHONUTF8".into(), "1".into())],
+        cwd: None,
+        handshake_timeout: Duration::from_secs(3),
+    };
+
+    let error = Sidecar::spawn_with_handshake(&options).expect_err("protocol must fail");
+    assert!(matches!(
+        error,
+        SidecarError::Protocol(protocol::ProtocolError::UnsupportedVersion(2))
+    ));
+    let pid: u32 = fs::read_to_string(&pid_path)
+        .expect("script writes pid")
+        .parse()
+        .expect("valid pid");
+    assert!(
+        !process_is_alive(pid),
+        "PID {pid} must be reaped before return"
+    );
+}
+
 /// 退出码异常：sidecar 在握手前退出，返回退出码信息。
 #[test]
 fn early_exit_reports_exit_code() {
@@ -165,10 +231,15 @@ fn handshake_timeout_is_diagnostic() {
         eprintln!("python not found, skipping");
         return;
     };
-    let script = "import time\ntime.sleep(30)\n";
+    let dir = tempdir().unwrap();
+    let pid_path = dir.path().join("handshake-timeout.pid");
+    let script = format!(
+        "import os,pathlib,time\npathlib.Path(r'{}').write_text(str(os.getpid()))\ntime.sleep(30)\n",
+        pid_path.display()
+    );
     let options = SpawnOptions {
         program: py.to_path_buf(),
-        args: vec!["-u".into(), "-c".into(), script.into()],
+        args: vec!["-u".into(), "-c".into(), script],
         env: vec![("PYTHONUTF8".into(), "1".into())],
         cwd: None,
         handshake_timeout: Duration::from_millis(300),
@@ -177,6 +248,46 @@ fn handshake_timeout_is_diagnostic() {
     let err = Sidecar::spawn_with_handshake(&options).expect_err("handshake must fail");
     assert!(matches!(err, SidecarError::HandshakeTimeout(_)));
     assert!(started.elapsed() < Duration::from_secs(5));
+    let pid: u32 = fs::read_to_string(pid_path)
+        .expect("script writes pid")
+        .parse()
+        .expect("valid pid");
+    assert!(
+        !process_is_alive(pid),
+        "PID {pid} must be reaped on timeout"
+    );
+}
+
+#[test]
+fn handshake_cancellation_kills_and_reaps_process() {
+    let Some(py) = python() else {
+        eprintln!("python not found, skipping");
+        return;
+    };
+    let dir = tempdir().unwrap();
+    let pid_path = dir.path().join("handshake-cancel.pid");
+    let script = format!(
+        "import os,pathlib,time\npathlib.Path(r'{}').write_text(str(os.getpid()))\ntime.sleep(30)\n",
+        pid_path.display()
+    );
+    let options = SpawnOptions {
+        program: py.to_path_buf(),
+        args: vec!["-u".into(), "-c".into(), script],
+        env: vec![("PYTHONUTF8".into(), "1".into())],
+        cwd: None,
+        handshake_timeout: Duration::from_secs(10),
+    };
+    let started = std::time::Instant::now();
+    let err = Sidecar::spawn_with_handshake_cancellable(&options, || {
+        started.elapsed() >= Duration::from_millis(200)
+    })
+    .expect_err("cancelled handshake must fail");
+    assert!(matches!(err, SidecarError::HandshakeCancelled));
+    let pid: u32 = fs::read_to_string(pid_path)
+        .expect("script writes pid")
+        .parse()
+        .expect("valid pid");
+    assert!(!process_is_alive(pid), "PID {pid} must be reaped on cancel");
 }
 
 /// 采集流：发送 collect_user_posts 后能读到 started / user / post / done 事件。
@@ -225,5 +336,7 @@ fn collect_stream_replays_fixture() {
     assert!(posts > 0, "expected posts from fixture");
     assert!(saw_done, "expected done event");
 
-    sidecar.shutdown(Duration::from_millis(500)).expect("clean shutdown");
+    sidecar
+        .shutdown(Duration::from_millis(500))
+        .expect("clean shutdown");
 }

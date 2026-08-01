@@ -446,8 +446,14 @@ mod local_tests {
         let dirs = RuntimeDirs::from_root(Path::new("data-root"));
 
         assert_eq!(dirs.data_dir, PathBuf::from("data-root/weiback-next"));
-        assert_eq!(dirs.db_path, PathBuf::from("data-root/weiback-next/weiback.db"));
-        assert_eq!(dirs.media_dir, PathBuf::from("data-root/weiback-next/media"));
+        assert_eq!(
+            dirs.db_path,
+            PathBuf::from("data-root/weiback-next/weiback.db")
+        );
+        assert_eq!(
+            dirs.media_dir,
+            PathBuf::from("data-root/weiback-next/media")
+        );
         assert_eq!(
             dirs.pictures_dir,
             PathBuf::from("data-root/weiback-next/media/pictures")
@@ -457,7 +463,10 @@ mod local_tests {
             PathBuf::from("data-root/weiback-next/media/videos")
         );
         assert_eq!(dirs.logs_dir, PathBuf::from("data-root/weiback-next/logs"));
-        assert_eq!(dirs.sidecar_dir, PathBuf::from("data-root/weiback-next/sidecar"));
+        assert_eq!(
+            dirs.sidecar_dir,
+            PathBuf::from("data-root/weiback-next/sidecar")
+        );
         assert_eq!(
             dirs.chromium_dir,
             PathBuf::from("data-root/weiback-next/chromium")

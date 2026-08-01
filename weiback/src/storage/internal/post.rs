@@ -1370,8 +1370,14 @@ mod local_tests {
             Some(vec!["10001".to_string(), "10002".to_string()])
         );
         assert_eq!(fetched.is_long_text, Some(true));
-        assert_eq!(fetched.video_url, Some("https://weibo.com/v/abc".to_string()));
-        assert_eq!(fetched.raw_data, Some(serde_json::json!({"orig": {"x": 1}})));
+        assert_eq!(
+            fetched.video_url,
+            Some("https://weibo.com/v/abc".to_string())
+        );
+        assert_eq!(
+            fetched.raw_data,
+            Some(serde_json::json!({"orig": {"x": 1}}))
+        );
         assert_eq!(fetched.content_status, Some("partial".to_string()));
         assert_eq!(fetched.fetch_error, Some("HTTP 429".to_string()));
         assert_eq!(fetched.first_fetched_at, Some(fetched_at));

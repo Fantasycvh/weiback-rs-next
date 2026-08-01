@@ -16,12 +16,13 @@ pub mod task_handler;
 pub mod task_manager;
 
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+    Arc, Mutex, MutexGuard,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use tokio::spawn;
+use tokio::{spawn, task::JoinHandle};
 use tracing::{error, info, warn};
 use weibosdk_rs::{ApiClient as SdkApiClient, api_client::LoginState, session::Session};
 
@@ -34,11 +35,23 @@ use crate::error::Result;
 use crate::exporter::ExporterImpl;
 use crate::media_downloader::MediaDownloaderHandle;
 use crate::models::User;
+use crate::refresh_scheduler::{PersistentScheduler, RefreshScheduleConfig};
 use crate::sidecar::{
-    CollectionRequest, CollectionStatus, CommandType, Sidecar, collection_spawn_options,
-    run_collection,
+    CollectionRequest, CollectionStatus, CommandType, DEFAULT_HANDSHAKE_TIMEOUT, Sidecar,
+    collection_spawn_options, run_collection_interruptible,
 };
 use crate::storage::StorageImpl;
+use crate::storage::internal::entities::{
+    AccountDto, JobControlResult, MonitoredUserDto, SyncJobDto, SyncJobSpec, SyncRunDto,
+    delete_account, delete_monitored_user, enqueue_sync_job_spec, get_accounts,
+    get_monitored_users, get_sync_job, get_sync_jobs, get_sync_run_history,
+    recover_interrupted_sync_jobs, resume_sync_job, retry_sync_job, save_account,
+    save_monitored_user,
+};
+use crate::sync_executor::{
+    ControlStopResult, JobExecutor, WorkerRegistry, WorkerShutdownSummary,
+    account_session_resolver, validate_account_session,
+};
 pub use task::{
     BackupFavoritesOptions, BackupUserPostsOptions, CleanupInvalidPostsOptions, DeletePostOptions,
     ExportJobOptions, PaginatedPostInfo, PostQuery, TaskContext, TaskRequest, UserPostFilter,
@@ -83,6 +96,103 @@ pub struct Core {
     task_manager: Arc<TaskManager>,
     sdk_api_client: Arc<CurrentSdkApiClient>,
     db_pool: SqlitePool,
+    persistent_workers: Arc<WorkerRegistry>,
+    shutdown_admission: ShutdownAdmission,
+    persistent_scheduler: Mutex<PersistentSchedulerLifecycle>,
+    ad_hoc_collection: Mutex<Option<AdHocCollectionTask>>,
+}
+
+#[derive(Default)]
+struct ShutdownAdmission {
+    shutting_down: AtomicBool,
+    gate: Mutex<()>,
+}
+
+impl ShutdownAdmission {
+    fn enter(&self) -> Result<MutexGuard<'_, ()>> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(crate::error::Error::InconsistentTask(
+                "core is shutting down".to_string(),
+            ));
+        }
+        let gate = self.gate.lock()?;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(crate::error::Error::InconsistentTask(
+                "core is shutting down".to_string(),
+            ));
+        }
+        Ok(gate)
+    }
+
+    fn begin_shutdown(&self) {
+        let _gate = self.gate.lock().unwrap_or_else(|error| error.into_inner());
+        self.shutting_down.store(true, Ordering::Release);
+    }
+}
+
+#[derive(Default)]
+struct PersistentSchedulerLifecycle {
+    task: Option<PersistentSchedulerTask>,
+}
+
+struct PersistentSchedulerTask {
+    cancelled: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
+    handle: JoinHandle<()>,
+}
+
+struct AdHocCollectionTask {
+    cancelled: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SyncJobControlOutcome {
+    pub job: SyncJobDto,
+    pub worker_stop: ControlStopResult,
+}
+
+impl SyncJobControlOutcome {
+    pub fn degraded(&self) -> bool {
+        self.worker_stop.is_degraded()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulerShutdownStatus {
+    NotRunning,
+    Stopped,
+    TimedOut,
+    JoinFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistentShutdownSummary {
+    pub scheduler: SchedulerShutdownStatus,
+    pub ad_hoc: SchedulerShutdownStatus,
+    pub workers: WorkerShutdownSummary,
+    pub database_failures: Vec<PersistentShutdownFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistentShutdownFailure {
+    pub job_id: i64,
+    pub error: String,
+}
+
+impl PersistentShutdownSummary {
+    pub fn degraded(&self) -> bool {
+        matches!(
+            self.scheduler,
+            SchedulerShutdownStatus::TimedOut | SchedulerShutdownStatus::JoinFailed
+        ) || self.workers.degraded()
+            || matches!(
+                self.ad_hoc,
+                SchedulerShutdownStatus::TimedOut | SchedulerShutdownStatus::JoinFailed
+            )
+            || !self.database_failures.is_empty()
+    }
 }
 
 impl Core {
@@ -100,6 +210,255 @@ impl Core {
             task_manager: Arc::new(TaskManager::new()),
             sdk_api_client,
             db_pool,
+            persistent_workers: Arc::new(WorkerRegistry::new()),
+            shutdown_admission: ShutdownAdmission::default(),
+            persistent_scheduler: Mutex::new(PersistentSchedulerLifecycle::default()),
+            ad_hoc_collection: Mutex::new(None),
+        })
+    }
+
+    fn persistent_executor(&self) -> Result<JobExecutor> {
+        let session_path = get_config().read()?.session_path.clone();
+        let options = collection_spawn_options(&session_path)
+            .map_err(|error| crate::error::Error::FormatError(error.to_string()))?;
+        Ok(JobExecutor::with_spawn_options(
+            self.db_pool.clone(),
+            self.persistent_workers.clone(),
+            options.clone(),
+        )
+        .with_account_resolver(account_session_resolver(options)))
+    }
+
+    /// Starts the single background loop that scans monitored users and drains the queue.
+    pub fn start_persistent_scheduler(&self) -> Result<bool> {
+        let _admission = match self.shutdown_admission.enter() {
+            Ok(admission) => admission,
+            Err(crate::error::Error::InconsistentTask(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let mut lifecycle = self.persistent_scheduler.lock()?;
+        if lifecycle.task.is_some() {
+            return Ok(false);
+        }
+        let executor = self.persistent_executor()?;
+        let scheduler = PersistentScheduler::new(
+            self.db_pool.clone(),
+            executor,
+            RefreshScheduleConfig::default(),
+        );
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let handle = spawn(scheduler.run_until_cancelled(
+            std::time::Duration::from_secs(1),
+            cancelled.clone(),
+            wake.clone(),
+        ));
+        lifecycle.task = Some(PersistentSchedulerTask {
+            cancelled,
+            wake,
+            handle,
+        });
+        Ok(true)
+    }
+
+    pub async fn shutdown_persistent_tasks(
+        &self,
+        timeout: std::time::Duration,
+    ) -> PersistentShutdownSummary {
+        self.shutdown_admission.begin_shutdown();
+        let wait_timeout =
+            timeout.max(DEFAULT_HANDSHAKE_TIMEOUT + std::time::Duration::from_secs(3));
+        let deadline = tokio::time::Instant::now() + wait_timeout;
+        let scheduler_task = match self.persistent_scheduler.lock() {
+            Ok(mut lifecycle) => lifecycle.task.take(),
+            Err(_) => None,
+        };
+        if let Some(task) = &scheduler_task {
+            task.cancelled.store(true, Ordering::Release);
+            task.wake.notify_waiters();
+        }
+        let ad_hoc_task = self
+            .ad_hoc_collection
+            .lock()
+            .ok()
+            .and_then(|mut task| task.take());
+        if let Some(task) = &ad_hoc_task {
+            task.cancelled.store(true, Ordering::Release);
+        }
+
+        self.persistent_workers.begin_shutdown();
+        let database_failures = Vec::new();
+        let registry = self.persistent_workers.clone();
+        let worker_task = tokio::task::spawn_blocking(move || registry.shutdown_all(wait_timeout));
+        let workers = match worker_task.await {
+            Ok(summary) => summary,
+            Err(error) => WorkerShutdownSummary {
+                workers: vec![crate::sync_executor::WorkerShutdownOutcome {
+                    job_id: 0,
+                    worker_stop: ControlStopResult::StopFailed(error.to_string()),
+                }],
+            },
+        };
+        let scheduler = match scheduler_task {
+            None => SchedulerShutdownStatus::NotRunning,
+            Some(mut task) => match tokio::time::timeout_at(deadline, &mut task.handle).await {
+                Ok(Ok(())) => SchedulerShutdownStatus::Stopped,
+                Ok(Err(_)) => SchedulerShutdownStatus::JoinFailed,
+                Err(_) => {
+                    if let Ok(mut lifecycle) = self.persistent_scheduler.lock() {
+                        lifecycle.task = Some(task);
+                    }
+                    SchedulerShutdownStatus::TimedOut
+                }
+            },
+        };
+        let ad_hoc = match ad_hoc_task {
+            None => SchedulerShutdownStatus::NotRunning,
+            Some(mut task) => match tokio::time::timeout_at(deadline, &mut task.handle).await {
+                Ok(Ok(())) => SchedulerShutdownStatus::Stopped,
+                Ok(Err(_)) => SchedulerShutdownStatus::JoinFailed,
+                Err(_) => {
+                    if let Ok(mut lifecycle) = self.ad_hoc_collection.lock() {
+                        *lifecycle = Some(task);
+                    }
+                    SchedulerShutdownStatus::TimedOut
+                }
+            },
+        };
+        PersistentShutdownSummary {
+            scheduler,
+            ad_hoc,
+            workers,
+            database_failures,
+        }
+    }
+
+    pub async fn recover_persistent_tasks(&self) -> Result<()> {
+        let now = chrono::Utc::now();
+        let summary =
+            recover_interrupted_sync_jobs(&self.db_pool, now.timestamp(), &now.to_rfc3339())
+                .await?;
+        if summary.requeued > 0 || summary.failed > 0 {
+            info!(
+                requeued = summary.requeued,
+                failed = summary.failed,
+                "recovered expired persistent tasks"
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn get_accounts(&self) -> Result<Vec<AccountDto>> {
+        get_accounts(&self.db_pool).await
+    }
+
+    pub async fn save_account(&self, mut account: AccountDto) -> Result<i64> {
+        let session_root = get_config()
+            .read()?
+            .session_path
+            .parent()
+            .ok_or_else(|| {
+                crate::error::Error::FormatError("configured session root is invalid".into())
+            })?
+            .to_path_buf();
+        validate_account_session(&account, &session_root)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        if account.created_at.is_empty() {
+            account.created_at = now.clone();
+        }
+        account.updated_at = Some(now);
+        let id = save_account(&self.db_pool, &account).await?;
+        if !account.enabled {
+            let job_ids = get_sync_jobs(&self.db_pool)
+                .await?
+                .into_iter()
+                .filter(|job| job.account_id == id && self.persistent_workers.contains(job.id))
+                .map(|job| job.id)
+                .collect::<Vec<_>>();
+            for job_id in job_ids {
+                let registry = self.persistent_workers.clone();
+                let stopped = tokio::task::spawn_blocking(move || {
+                    registry.stop_fenced_job(job_id, std::time::Duration::from_secs(5))
+                })
+                .await
+                .map_err(|error| crate::error::Error::Tokio(error.to_string()))?;
+                if stopped.is_degraded() {
+                    warn!(job_id, result = ?stopped, "disabled account worker stop degraded");
+                }
+            }
+        }
+        Ok(id)
+    }
+
+    pub async fn delete_account(&self, id: i64) -> Result<bool> {
+        delete_account(&self.db_pool, id).await
+    }
+
+    pub async fn get_monitored_users(&self) -> Result<Vec<MonitoredUserDto>> {
+        get_monitored_users(&self.db_pool).await
+    }
+
+    pub async fn save_monitored_user(&self, mut user: MonitoredUserDto) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        if user.created_at.is_empty() {
+            user.created_at = now.clone();
+        }
+        user.updated_at = Some(now);
+        save_monitored_user(&self.db_pool, &user).await
+    }
+
+    pub async fn delete_monitored_user(&self, account_id: i64, uid: i64) -> Result<bool> {
+        delete_monitored_user(&self.db_pool, account_id, uid).await
+    }
+
+    pub async fn enqueue_sync_job(&self, spec: SyncJobSpec) -> Result<i64> {
+        let now = chrono::Utc::now();
+        enqueue_sync_job_spec(&self.db_pool, &spec, now.timestamp(), &now.to_rfc3339()).await
+    }
+
+    pub async fn get_sync_jobs(&self) -> Result<Vec<SyncJobDto>> {
+        get_sync_jobs(&self.db_pool).await
+    }
+
+    pub async fn get_sync_run_history(&self, job_id: i64, limit: u64) -> Result<Vec<SyncRunDto>> {
+        get_sync_run_history(&self.db_pool, job_id, limit.min(1000)).await
+    }
+
+    pub async fn pause_sync_job(&self, job_id: i64) -> Result<SyncJobControlOutcome> {
+        let worker_stop = JobExecutor::new(self.db_pool.clone(), self.persistent_workers.clone())
+            .pause(job_id, std::time::Duration::from_secs(5))
+            .await?;
+        Ok(SyncJobControlOutcome {
+            job: self.require_sync_job(job_id).await?,
+            worker_stop,
+        })
+    }
+
+    pub async fn cancel_sync_job(&self, job_id: i64) -> Result<SyncJobControlOutcome> {
+        let worker_stop = JobExecutor::new(self.db_pool.clone(), self.persistent_workers.clone())
+            .cancel(job_id, std::time::Duration::from_secs(5))
+            .await?;
+        Ok(SyncJobControlOutcome {
+            job: self.require_sync_job(job_id).await?,
+            worker_stop,
+        })
+    }
+
+    pub async fn resume_sync_job(&self, job_id: i64) -> Result<SyncJobDto> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let _: JobControlResult = resume_sync_job(&self.db_pool, job_id, &now).await?;
+        self.require_sync_job(job_id).await
+    }
+
+    pub async fn retry_sync_job(&self, job_id: i64) -> Result<SyncJobDto> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let _: JobControlResult = retry_sync_job(&self.db_pool, job_id, &now).await?;
+        self.require_sync_job(job_id).await
+    }
+
+    async fn require_sync_job(&self, job_id: i64) -> Result<SyncJobDto> {
+        get_sync_job(&self.db_pool, job_id).await?.ok_or_else(|| {
+            crate::error::Error::InconsistentTask(format!("sync job {job_id} not found"))
         })
     }
 
@@ -389,25 +748,53 @@ impl Core {
         description: &str,
         request: CollectionRequest,
     ) -> Result<()> {
+        let _admission = self.shutdown_admission.enter()?;
+        let mut lifecycle = self.ad_hoc_collection.lock()?;
+        if lifecycle
+            .as_ref()
+            .is_some_and(|task| !task.handle.is_finished())
+        {
+            return Err(crate::error::Error::InconsistentTask(
+                "sidecar collection is already running".into(),
+            ));
+        }
+        lifecycle.take();
         let session_path = get_config().read()?.session_path.clone();
         let task_id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
         self.task_manager
             .start_task(task_id, task_type, description.into(), 0)?;
 
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
         let pool = self.db_pool.clone();
         let task_manager = self.task_manager.clone();
-        spawn(async move {
+        let handle = spawn(async move {
             let blocking_task_manager = task_manager.clone();
             let runtime = tokio::runtime::Handle::current();
             let result = tokio::task::spawn_blocking(move || {
                 let options = collection_spawn_options(&session_path)
                     .map_err(|e| crate::error::Error::FormatError(e.to_string()))?;
-                let (mut sidecar, _, _) = Sidecar::spawn_with_handshake(&options)
-                    .map_err(|e| crate::error::Error::FormatError(e.to_string()))?;
-                let result = runtime.block_on(run_collection(
+                let (mut sidecar, _, _) =
+                    match Sidecar::spawn_with_handshake_cancellable(&options, || {
+                        worker_cancelled.load(Ordering::Acquire)
+                    }) {
+                        Ok(sidecar) => sidecar,
+                        Err(crate::sidecar::SidecarError::HandshakeCancelled) => {
+                            return Ok(crate::sidecar::CollectionSummary {
+                                status: CollectionStatus::Shutdown,
+                                error: Some("application shutdown during sidecar handshake".into()),
+                                ..crate::sidecar::CollectionSummary::default()
+                            });
+                        }
+                        Err(error) => {
+                            return Err(crate::error::Error::FormatError(error.to_string()));
+                        }
+                    };
+                let result = runtime.block_on(run_collection_interruptible(
                     &mut sidecar,
                     &pool,
                     &request,
+                    &worker_cancelled,
                     |progress, total| {
                         if let Err(e) = blocking_task_manager.update_progress_for(
                             task_id,
@@ -432,6 +819,7 @@ impl Core {
                 Err(error) => fail_collection_task(&task_manager, task_id, error.to_string()),
             }
         });
+        *lifecycle = Some(AdHocCollectionTask { cancelled, handle });
         Ok(())
     }
 
@@ -630,7 +1018,11 @@ fn finish_collection_task(
     let result = match status {
         CollectionStatus::Completed => task_manager.finish_for(task_id),
         CollectionStatus::Stopped => task_manager.cancel_for(task_id),
+        CollectionStatus::Paused => task_manager.pause_for(task_id),
+        CollectionStatus::Cancelled => task_manager.cancel_for(task_id),
+        CollectionStatus::RateLimited => task_manager.interrupt_for(task_id),
         CollectionStatus::Interrupted => task_manager.interrupt_for(task_id),
+        CollectionStatus::Shutdown => task_manager.interrupt_for(task_id),
         CollectionStatus::Failed => task_manager.fail_for(
             task_id,
             error_message.unwrap_or_else(|| "sidecar collection failed".to_string()),
@@ -691,5 +1083,39 @@ async fn handle_task_request(task_handler: Arc<TH>, ctx: Arc<TaskContext>, reque
         if let Err(e) = ctx.task_manager.finish() {
             error!("Failed to set task {} as finished: {}", task_id, e);
         }
+    }
+}
+
+#[cfg(test)]
+mod shutdown_admission_tests {
+    use super::ShutdownAdmission;
+    use std::{
+        sync::{Arc, mpsc},
+        time::Duration,
+    };
+
+    #[test]
+    fn shutdown_admission_rejects_new_starts_after_shutdown_begins() {
+        let admission = ShutdownAdmission::default();
+        admission.begin_shutdown();
+        assert!(admission.enter().is_err());
+    }
+
+    #[test]
+    fn shutdown_waits_for_in_flight_start_critical_section() {
+        let admission = Arc::new(ShutdownAdmission::default());
+        let start_guard = admission.enter().unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let shutting_down = admission.clone();
+        let shutdown = std::thread::spawn(move || {
+            shutting_down.begin_shutdown();
+            done_tx.send(()).unwrap();
+        });
+
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(start_guard);
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        shutdown.join().unwrap();
+        assert!(admission.enter().is_err());
     }
 }

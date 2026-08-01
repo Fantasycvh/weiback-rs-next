@@ -1,6 +1,9 @@
 mod error;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
@@ -10,14 +13,25 @@ use weiback::builder::CoreBuilder;
 use weiback::config::{Config, get_config};
 use weiback::core::{
     BackupFavoritesOptions, BackupUserPostsOptions, CleanupInvalidPostsOptions, Core,
-    DeletePostOptions, ExportJobOptions, PostQuery, TaskEventListener, TaskRequest,
+    DeletePostOptions, ExportJobOptions, PostQuery, SyncJobControlOutcome, TaskEventListener,
+    TaskRequest,
     task::{BackupType, CleanupPicturesOptions, PaginatedPostInfo},
     task_manager::{Task, TaskError},
 };
 use weiback::media_downloader::{DownloaderStatus, MediaDownloaderStatusListener};
 use weiback::models::User;
+use weiback::storage::internal::entities::{
+    AccountDto, MonitoredUserDto, RefreshTier, SyncJobDto, SyncJobSpec, SyncRunDto,
+};
+use weiback::sync_executor::ControlStopResult;
 
-use error::{Error, Result};
+use error::{Error, INVALID_SYNC_INPUT, Result, SYNC_OPERATION_FAILED, stable_sync_error};
+
+const MAX_SYNC_PAGES: u32 = 1_000;
+const MIN_SYNC_PRIORITY: i32 = 0;
+const MAX_SYNC_PRIORITY: i32 = 1_000;
+const MAX_REFRESH_INTERVAL_SECS: i64 = 7 * 24 * 60 * 60;
+const MAX_REFRESH_JITTER_SECS: i64 = MAX_REFRESH_INTERVAL_SECS;
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(tag = "status")]
@@ -34,6 +48,7 @@ pub enum BackendStatus {
 
 pub struct BackendState {
     pub status: Mutex<BackendStatus>,
+    pub exit_started: AtomicBool,
 }
 
 /// A reporter that forwards task events to the Tauri frontend via `emit`.
@@ -71,6 +86,357 @@ impl From<WeiboId> for i64 {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountWireDto {
+    pub id: String,
+    pub provider: String,
+    pub uid: String,
+    pub display_name: Option<String>,
+    pub enabled: bool,
+    pub has_session: bool,
+    pub created_at: String,
+    pub updated_at: Option<String>,
+}
+
+impl From<AccountDto> for AccountWireDto {
+    fn from(account: AccountDto) -> Self {
+        Self {
+            id: account.id.to_string(),
+            provider: account.provider,
+            uid: account.uid,
+            display_name: account.display_name,
+            enabled: account.enabled,
+            has_session: !account.session_ref.is_empty(),
+            created_at: account.created_at,
+            updated_at: account.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SaveSyncAccountInput {
+    pub id: Option<WeiboId>,
+    pub provider: String,
+    pub uid: String,
+    pub display_name: Option<String>,
+    pub session_ref: Option<String>,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MonitoredUserWireDto {
+    pub account_id: String,
+    pub uid: String,
+    pub screen_name: Option<String>,
+    pub refresh_strategy: String,
+    pub enabled: bool,
+    pub last_refreshed_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: Option<String>,
+    pub tier: RefreshTier,
+    pub interval_secs: String,
+    pub jitter_secs: String,
+    pub next_refresh_epoch: String,
+    pub last_refresh_epoch: Option<String>,
+}
+
+impl From<MonitoredUserDto> for MonitoredUserWireDto {
+    fn from(user: MonitoredUserDto) -> Self {
+        Self {
+            account_id: user.account_id.to_string(),
+            uid: user.uid.to_string(),
+            screen_name: user.screen_name,
+            refresh_strategy: user.refresh_strategy,
+            enabled: user.enabled,
+            last_refreshed_at: user.last_refreshed_at,
+            created_at: user.created_at,
+            updated_at: user.updated_at,
+            tier: user.tier,
+            interval_secs: user.interval_secs.to_string(),
+            jitter_secs: user.jitter_secs.to_string(),
+            next_refresh_epoch: user.next_refresh_epoch.to_string(),
+            last_refresh_epoch: user.last_refresh_epoch.map(|epoch| epoch.to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SaveMonitoredUserInput {
+    pub account_id: WeiboId,
+    pub uid: WeiboId,
+    pub screen_name: Option<String>,
+    pub refresh_strategy: String,
+    pub enabled: bool,
+    pub tier: RefreshTier,
+    pub interval_secs: i64,
+    pub jitter_secs: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SyncJobWireDto {
+    pub id: String,
+    pub resource_key: String,
+    pub name: String,
+    pub kind: String,
+    pub status: String,
+    pub priority: String,
+    pub schedule_config: Option<String>,
+    pub enabled: bool,
+    pub recovery_count: String,
+    pub max_recovery_attempts: String,
+    pub available_at: Option<String>,
+    pub available_at_epoch: String,
+    pub claimed_at: Option<String>,
+    pub current_run_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: Option<String>,
+    pub account_id: String,
+    pub endpoint_key: String,
+}
+
+impl From<SyncJobDto> for SyncJobWireDto {
+    fn from(job: SyncJobDto) -> Self {
+        Self {
+            id: job.id.to_string(),
+            resource_key: job.resource_key,
+            name: job.name,
+            kind: job.kind,
+            status: job.status,
+            priority: job.priority.to_string(),
+            schedule_config: job.schedule_config,
+            enabled: job.enabled,
+            recovery_count: job.recovery_count.to_string(),
+            max_recovery_attempts: job.max_recovery_attempts.to_string(),
+            available_at: job.available_at,
+            available_at_epoch: job.available_at_epoch.to_string(),
+            claimed_at: job.claimed_at,
+            current_run_id: job.current_run_id.map(|id| id.to_string()),
+            created_at: job.created_at,
+            updated_at: job.updated_at,
+            account_id: job.account_id.to_string(),
+            endpoint_key: job.endpoint_key,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SyncJobControlWireOutcome {
+    pub job: SyncJobWireDto,
+    pub worker_stop: ControlStopWireResult,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "status", content = "detail", rename_all = "snake_case")]
+pub enum ControlStopWireResult {
+    Stopped { pid: u32 },
+    WorkerNotFound,
+    WorkerStarting,
+    StopTimedOut { pid: u32 },
+    StopFailed(String),
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SyncRunWireDto {
+    pub id: String,
+    pub job_id: String,
+    pub status: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub stats_json: Option<String>,
+    pub attempt: String,
+    pub updated_at: Option<String>,
+}
+
+impl From<SyncRunDto> for SyncRunWireDto {
+    fn from(run: SyncRunDto) -> Self {
+        Self {
+            id: run.id.to_string(),
+            job_id: run.job_id.to_string(),
+            status: run.status,
+            started_at: run.started_at,
+            finished_at: run.finished_at,
+            stats_json: run.stats_json,
+            attempt: run.attempt.to_string(),
+            updated_at: run.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[allow(clippy::enum_variant_names)]
+enum SyncJobCommandSpec {
+    CollectUserPosts {
+        account_id: WeiboId,
+        uid: WeiboId,
+        max_pages: Option<u32>,
+        priority: i32,
+    },
+    CollectComments {
+        account_id: WeiboId,
+        post_id: WeiboId,
+        max_pages: Option<u32>,
+        priority: i32,
+    },
+    CollectCommentReplies {
+        account_id: WeiboId,
+        post_id: WeiboId,
+        root_comment_id: WeiboId,
+        max_pages: Option<u32>,
+        priority: i32,
+    },
+}
+
+impl From<SyncJobCommandSpec> for SyncJobSpec {
+    fn from(spec: SyncJobCommandSpec) -> Self {
+        match spec {
+            SyncJobCommandSpec::CollectUserPosts {
+                account_id,
+                uid,
+                max_pages,
+                priority,
+            } => Self::CollectUserPosts {
+                account_id: account_id.into(),
+                uid: uid.into(),
+                max_pages: max_pages.map(u64::from),
+                priority: i64::from(priority),
+            },
+            SyncJobCommandSpec::CollectComments {
+                account_id,
+                post_id,
+                max_pages,
+                priority,
+            } => Self::CollectComments {
+                account_id: account_id.into(),
+                post_id: post_id.into(),
+                max_pages: max_pages.map(u64::from),
+                priority: i64::from(priority),
+            },
+            SyncJobCommandSpec::CollectCommentReplies {
+                account_id,
+                post_id,
+                root_comment_id,
+                max_pages,
+                priority,
+            } => Self::CollectCommentReplies {
+                account_id: account_id.into(),
+                post_id: post_id.into(),
+                root_comment_id: root_comment_id.into(),
+                max_pages: max_pages.map(u64::from),
+                priority: i64::from(priority),
+            },
+        }
+    }
+}
+
+fn sync_core_error(operation: &'static str, error: impl std::fmt::Display) -> Error {
+    error!(operation, error = %error, "sync command failed");
+    stable_sync_error(SYNC_OPERATION_FAILED)
+}
+
+fn validate_session_ref(session_ref: &str) -> Result<()> {
+    if session_ref.is_empty()
+        || session_ref.contains('\0')
+        || session_ref.starts_with('/')
+        || session_ref.starts_with('\\')
+        || session_ref.as_bytes().get(1) == Some(&b':')
+        || session_ref.split(['/', '\\']).any(|part| part == "..")
+    {
+        return Err(stable_sync_error(INVALID_SYNC_INPUT));
+    }
+    Ok(())
+}
+
+fn validate_account_input(input: &SaveSyncAccountInput) -> Result<()> {
+    if input.provider.trim().is_empty()
+        || input.provider.len() > 64
+        || input.uid.trim().is_empty()
+        || input.uid.len() > 128
+    {
+        return Err(stable_sync_error(INVALID_SYNC_INPUT));
+    }
+    if let Some(session_ref) = input.session_ref.as_deref() {
+        validate_session_ref(session_ref)?;
+    }
+    Ok(())
+}
+
+fn validate_monitor_input(input: &SaveMonitoredUserInput) -> Result<()> {
+    if input.account_id.0 <= 0 || input.uid.0 <= 0 {
+        return Err(stable_sync_error(INVALID_SYNC_INPUT));
+    }
+    if !matches!(input.refresh_strategy.as_str(), "hot" | "warm" | "cold") {
+        return Err(stable_sync_error(INVALID_SYNC_INPUT));
+    }
+    if !(1..=MAX_REFRESH_INTERVAL_SECS).contains(&input.interval_secs)
+        || !(0..=MAX_REFRESH_JITTER_SECS).contains(&input.jitter_secs)
+        || input.jitter_secs > input.interval_secs
+    {
+        return Err(stable_sync_error(INVALID_SYNC_INPUT));
+    }
+    Ok(())
+}
+
+fn validate_job_spec(spec: &SyncJobCommandSpec) -> Result<()> {
+    let (account_id, resource_id, max_pages, priority) = match spec {
+        SyncJobCommandSpec::CollectUserPosts {
+            account_id,
+            uid,
+            max_pages,
+            priority,
+            ..
+        } => (account_id.0, uid.0, max_pages, priority),
+        SyncJobCommandSpec::CollectComments {
+            account_id,
+            post_id,
+            max_pages,
+            priority,
+            ..
+        } => (account_id.0, post_id.0, max_pages, priority),
+        SyncJobCommandSpec::CollectCommentReplies {
+            account_id,
+            post_id,
+            root_comment_id,
+            max_pages,
+            priority,
+            ..
+        } => {
+            if root_comment_id.0 <= 0 {
+                return Err(stable_sync_error(INVALID_SYNC_INPUT));
+            }
+            (account_id.0, post_id.0, max_pages, priority)
+        }
+    };
+    if account_id <= 0
+        || resource_id <= 0
+        || max_pages.is_some_and(|pages| !(1..=MAX_SYNC_PAGES).contains(&pages))
+        || !(MIN_SYNC_PRIORITY..=MAX_SYNC_PRIORITY).contains(priority)
+    {
+        return Err(stable_sync_error(INVALID_SYNC_INPUT));
+    }
+    Ok(())
+}
+
+fn safe_worker_stop(result: ControlStopResult) -> ControlStopWireResult {
+    match result {
+        ControlStopResult::Stopped { pid } => ControlStopWireResult::Stopped { pid },
+        ControlStopResult::WorkerNotFound => ControlStopWireResult::WorkerNotFound,
+        ControlStopResult::WorkerStarting => ControlStopWireResult::WorkerStarting,
+        ControlStopResult::StopTimedOut { pid } => ControlStopWireResult::StopTimedOut { pid },
+        ControlStopResult::StopFailed(error) => {
+            error!(error = %error, "sync worker stop failed");
+            ControlStopWireResult::StopFailed(SYNC_OPERATION_FAILED.to_string())
+        }
+    }
+}
+
+fn sync_control_wire(outcome: SyncJobControlOutcome) -> SyncJobControlWireOutcome {
+    SyncJobControlWireOutcome {
+        job: outcome.job.into(),
+        worker_stop: safe_worker_stop(outcome.worker_stop),
+    }
+}
+
 #[tauri::command]
 async fn get_backend_status(state: State<'_, BackendState>) -> Result<BackendStatus> {
     Ok(state.status.lock().unwrap().clone())
@@ -87,7 +453,7 @@ fn perform_init_backend(app_handle: &AppHandle, state: &BackendState) -> Backend
     let mut warning = None;
     if let Err(e) = weiback::config::init() {
         warn!("Config initialization failed, using default: {e}");
-        warning = Some(e.to_string());
+        warning = Some("Configuration could not be loaded; defaults are in use".to_string());
         // Fallback to in-memory default configuration.
         weiback::config::init_default();
     }
@@ -108,6 +474,15 @@ fn perform_init_backend(app_handle: &AppHandle, state: &BackendState) -> Backend
                 error!("Failed to set task event listener: {e}");
             }
 
+            if let Err(error) = core.start_persistent_scheduler() {
+                warn!(error = %error, "Persistent scheduler is unavailable");
+                warning = Some(match warning {
+                    Some(existing) => format!("{existing}; persistent scheduler unavailable"),
+                    None => {
+                        "Persistent scheduler is unavailable; see the application log".to_string()
+                    }
+                });
+            }
             let core_clone = core.clone();
             tauri::async_runtime::spawn(async move { core_clone.login_with_session().await });
 
@@ -119,7 +494,7 @@ fn perform_init_backend(app_handle: &AppHandle, state: &BackendState) -> Backend
         Err(e) => {
             error!("Backend initialization failed: {e}");
             *status_guard = BackendStatus::Error {
-                message: e.to_string(),
+                message: "Backend initialization failed; see the application log".to_string(),
             };
             status_guard.clone()
         }
@@ -251,6 +626,231 @@ async fn collect_comment_replies(
     Ok(core
         .collect_comment_replies(post_id.into(), root_comment_id.into(), max_pages)
         .await?)
+}
+
+#[tauri::command]
+async fn get_sync_accounts(core: State<'_, Arc<Core>>) -> Result<Vec<AccountWireDto>> {
+    Ok(core
+        .get_accounts()
+        .await
+        .map_err(|error| sync_core_error("get_sync_accounts", error))?
+        .into_iter()
+        .map(Into::into)
+        .collect())
+}
+
+#[tauri::command]
+async fn save_sync_account(
+    core: State<'_, Arc<Core>>,
+    input: SaveSyncAccountInput,
+) -> Result<String> {
+    validate_account_input(&input)?;
+    let existing = core
+        .get_accounts()
+        .await
+        .map_err(|error| sync_core_error("save_sync_account/get_accounts", error))?;
+    let account = match input.id {
+        Some(id) => {
+            let Some(current) = existing.into_iter().find(|account| account.id == id.0) else {
+                return Err(Error("Account not found".into()));
+            };
+            if current.provider != input.provider || current.uid != input.uid {
+                return Err(Error("Account provider and uid cannot be changed".into()));
+            }
+            AccountDto {
+                id: current.id,
+                provider: current.provider,
+                uid: current.uid,
+                display_name: input.display_name,
+                session_ref: input.session_ref.clone().unwrap_or(current.session_ref),
+                enabled: input.enabled,
+                created_at: current.created_at,
+                updated_at: current.updated_at,
+            }
+        }
+        None => {
+            if existing
+                .iter()
+                .any(|account| account.provider == input.provider && account.uid == input.uid)
+            {
+                return Err(stable_sync_error(
+                    "An account with this provider and uid already exists",
+                ));
+            }
+            let session_ref = input.session_ref.clone().ok_or_else(|| {
+                stable_sync_error("A session reference is required when creating an account")
+            })?;
+            validate_session_ref(&session_ref)?;
+            AccountDto {
+                id: 0,
+                provider: input.provider,
+                uid: input.uid,
+                display_name: input.display_name,
+                session_ref,
+                enabled: input.enabled,
+                created_at: String::new(),
+                updated_at: None,
+            }
+        }
+    };
+    core.save_account(account)
+        .await
+        .map(|id| id.to_string())
+        .map_err(|error| sync_core_error("save_sync_account", error))
+}
+
+#[tauri::command]
+async fn delete_sync_account(core: State<'_, Arc<Core>>, id: WeiboId) -> Result<bool> {
+    core.delete_account(id.into())
+        .await
+        .map_err(|error| sync_core_error("delete_sync_account", error))
+}
+
+#[tauri::command]
+async fn get_monitored_users(core: State<'_, Arc<Core>>) -> Result<Vec<MonitoredUserWireDto>> {
+    Ok(core
+        .get_monitored_users()
+        .await
+        .map_err(|error| sync_core_error("get_monitored_users", error))?
+        .into_iter()
+        .map(Into::into)
+        .collect())
+}
+
+#[tauri::command]
+async fn save_monitored_user(
+    core: State<'_, Arc<Core>>,
+    input: SaveMonitoredUserInput,
+) -> Result<()> {
+    validate_monitor_input(&input)?;
+    let existing = core
+        .get_monitored_users()
+        .await
+        .map_err(|error| sync_core_error("save_monitored_user/get_monitored_users", error))?;
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+    let user = existing
+        .into_iter()
+        .find(|user| user.account_id == input.account_id.0 && user.uid == input.uid.0)
+        .map(|current| MonitoredUserDto {
+            account_id: current.account_id,
+            uid: current.uid,
+            screen_name: input.screen_name.clone(),
+            refresh_strategy: input.refresh_strategy.clone(),
+            enabled: input.enabled,
+            last_refreshed_at: current.last_refreshed_at,
+            created_at: current.created_at,
+            updated_at: current.updated_at,
+            tier: input.tier,
+            interval_secs: input.interval_secs,
+            jitter_secs: input.jitter_secs,
+            next_refresh_epoch: current.next_refresh_epoch,
+            last_refresh_epoch: current.last_refresh_epoch,
+        })
+        .unwrap_or(MonitoredUserDto {
+            account_id: input.account_id.into(),
+            uid: input.uid.into(),
+            screen_name: input.screen_name,
+            refresh_strategy: input.refresh_strategy,
+            enabled: input.enabled,
+            last_refreshed_at: None,
+            created_at: String::new(),
+            updated_at: None,
+            tier: input.tier,
+            interval_secs: input.interval_secs,
+            jitter_secs: input.jitter_secs,
+            next_refresh_epoch: now_epoch,
+            last_refresh_epoch: None,
+        });
+    core.save_monitored_user(user)
+        .await
+        .map_err(|error| sync_core_error("save_monitored_user", error))
+}
+
+#[tauri::command]
+async fn delete_monitored_user(
+    core: State<'_, Arc<Core>>,
+    account_id: WeiboId,
+    uid: WeiboId,
+) -> Result<bool> {
+    core.delete_monitored_user(account_id.into(), uid.into())
+        .await
+        .map_err(|error| sync_core_error("delete_monitored_user", error))
+}
+
+#[tauri::command]
+async fn enqueue_sync_job(core: State<'_, Arc<Core>>, spec: SyncJobCommandSpec) -> Result<String> {
+    validate_job_spec(&spec)?;
+    core.enqueue_sync_job(spec.into())
+        .await
+        .map(|id| id.to_string())
+        .map_err(|error| sync_core_error("enqueue_sync_job", error))
+}
+
+#[tauri::command]
+async fn get_sync_jobs(core: State<'_, Arc<Core>>) -> Result<Vec<SyncJobWireDto>> {
+    Ok(core
+        .get_sync_jobs()
+        .await
+        .map_err(|error| sync_core_error("get_sync_jobs", error))?
+        .into_iter()
+        .map(Into::into)
+        .collect())
+}
+
+#[tauri::command]
+async fn get_sync_run_history(
+    core: State<'_, Arc<Core>>,
+    job_id: WeiboId,
+    limit: u64,
+) -> Result<Vec<SyncRunWireDto>> {
+    Ok(core
+        .get_sync_run_history(job_id.into(), limit)
+        .await
+        .map_err(|error| sync_core_error("get_sync_run_history", error))?
+        .into_iter()
+        .map(Into::into)
+        .collect())
+}
+
+#[tauri::command]
+async fn pause_sync_job(
+    core: State<'_, Arc<Core>>,
+    job_id: WeiboId,
+) -> Result<SyncJobControlWireOutcome> {
+    core.pause_sync_job(job_id.into())
+        .await
+        .map(sync_control_wire)
+        .map_err(|error| sync_core_error("pause_sync_job", error))
+}
+
+#[tauri::command]
+async fn resume_sync_job(core: State<'_, Arc<Core>>, job_id: WeiboId) -> Result<SyncJobWireDto> {
+    core.resume_sync_job(job_id.into())
+        .await
+        .map(Into::into)
+        .map_err(|error| sync_core_error("resume_sync_job", error))
+}
+
+#[tauri::command]
+async fn cancel_sync_job(
+    core: State<'_, Arc<Core>>,
+    job_id: WeiboId,
+) -> Result<SyncJobControlWireOutcome> {
+    core.cancel_sync_job(job_id.into())
+        .await
+        .map(sync_control_wire)
+        .map_err(|error| sync_core_error("cancel_sync_job", error))
+}
+
+#[tauri::command]
+async fn retry_sync_job(core: State<'_, Arc<Core>>, job_id: WeiboId) -> Result<SyncJobWireDto> {
+    core.retry_sync_job(job_id.into())
+        .await
+        .map(Into::into)
+        .map_err(|error| sync_core_error("retry_sync_job", error))
 }
 
 #[tauri::command]
@@ -443,6 +1043,19 @@ pub fn run() -> Result<()> {
             collect_user_posts,
             collect_comments,
             collect_comment_replies,
+            get_sync_accounts,
+            save_sync_account,
+            delete_sync_account,
+            get_monitored_users,
+            save_monitored_user,
+            delete_monitored_user,
+            enqueue_sync_job,
+            get_sync_jobs,
+            get_sync_run_history,
+            pause_sync_job,
+            resume_sync_job,
+            cancel_sync_job,
+            retry_sync_job,
             unfavorite_posts,
             export_posts,
             query_local_posts,
@@ -470,15 +1083,40 @@ pub fn run() -> Result<()> {
         ])
         .build(tauri::generate_context!())
         .expect("tauri app build failed")
-        .run(|_app_handle, _event| {
-            #[cfg(feature = "dev-mode")]
-            if let tauri::RunEvent::ExitRequested { code, api, .. } = _event
+        .run(|app_handle, event| {
+            if let tauri::RunEvent::ExitRequested { code, api, .. } = event
                 && code.is_none()
             {
                 api.prevent_exit();
-                weiback::dev_client::save_records();
-                _app_handle.cleanup_before_exit();
-                _app_handle.exit(0);
+                let state = app_handle.state::<BackendState>();
+                if state
+                    .exit_started
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    return;
+                }
+                let app_handle = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Some(core) = app_handle.try_state::<Arc<Core>>() {
+                        let summary = core
+                            .shutdown_persistent_tasks(std::time::Duration::from_secs(5))
+                            .await;
+                        if summary.degraded() {
+                            warn!(?summary, "persistent task shutdown was degraded");
+                            app_handle
+                                .state::<BackendState>()
+                                .exit_started
+                                .store(false, Ordering::Release);
+                            return;
+                        }
+                        info!(?summary, "persistent tasks stopped");
+                    }
+                    #[cfg(feature = "dev-mode")]
+                    weiback::dev_client::save_records();
+                    app_handle.cleanup_before_exit();
+                    app_handle.exit(0);
+                });
             }
         });
     Ok(())
@@ -488,6 +1126,7 @@ fn setup(app: &mut App) -> std::result::Result<(), Box<dyn std::error::Error>> {
     info!("Setting up Tauri application state");
     let state = BackendState {
         status: Mutex::new(BackendStatus::Uninitialized),
+        exit_started: AtomicBool::new(false),
     };
 
     app.manage(state);
@@ -497,6 +1136,174 @@ fn setup(app: &mut App) -> std::result::Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn sync_wire_dtos_stringify_large_ids_and_exclude_sensitive_fields() {
+        let account = AccountWireDto {
+            id: i64::MAX.to_string(),
+            provider: "weibo".into(),
+            uid: i64::MAX.to_string(),
+            display_name: Some("Alice".into()),
+            enabled: true,
+            has_session: true,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: None,
+        };
+        let job = SyncJobWireDto {
+            id: i64::MAX.to_string(),
+            resource_key: "user:1".into(),
+            name: "Collect".into(),
+            kind: "collect_user_posts".into(),
+            status: "pending".into(),
+            priority: "1".into(),
+            schedule_config: None,
+            enabled: true,
+            recovery_count: "0".into(),
+            max_recovery_attempts: "3".into(),
+            available_at: None,
+            available_at_epoch: "0".into(),
+            claimed_at: None,
+            current_run_id: Some(i64::MAX.to_string()),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: None,
+            account_id: i64::MAX.to_string(),
+            endpoint_key: "posts".into(),
+        };
+        let run = SyncRunWireDto {
+            id: i64::MAX.to_string(),
+            job_id: i64::MAX.to_string(),
+            status: "running".into(),
+            started_at: "2026-01-01T00:00:00Z".into(),
+            finished_at: None,
+            stats_json: None,
+            attempt: "1".into(),
+            updated_at: None,
+        };
+
+        let account_json = serde_json::to_value(account).unwrap();
+        let job_json = serde_json::to_value(job.clone()).unwrap();
+        let run_json = serde_json::to_value(run).unwrap();
+        assert_eq!(account_json["id"], json!(i64::MAX.to_string()));
+        assert_eq!(job_json["current_run_id"], json!(i64::MAX.to_string()));
+        assert_eq!(run_json["job_id"], json!(i64::MAX.to_string()));
+        for value in [&account_json, &job_json, &run_json] {
+            let object = value.as_object().unwrap();
+            for forbidden in [
+                "session_ref",
+                "owner_token",
+                "lease_until_epoch",
+                "generation",
+                "endpoint_gate_revision",
+                "account_gate_revision",
+                "payload_json",
+                "error",
+            ] {
+                assert!(!object.contains_key(forbidden), "found {forbidden}");
+            }
+        }
+
+        let control_json = serde_json::to_value(SyncJobControlWireOutcome {
+            job,
+            worker_stop: ControlStopWireResult::WorkerStarting,
+        })
+        .unwrap();
+        assert_eq!(control_json["worker_stop"]["status"], "worker_starting");
+        assert_eq!(control_json["job"]["id"], i64::MAX.to_string());
+    }
+
+    #[test]
+    fn sync_inputs_have_only_public_editable_fields() {
+        let account: SaveSyncAccountInput = serde_json::from_value(json!({
+            "id": "9007199254740993",
+            "provider": "weibo",
+            "uid": "123",
+            "display_name": "Alice",
+            "session_ref": "sessions/alice.json",
+            "enabled": true
+        }))
+        .unwrap();
+        assert_eq!(i64::from(account.id.unwrap()), 9_007_199_254_740_993_i64);
+
+        let patch: SaveSyncAccountInput = serde_json::from_value(json!({
+            "id": "1",
+            "provider": "weibo",
+            "uid": "123",
+            "display_name": "Renamed",
+            "enabled": false
+        }))
+        .unwrap();
+        assert!(patch.session_ref.is_none());
+
+        let user: SaveMonitoredUserInput = serde_json::from_value(json!({
+            "account_id": "1",
+            "uid": "9007199254740993",
+            "screen_name": "Alice",
+            "refresh_strategy": "scheduled",
+            "enabled": true,
+            "tier": "hot",
+            "interval_secs": 60,
+            "jitter_secs": 5
+        }))
+        .unwrap();
+        assert_eq!(i64::from(user.uid), 9_007_199_254_740_993_i64);
+    }
+
+    #[test]
+    fn sync_boundary_validation_rejects_unsafe_paths_and_bad_ranges() {
+        for path in [
+            "../session.json",
+            "/session.json",
+            "C:\\session.json",
+            "\\\\host\\session.json",
+        ] {
+            assert!(validate_session_ref(path).is_err(), "accepted {path}");
+        }
+        assert!(validate_session_ref("sessions/alice.json").is_ok());
+        let mut account: SaveSyncAccountInput = serde_json::from_value(json!({
+            "provider": "weibo", "uid": "2", "session_ref": "sessions/alice.json",
+            "display_name": null, "enabled": true
+        }))
+        .unwrap();
+        assert!(validate_account_input(&account).is_ok());
+        account.provider.clear();
+        assert!(validate_account_input(&account).is_err());
+
+        let mut monitor: SaveMonitoredUserInput = serde_json::from_value(json!({
+            "account_id": "1", "uid": "2", "refresh_strategy": "hot",
+            "enabled": true, "tier": "hot", "interval_secs": 60, "jitter_secs": 5
+        }))
+        .unwrap();
+        assert!(validate_monitor_input(&monitor).is_ok());
+        monitor.refresh_strategy = "scheduled".into();
+        assert!(validate_monitor_input(&monitor).is_err());
+        monitor.refresh_strategy = "hot".into();
+        monitor.jitter_secs = 61;
+        assert!(validate_monitor_input(&monitor).is_err());
+
+        let spec: SyncJobCommandSpec = serde_json::from_value(json!({
+            "kind": "collect_user_posts", "account_id": "1", "uid": "2",
+            "max_pages": 1001, "priority": 1
+        }))
+        .unwrap();
+        assert!(validate_job_spec(&spec).is_err());
+        let negative: SyncJobCommandSpec = serde_json::from_value(json!({
+            "kind": "collect_comments", "account_id": "-1", "post_id": "2",
+            "max_pages": 1, "priority": 1
+        }))
+        .unwrap();
+        assert!(validate_job_spec(&negative).is_err());
+    }
+
+    #[test]
+    fn sync_worker_failure_is_mapped_without_detail() {
+        let mapped = safe_worker_stop(ControlStopResult::StopFailed("secret db path".into()));
+        let json = serde_json::to_value(mapped).unwrap();
+        assert_eq!(json["detail"], SYNC_OPERATION_FAILED);
+        assert!(!json.to_string().contains("secret db path"));
+    }
+
     #[test]
     fn tauri_config_uses_the_permanent_next_identity() {
         let config: serde_json::Value =

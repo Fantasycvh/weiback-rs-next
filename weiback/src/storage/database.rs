@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use sqlx::{Sqlite, SqlitePool, migrate::MigrateDatabase};
+use sqlx::{Sqlite, SqlitePool, migrate::MigrateDatabase, sqlite::SqlitePoolOptions};
 use tracing::{error, info};
 
 use crate::config::get_config;
@@ -70,24 +70,76 @@ pub async fn create_db_pool_with_url(db_url: &str) -> Result<SqlitePool> {
     }
 
     info!("Connecting to database and running migrations...");
-    let db_pool = SqlitePool::connect(db_url).await?;
+    let db_pool = SqlitePoolOptions::new()
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::query("PRAGMA foreign_keys=ON")
+                    .execute(&mut *conn)
+                    .await?;
+                sqlx::query("PRAGMA busy_timeout=5000")
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(db_url)
+        .await?;
 
-    // 迁移前备份：仅已有文件需要（全新库无数据可备份）。
-    let backup_path = if !is_memory && !is_new_database {
-        Some(backup_before_migration(&db_pool, Path::new(db_url)).await?)
-    } else {
-        None
-    };
+    let migrator = sqlx::migrate!();
+    // 只有确实会改变 schema 时才创建快照；普通 reopen 不应持续产生备份。
+    let backup_path =
+        if !is_memory && !is_new_database && has_pending_migrations(&db_pool, &migrator).await? {
+            Some(backup_before_migration(&db_pool, Path::new(db_url)).await?)
+        } else {
+            None
+        };
 
-    run_migrations(&db_pool, sqlx::migrate!()).await.inspect_err(|e| {
+    run_migrations(&db_pool, migrator).await.inspect_err(|e| {
         error!(
             "Database migration failed: {e}. Original database preserved. Backup: {:?}",
             backup_path
         );
     })?;
 
+    let recovered_at = chrono::Utc::now().to_rfc3339();
+    let recovery = super::internal::entities::recover_interrupted_sync_jobs(
+        &db_pool,
+        chrono::Utc::now().timestamp(),
+        &recovered_at,
+    )
+    .await?;
+    if recovery.requeued > 0 || recovery.failed > 0 {
+        info!(
+            "Recovered interrupted sync jobs: requeued={}, failed={}",
+            recovery.requeued, recovery.failed
+        );
+    }
+
     info!("Database connection and migration successful.");
     Ok(db_pool)
+}
+
+async fn has_pending_migrations(
+    pool: &SqlitePool,
+    migrator: &sqlx::migrate::Migrator,
+) -> Result<bool> {
+    let table_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='_sqlx_migrations')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !table_exists {
+        return Ok(migrator.iter().next().is_some());
+    }
+    let applied: std::collections::HashSet<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success=1")
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .collect();
+    Ok(migrator
+        .iter()
+        .any(|migration| !applied.contains(&migration.version)))
 }
 
 /// 在迁移前用 `VACUUM INTO` 创建一致性备份。
@@ -123,10 +175,7 @@ async fn backup_before_migration(db_pool: &SqlitePool, db_path: &Path) -> Result
 ///
 /// 拆分为独立函数以便测试注入自定义 migrator（如含坏 SQL 的目录）
 /// 来验证迁移失败时原库保持可打开。
-async fn run_migrations(
-    db_pool: &SqlitePool,
-    migrator: sqlx::migrate::Migrator,
-) -> Result<()> {
+async fn run_migrations(db_pool: &SqlitePool, migrator: sqlx::migrate::Migrator) -> Result<()> {
     migrator.run(db_pool).await.map_err(|e| {
         error!("Database migration failed: {e}");
         Error::DbError(e.to_string())
@@ -225,7 +274,7 @@ mod local_tests {
         pool.close().await;
     }
 
-    /// 已有数据库文件时迁移前应创建备份（成功升级场景）。
+    /// 已有数据库文件但没有待执行迁移时不应创建备份。
     #[tokio::test]
     async fn test_existing_db_gets_migration_backup() {
         let dir = tempdir().unwrap();
@@ -233,23 +282,27 @@ mod local_tests {
         let db_url = db_path.to_str().unwrap();
 
         // 第一次创建：全新库，无备份。
-        let pool = create_db_pool_with_url(db_url).await.expect("create new db");
+        let pool = create_db_pool_with_url(db_url)
+            .await
+            .expect("create new db");
         sqlx::query("INSERT INTO posts (id, text) VALUES (1, 'legacy data');")
             .execute(&pool)
             .await
             .unwrap();
         pool.close().await;
 
-        // 第二次打开：已有迁移历史，触发备份并成功（无 pending migration）。
-        let pool = create_db_pool_with_url(db_url).await.expect("reopen existing db");
+        // 第二次打开：没有 pending migration，不应重复快照。
+        let pool = create_db_pool_with_url(db_url)
+            .await
+            .expect("reopen existing db");
 
-        // 备份文件应存在于同目录。
+        // 没有 pending migration，不应产生备份文件。
         let backups: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().contains("-migrate-backup-"))
             .collect();
-        assert_eq!(backups.len(), 1, "expected exactly one migration backup");
+        assert_eq!(backups.len(), 0, "no pending migration means no backup");
 
         // 原库数据应保留。
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM posts")
@@ -259,17 +312,6 @@ mod local_tests {
         assert_eq!(count, 1);
 
         pool.close().await;
-
-        // 备份文件应可独立打开且含原数据。
-        let backup_pool = SqlitePool::connect(backups[0].path().to_str().unwrap())
-            .await
-            .unwrap();
-        let backup_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM posts")
-            .fetch_one(&backup_pool)
-            .await
-            .unwrap();
-        assert_eq!(backup_count, 1);
-        backup_pool.close().await;
     }
 
     /// 迁移失败时原库保持可打开，备份保留。

@@ -33,6 +33,46 @@ async fn build_legacy_db(db_url: &str, mig_dir: &Path) {
     pool.close().await;
 }
 
+/// 用截至 P0-C 的真实 migration 构建数据库。
+async fn build_p0c_db(db_url: &str, mig_dir: &Path) {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let mut files: Vec<_> = std::fs::read_dir(&src)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
+    files.sort();
+    assert!(files.len() >= 5, "expected P2 migration after P0-C");
+    for file in files.iter().take(4) {
+        std::fs::copy(file, mig_dir.join(file.file_name().unwrap())).unwrap();
+    }
+    let migrator = sqlx::migrate::Migrator::new(mig_dir).await.unwrap();
+    Sqlite::create_database(db_url).await.unwrap();
+    let pool = SqlitePool::connect(db_url).await.unwrap();
+    migrator.run(&pool).await.unwrap();
+    pool.close().await;
+}
+
+/// 用截至 P2 Phase2 的真实 migration 构建数据库。
+async fn build_phase2_db(db_url: &str, mig_dir: &Path) {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let mut files: Vec<_> = std::fs::read_dir(&src)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .collect();
+    files.sort();
+    assert!(files.len() >= 6, "expected Phase3 migration after Phase2");
+    for file in files.iter().take(5) {
+        std::fs::copy(file, mig_dir.join(file.file_name().unwrap())).unwrap();
+    }
+    let migrator = sqlx::migrate::Migrator::new(mig_dir).await.unwrap();
+    Sqlite::create_database(db_url).await.unwrap();
+    let pool = SqlitePool::connect(db_url).await.unwrap();
+    migrator.run(&pool).await.unwrap();
+    pool.close().await;
+}
+
 #[tokio::test]
 async fn legacy_db_upgrades_without_data_loss() {
     let dir = tempdir().unwrap();
@@ -75,7 +115,9 @@ async fn legacy_db_upgrades_without_data_loss() {
     }
 
     // 升级：完整 migrate!()，触发迁移前备份。
-    let pool = create_db_pool_with_url(db_url).await.expect("upgrade succeeds");
+    let pool = create_db_pool_with_url(db_url)
+        .await
+        .expect("upgrade succeeds");
 
     // 帖子/用户/收藏不丢失。
     let posts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM posts")
@@ -204,10 +246,221 @@ async fn legacy_db_fts_still_tracks_new_rows() {
     .execute(&pool)
     .await
     .unwrap();
-    let fts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM posts_fts WHERE posts_fts MATCH '模糊搜索目标'")
+    let fts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM posts_fts WHERE posts_fts MATCH '模糊搜索目标'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(fts, 1, "fts tracks newly inserted rows after upgrade");
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn p0c_running_history_is_normalized_before_unique_index() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("p0c-dirty.sqlite");
+    let db_url = db_path.to_str().unwrap();
+    let mig_dir = dir.path().join("p0c_migrations");
+    std::fs::create_dir_all(&mig_dir).unwrap();
+    build_p0c_db(db_url, &mig_dir).await;
+
+    {
+        let pool = SqlitePool::connect(db_url).await.unwrap();
+        sqlx::query(
+            "INSERT INTO sync_jobs(name,kind,priority,enabled,created_at) VALUES('legacy','collect_user_posts',0,1,'2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for started in ["2026-01-01T00:00:01Z", "2026-01-01T00:00:02Z"] {
+            sqlx::query("INSERT INTO sync_runs(job_id,status,started_at) VALUES(1,'running',?)")
+                .bind(started)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        pool.close().await;
+    }
+
+    let pool = create_db_pool_with_url(db_url)
+        .await
+        .expect("dirty P0-C database must upgrade");
+    let running: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_runs WHERE status='running'")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(fts, 1, "fts tracks newly inserted rows after upgrade");
-    pool.close().await;
+    let interrupted: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sync_runs WHERE status='interrupted'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(running, 0);
+    assert_eq!(interrupted, 2);
+    let ownership: (Option<String>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT owner_token, lease_until_epoch, current_run_id FROM sync_jobs WHERE id=1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(ownership, (None, None, None));
+}
+
+#[tokio::test]
+async fn phase2_database_upgrades_to_legacy_account_without_secrets() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("phase2.sqlite");
+    let db_url = db_path.to_str().unwrap();
+    let mig_dir = dir.path().join("phase2_migrations");
+    std::fs::create_dir_all(&mig_dir).unwrap();
+    build_phase2_db(db_url, &mig_dir).await;
+    {
+        let pool = SqlitePool::connect(db_url).await.unwrap();
+        sqlx::query(
+            "INSERT INTO monitored_users(uid,screen_name,refresh_strategy,enabled,created_at) \
+             VALUES(123,'legacy-user','daily',1,'2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sync_jobs(resource_key,name,kind,status,enabled,created_at) \
+             VALUES('legacy:job','legacy','collect_user_posts','pending',1,'2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+    }
+
+    let pool = create_db_pool_with_url(db_url).await.unwrap();
+    let legacy: (i64, String, String, bool) =
+        sqlx::query_as("SELECT id,provider,session_ref,enabled FROM accounts WHERE uid='legacy'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(legacy.1, "legacy");
+    assert!(!legacy.2.is_empty());
+    assert!(!legacy.3);
+    let monitored_account: i64 =
+        sqlx::query_scalar("SELECT account_id FROM monitored_users WHERE uid=123")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let job_account: i64 =
+        sqlx::query_scalar("SELECT account_id FROM sync_jobs WHERE resource_key='legacy:job'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((monitored_account, job_account), (legacy.0, legacy.0));
+    let monitored_enabled: bool =
+        sqlx::query_scalar("SELECT enabled FROM monitored_users WHERE uid=123")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(!monitored_enabled);
+    let archived_job: (String, bool, Option<String>) = sqlx::query_as(
+        "SELECT status,enabled,last_error FROM sync_jobs WHERE resource_key='legacy:job'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(archived_job.0, "failed");
+    assert!(!archived_job.1);
+    assert!(
+        archived_job
+            .2
+            .is_some_and(|error| error.contains("archived"))
+    );
+    let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('accounts')")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(
+        !columns.iter().any(|column| {
+            matches!(column.as_str(), "cookie" | "token" | "password" | "secret")
+        })
+    );
+    let unique_indexes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_index_list('monitored_users') WHERE [unique]=1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(unique_indexes >= 1);
+
+    let account_column: (i64, Option<String>) = sqlx::query_as(
+        "SELECT [notnull], dflt_value FROM pragma_table_info('sync_jobs') WHERE name='account_id'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(account_column, (1, None));
+    let account_fk: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_foreign_key_list('sync_jobs') \
+         WHERE [table]='accounts' AND [from]='account_id'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(account_fk, 1);
+    let invalid_account = sqlx::query(
+        "INSERT INTO sync_jobs(resource_key,name,kind,status,enabled,created_at,account_id) \
+         VALUES('invalid:account','invalid','collect_user_posts','failed',0,'x',999999)",
+    )
+    .execute(&pool)
+    .await;
+    assert!(invalid_account.is_err());
+}
+
+#[tokio::test]
+async fn phase3_archives_only_active_legacy_jobs_and_preserves_terminal_history() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("phase2-terminal.sqlite");
+    let db_url = db_path.to_str().unwrap();
+    let mig_dir = dir.path().join("phase2-terminal-migrations");
+    std::fs::create_dir_all(&mig_dir).unwrap();
+    build_phase2_db(db_url, &mig_dir).await;
+    {
+        let pool = SqlitePool::connect(db_url).await.unwrap();
+        for (resource, status, error) in [
+            ("active", "pending", Some("old active error")),
+            ("done", "completed", Some("completed detail")),
+            ("cancel", "cancelled", None),
+            ("failed", "failed", Some("original failure")),
+        ] {
+            sqlx::query(
+                "INSERT INTO sync_jobs(resource_key,name,kind,status,enabled,created_at,last_error) \
+                 VALUES(?,?,?, ?,1,?,?)",
+            )
+            .bind(resource)
+            .bind(resource)
+            .bind("collect_user_posts")
+            .bind(status)
+            .bind("2026-01-01T00:00:00Z")
+            .bind(error)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        pool.close().await;
+    }
+    let pool = create_db_pool_with_url(db_url).await.unwrap();
+    let rows: Vec<(String, bool, Option<String>)> =
+        sqlx::query_as("SELECT status,enabled,last_error FROM sync_jobs ORDER BY resource_key")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        rows[0],
+        ("failed".into(), false, Some("old active error".into()))
+    );
+    assert_eq!(rows[1], ("cancelled".into(), true, None));
+    assert_eq!(
+        rows[2],
+        ("completed".into(), true, Some("completed detail".into()))
+    );
+    assert_eq!(
+        rows[3],
+        ("failed".into(), true, Some("original failure".into()))
+    );
 }

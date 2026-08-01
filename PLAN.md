@@ -1,10 +1,10 @@
 # WeiBack 混合架构改进计划
 
-> 状态：提案（待实施）  
+> 状态：实施中（P0-P2 已完成）
 > 首期平台：Windows x64  
 > 主产品：`F:\build\weiback-rs\weiback-rs-master`  
 > Python 采集器：`F:\build\projects\weiback-python`  
-> 最后更新：2026-08-01
+> 最后更新：2026-08-02
 
 ## 1. 目标
 
@@ -638,17 +638,19 @@ running --进程退出--> interrupted -> pending/running
 
 交付物：
 
-- [ ] 持久任务队列和 run 历史。
-- [ ] 暂停、继续、取消、重试。
-- [ ] 监控用户和分层刷新。
-- [ ] 按账号/端点限流、指数退避和随机抖动。
-- [ ] 应用启动时恢复 interrupted 任务。
+- [x] 持久任务队列和 run 历史。
+- [x] 暂停、继续、取消、重试。
+- [x] 监控用户和分层刷新。
+- [x] 按账号/端点限流、指数退避和随机抖动。
+- [x] 应用启动时恢复 interrupted 任务。
 
 完成门槛：
 
 - 所有跨 session 状态均在 SQLite 中恢复。
 - 连续崩溃不会形成无限重启循环。
 - 同一资源不会因多个调度项并发重复抓取。
+
+验证：Python Sidecar `108` 项测试通过；Rust workspace 核心 `167` 项通过、`4` 项实时网络测试忽略，P2/纵向集成测试 `97` 项通过，Tauri 边界测试 `5` 项通过；`cargo clippy --workspace --all-targets -- -D warnings`、release check、前端 build/lint、rustfmt 和 diff check 均通过。覆盖持久队列与 run 历史、租约/checkpoint fencing、崩溃与握手期退出恢复、暂停/继续/取消/重试、账号禁用、分层刷新、账号/端点限流、持久退避预算和 Sidecar PID 回收。
 
 ### P3-A：统一媒体流水线（第 4 周）
 

@@ -122,6 +122,7 @@ pub enum MediaIden {
 #[iden = "monitored_users"]
 pub enum MonitoredUserIden {
     Table,
+    AccountId,
     Uid,
     ScreenName,
     RefreshStrategy,
@@ -129,6 +130,11 @@ pub enum MonitoredUserIden {
     LastRefreshedAt,
     CreatedAt,
     UpdatedAt,
+    Tier,
+    IntervalSecs,
+    JitterSecs,
+    NextRefreshEpoch,
+    LastRefreshEpoch,
 }
 
 #[derive(Iden)]
@@ -136,13 +142,30 @@ pub enum MonitoredUserIden {
 pub enum SyncJobIden {
     Table,
     Id,
+    ResourceKey,
     Name,
     Kind,
+    PayloadJson,
+    Status,
     Priority,
     ScheduleConfig,
     Enabled,
+    RecoveryCount,
+    MaxRecoveryAttempts,
+    AvailableAt,
+    AvailableAtEpoch,
+    ClaimedAt,
+    OwnerToken,
+    LeaseUntilEpoch,
+    CurrentRunId,
+    Generation,
+    LastError,
     CreatedAt,
     UpdatedAt,
+    AccountId,
+    EndpointKey,
+    EndpointGateRevision,
+    AccountGateRevision,
 }
 
 #[derive(Iden)]
@@ -156,6 +179,11 @@ pub enum SyncRunIden {
     FinishedAt,
     StatsJson,
     Error,
+    Attempt,
+    UpdatedAt,
+    OwnerToken,
+    Generation,
+    LeaseUntilEpoch,
 }
 
 #[derive(Iden)]
@@ -167,6 +195,10 @@ pub enum SyncCheckpointIden {
     FetchedCount,
     LastSequence,
     UpdatedAt,
+    JobId,
+    RunId,
+    Generation,
+    OwnerToken,
 }
 
 #[derive(Iden)]
@@ -222,6 +254,7 @@ pub struct MediaDto {
 /// 监控用户 DTO。
 #[derive(Debug, Clone, PartialEq, FromRow, Serialize, Deserialize)]
 pub struct MonitoredUserDto {
+    pub account_id: i64,
     pub uid: i64,
     pub screen_name: Option<String>,
     pub refresh_strategy: String,
@@ -229,19 +262,306 @@ pub struct MonitoredUserDto {
     pub last_refreshed_at: Option<String>,
     pub created_at: String,
     pub updated_at: Option<String>,
+    pub tier: RefreshTier,
+    pub interval_secs: i64,
+    pub jitter_secs: i64,
+    pub next_refresh_epoch: i64,
+    pub last_refresh_epoch: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "TEXT", rename_all = "snake_case")]
+pub enum RefreshTier {
+    Hot,
+    Warm,
+    Cold,
+}
+
+impl RefreshTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hot => "hot",
+            Self::Warm => "warm",
+            Self::Cold => "cold",
+        }
+    }
+}
+
+/// Upsert an account reference. Secrets are deliberately outside this table.
+pub async fn save_account<'c, A>(acquirer: A, account: &AccountDto) -> Result<i64>
+where
+    A: Acquire<'c, Database = Sqlite>,
+{
+    if account.provider.is_empty() || account.uid.is_empty() || account.session_ref.is_empty() {
+        return Err(crate::error::Error::FormatError(
+            "invalid account reference".into(),
+        ));
+    }
+    let mut conn = acquirer.acquire().await?;
+    if account.id > 0 {
+        return sqlx::query_scalar(
+            "UPDATE accounts SET display_name=?,session_ref=?,enabled=?,updated_at=? \
+             WHERE id=? AND provider=? AND uid=? RETURNING id",
+        )
+        .bind(&account.display_name)
+        .bind(&account.session_ref)
+        .bind(account.enabled)
+        .bind(&account.updated_at)
+        .bind(account.id)
+        .bind(&account.provider)
+        .bind(&account.uid)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(|| {
+            crate::error::Error::InconsistentTask(format!(
+                "account {} identity does not match persisted account",
+                account.id
+            ))
+        });
+    }
+    Ok(sqlx::query_scalar(
+        "INSERT INTO accounts(provider,uid,display_name,session_ref,enabled,created_at,updated_at) \
+         VALUES(?,?,?,?,?,?,?) ON CONFLICT(provider,uid) DO UPDATE SET \
+         display_name=excluded.display_name,session_ref=excluded.session_ref,enabled=excluded.enabled,updated_at=excluded.updated_at \
+         RETURNING id",
+    )
+    .bind(&account.provider).bind(&account.uid).bind(&account.display_name)
+    .bind(&account.session_ref).bind(account.enabled).bind(&account.created_at)
+    .bind(&account.updated_at).fetch_one(&mut *conn).await?)
+}
+
+pub async fn get_account<'e, E>(executor: E, id: i64) -> Result<Option<AccountDto>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    Ok(sqlx::query_as("SELECT id,provider,uid,display_name,session_ref,enabled,created_at,updated_at FROM accounts WHERE id=?")
+        .bind(id).fetch_optional(executor).await?)
+}
+
+pub async fn get_accounts<'e, E>(executor: E) -> Result<Vec<AccountDto>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    Ok(sqlx::query_as(
+        "SELECT id,provider,uid,display_name,session_ref,enabled,created_at,updated_at \
+         FROM accounts ORDER BY provider,uid",
+    )
+    .fetch_all(executor)
+    .await?)
+}
+
+pub async fn delete_account<'c, A>(acquirer: A, id: i64) -> Result<bool>
+where
+    A: Acquire<'c, Database = Sqlite>,
+{
+    let mut conn = acquirer.acquire().await?;
+    let dependent: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM monitored_users WHERE account_id=?) + \
+         (SELECT COUNT(*) FROM sync_jobs WHERE account_id=?)",
+    )
+    .bind(id)
+    .bind(id)
+    .fetch_one(&mut *conn)
+    .await?;
+    if dependent > 0 {
+        return Err(crate::error::Error::InconsistentTask(format!(
+            "account {id} still owns persisted work"
+        )));
+    }
+    Ok(sqlx::query("DELETE FROM accounts WHERE id=?")
+        .bind(id)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected()
+        == 1)
+}
+
+pub async fn get_rate_limit_gate<'e, E>(
+    executor: E,
+    account_id: i64,
+    endpoint_key: &str,
+) -> Result<Option<RateLimitGateDto>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    Ok(sqlx::query_as("SELECT account_id,endpoint_key,next_allowed_epoch,backoff_level,retry_after_epoch,updated_at,updated_at_epoch,revision FROM rate_limit_gates WHERE account_id=? AND endpoint_key=?")
+        .bind(account_id).bind(endpoint_key).fetch_optional(executor).await?)
+}
+
+/// Monotonic gate upsert: a shorter observation never opens an existing gate.
+pub async fn set_rate_limit_gate<'c, A>(
+    acquirer: A,
+    account_id: i64,
+    endpoint_key: &str,
+    next_allowed_epoch: i64,
+    backoff_level: i64,
+    retry_after_epoch: Option<i64>,
+    updated_at: &str,
+) -> Result<()>
+where
+    A: Acquire<'c, Database = Sqlite>,
+{
+    let mut conn = acquirer.acquire().await?;
+    sqlx::query("INSERT INTO rate_limit_gates(account_id,endpoint_key,next_allowed_epoch,backoff_level,retry_after_epoch,updated_at,updated_at_epoch,revision) VALUES(?,?,?,?,?,?,?,1) \
+        ON CONFLICT(account_id,endpoint_key) DO UPDATE SET \
+        next_allowed_epoch=MAX(rate_limit_gates.next_allowed_epoch,excluded.next_allowed_epoch), \
+        backoff_level=CASE WHEN excluded.next_allowed_epoch >= rate_limit_gates.next_allowed_epoch THEN MAX(rate_limit_gates.backoff_level,excluded.backoff_level) ELSE rate_limit_gates.backoff_level END, \
+        retry_after_epoch=CASE WHEN excluded.next_allowed_epoch >= rate_limit_gates.next_allowed_epoch THEN excluded.retry_after_epoch ELSE rate_limit_gates.retry_after_epoch END,updated_at=excluded.updated_at,updated_at_epoch=MAX(rate_limit_gates.updated_at_epoch,excluded.updated_at_epoch),revision=rate_limit_gates.revision+1")
+        .bind(account_id).bind(endpoint_key).bind(next_allowed_epoch).bind(backoff_level)
+        .bind(retry_after_epoch).bind(updated_at).bind(next_allowed_epoch).execute(&mut *conn).await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, FromRow, Serialize, Deserialize)]
+pub struct AccountDto {
+    pub id: i64,
+    pub provider: String,
+    pub uid: String,
+    pub display_name: Option<String>,
+    pub session_ref: String,
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, FromRow, Serialize, Deserialize)]
+pub struct RateLimitGateDto {
+    pub account_id: i64,
+    pub endpoint_key: String,
+    pub next_allowed_epoch: i64,
+    pub backoff_level: i64,
+    pub retry_after_epoch: Option<i64>,
+    pub updated_at: String,
+    pub updated_at_epoch: i64,
+    pub revision: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SyncJobSpec {
+    CollectUserPosts {
+        account_id: i64,
+        uid: i64,
+        max_pages: Option<u64>,
+        priority: i64,
+    },
+    CollectComments {
+        account_id: i64,
+        post_id: i64,
+        max_pages: Option<u64>,
+        priority: i64,
+    },
+    CollectCommentReplies {
+        account_id: i64,
+        post_id: i64,
+        root_comment_id: i64,
+        max_pages: Option<u64>,
+        priority: i64,
+    },
+}
+
+/// 持久同步任务状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncJobStatus {
+    Pending,
+    Running,
+    Paused,
+    Interrupted,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl SyncJobStatus {
+    /// 数据库中的稳定字符串表示。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Paused => "paused",
+            Self::Interrupted => "interrupted",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// A worker claim. Epoch values are UTC Unix seconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimRequest {
+    pub owner_token: String,
+    pub now_epoch: i64,
+    pub lease_until_epoch: i64,
+    pub claimed_at: String,
+}
+
+/// Ownership proof attached to a checkpoint write.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CheckpointOwner {
+    /// P1 ad-hoc collection has no persistent job; progress is fenced by fetched_count.
+    #[default]
+    AdHoc,
+    /// Persistent collection must still own the job's current run and generation.
+    Persistent {
+        run_id: i64,
+        generation: i64,
+        owner_token: String,
+    },
+}
+
+/// Atomically finishes one run and its owning job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinishRunRequest {
+    pub job_id: i64,
+    pub run_id: i64,
+    pub owner_token: String,
+    pub generation: i64,
+    pub next_status: SyncJobStatus,
+    pub finished_at: String,
+    pub stats_json: Option<String>,
+    pub error: Option<String>,
+}
+
+/// 持久任务控制操作结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobControlResult {
+    /// 本调用完成了状态迁移。
+    Changed,
+    /// 任务已经处于目标状态，重复控制安全幂等。
+    AlreadyApplied,
 }
 
 /// 同步任务 DTO。
 #[derive(Debug, Clone, PartialEq, FromRow, Serialize, Deserialize)]
 pub struct SyncJobDto {
     pub id: i64,
+    pub resource_key: String,
     pub name: String,
     pub kind: String,
+    pub payload_json: Option<String>,
+    pub status: String,
     pub priority: i64,
     pub schedule_config: Option<String>,
     pub enabled: bool,
+    pub recovery_count: i64,
+    pub max_recovery_attempts: i64,
+    pub available_at: Option<String>,
+    pub available_at_epoch: i64,
+    pub claimed_at: Option<String>,
+    pub owner_token: Option<String>,
+    pub lease_until_epoch: Option<i64>,
+    pub current_run_id: Option<i64>,
+    pub generation: i64,
+    pub last_error: Option<String>,
     pub created_at: String,
     pub updated_at: Option<String>,
+    pub account_id: i64,
+    pub endpoint_key: String,
+    pub endpoint_gate_revision: i64,
+    pub account_gate_revision: i64,
 }
 
 /// 同步运行 DTO。
@@ -254,6 +574,11 @@ pub struct SyncRunDto {
     pub finished_at: Option<String>,
     pub stats_json: Option<String>,
     pub error: Option<String>,
+    pub attempt: i64,
+    pub updated_at: Option<String>,
+    pub owner_token: Option<String>,
+    pub generation: i64,
+    pub lease_until_epoch: Option<i64>,
 }
 
 /// 同步 checkpoint DTO。
@@ -264,6 +589,13 @@ pub struct SyncCheckpointDto {
     pub fetched_count: i64,
     pub last_sequence: Option<i64>,
     pub updated_at: String,
+    pub job_id: Option<i64>,
+    pub run_id: Option<i64>,
+    pub generation: Option<i64>,
+    pub owner_token: Option<String>,
+    #[sqlx(skip)]
+    #[serde(skip)]
+    pub owner: CheckpointOwner,
 }
 
 /// 幂等事件 DTO。
@@ -542,6 +874,7 @@ where
     let (sql, values) = Query::insert()
         .into_table(MonitoredUserIden::Table)
         .columns([
+            MonitoredUserIden::AccountId,
             MonitoredUserIden::Uid,
             MonitoredUserIden::ScreenName,
             MonitoredUserIden::RefreshStrategy,
@@ -549,8 +882,14 @@ where
             MonitoredUserIden::LastRefreshedAt,
             MonitoredUserIden::CreatedAt,
             MonitoredUserIden::UpdatedAt,
+            MonitoredUserIden::Tier,
+            MonitoredUserIden::IntervalSecs,
+            MonitoredUserIden::JitterSecs,
+            MonitoredUserIden::NextRefreshEpoch,
+            MonitoredUserIden::LastRefreshEpoch,
         ])
         .values([
+            user.account_id.into(),
             user.uid.into(),
             user.screen_name.clone().into(),
             user.refresh_strategy.clone().into(),
@@ -558,15 +897,22 @@ where
             user.last_refreshed_at.clone().into(),
             user.created_at.clone().into(),
             user.updated_at.clone().into(),
+            user.tier.as_str().into(),
+            user.interval_secs.into(),
+            user.jitter_secs.into(),
+            user.next_refresh_epoch.into(),
+            user.last_refresh_epoch.into(),
         ])?
         .on_conflict(
-            OnConflict::column(MonitoredUserIden::Uid)
+            OnConflict::columns([MonitoredUserIden::AccountId, MonitoredUserIden::Uid])
                 .update_columns([
                     MonitoredUserIden::ScreenName,
                     MonitoredUserIden::RefreshStrategy,
                     MonitoredUserIden::Enabled,
-                    MonitoredUserIden::LastRefreshedAt,
                     MonitoredUserIden::UpdatedAt,
+                    MonitoredUserIden::Tier,
+                    MonitoredUserIden::IntervalSecs,
+                    MonitoredUserIden::JitterSecs,
                 ])
                 .to_owned(),
         )
@@ -582,6 +928,7 @@ where
 {
     let (sql, values) = Query::select()
         .columns([
+            MonitoredUserIden::AccountId,
             MonitoredUserIden::Uid,
             MonitoredUserIden::ScreenName,
             MonitoredUserIden::RefreshStrategy,
@@ -589,6 +936,11 @@ where
             MonitoredUserIden::LastRefreshedAt,
             MonitoredUserIden::CreatedAt,
             MonitoredUserIden::UpdatedAt,
+            MonitoredUserIden::Tier,
+            MonitoredUserIden::IntervalSecs,
+            MonitoredUserIden::JitterSecs,
+            MonitoredUserIden::NextRefreshEpoch,
+            MonitoredUserIden::LastRefreshEpoch,
         ])
         .from(MonitoredUserIden::Table)
         .and_where(Expr::col(MonitoredUserIden::Enabled).eq(true))
@@ -601,35 +953,349 @@ where
     )
 }
 
-/// 保存同步任务（id=0 时按自增插入）。
-pub async fn save_sync_job<'c, A>(acquirer: A, job: &SyncJobDto) -> Result<i64>
+/// 读取全部监控用户，包括暂停的配置项。
+pub async fn get_monitored_users<'e, E>(executor: E) -> Result<Vec<MonitoredUserDto>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    Ok(sqlx::query_as(
+        "SELECT account_id,uid,screen_name,refresh_strategy,enabled,last_refreshed_at,created_at,updated_at, \
+         tier,interval_secs,jitter_secs,next_refresh_epoch,last_refresh_epoch FROM monitored_users \
+         ORDER BY account_id,uid",
+    )
+    .fetch_all(executor)
+    .await?)
+}
+
+/// 删除一个账号下的监控用户配置。
+pub async fn delete_monitored_user<'c, A>(acquirer: A, account_id: i64, uid: i64) -> Result<bool>
 where
     A: Acquire<'c, Database = Sqlite>,
 {
     let mut conn = acquirer.acquire().await?;
-    let (sql, values) = Query::insert()
-        .into_table(SyncJobIden::Table)
-        .columns([
-            SyncJobIden::Name,
-            SyncJobIden::Kind,
-            SyncJobIden::Priority,
-            SyncJobIden::ScheduleConfig,
-            SyncJobIden::Enabled,
-            SyncJobIden::CreatedAt,
-            SyncJobIden::UpdatedAt,
-        ])
-        .values([
-            job.name.clone().into(),
-            job.kind.clone().into(),
-            job.priority.into(),
-            job.schedule_config.clone().into(),
-            job.enabled.into(),
-            job.created_at.clone().into(),
-            job.updated_at.clone().into(),
-        ])?
+    Ok(
+        sqlx::query("DELETE FROM monitored_users WHERE account_id=? AND uid=?")
+            .bind(account_id)
+            .bind(uid)
+            .execute(&mut *conn)
+            .await?
+            .rows_affected()
+            == 1,
+    )
+}
+
+fn sync_job_columns() -> [SyncJobIden; 25] {
+    [
+        SyncJobIden::Id,
+        SyncJobIden::ResourceKey,
+        SyncJobIden::Name,
+        SyncJobIden::Kind,
+        SyncJobIden::PayloadJson,
+        SyncJobIden::Status,
+        SyncJobIden::Priority,
+        SyncJobIden::ScheduleConfig,
+        SyncJobIden::Enabled,
+        SyncJobIden::RecoveryCount,
+        SyncJobIden::MaxRecoveryAttempts,
+        SyncJobIden::AvailableAt,
+        SyncJobIden::AvailableAtEpoch,
+        SyncJobIden::ClaimedAt,
+        SyncJobIden::OwnerToken,
+        SyncJobIden::LeaseUntilEpoch,
+        SyncJobIden::CurrentRunId,
+        SyncJobIden::Generation,
+        SyncJobIden::LastError,
+        SyncJobIden::CreatedAt,
+        SyncJobIden::UpdatedAt,
+        SyncJobIden::AccountId,
+        SyncJobIden::EndpointKey,
+        SyncJobIden::EndpointGateRevision,
+        SyncJobIden::AccountGateRevision,
+    ]
+}
+
+/// 入队或更新同一资源的 active 任务，并返回事实行 id。
+///
+/// partial unique index 使并发 enqueue 也只能得到同一 active 行；终态不在
+/// 索引范围内，因此资源之后可以再次入队。
+async fn enqueue_sync_job_on_conn(
+    conn: &mut sqlx::SqliteConnection,
+    job: &SyncJobDto,
+) -> Result<i64> {
+    if job.resource_key.is_empty() || job.max_recovery_attempts < 0 || job.available_at_epoch < 0 {
+        return Err(crate::error::Error::FormatError(
+            "invalid sync job queue fields".to_string(),
+        ));
+    }
+    let id = sqlx::query_scalar(
+        "INSERT INTO sync_jobs \
+         (resource_key,name,kind,payload_json,status,priority,schedule_config,enabled,recovery_count,pre_run_recovery_count, \
+          max_recovery_attempts,available_at,available_at_epoch,created_at,updated_at,account_id,endpoint_key) \
+         VALUES(?,?,?,?,'pending',?,?,?,0,0,?,?,?,?,?,?,?) \
+         ON CONFLICT(resource_key) WHERE status IN ('pending','running','paused','interrupted') \
+         DO UPDATE SET \
+          name=CASE WHEN sync_jobs.status='pending' THEN excluded.name ELSE sync_jobs.name END, \
+          kind=CASE WHEN sync_jobs.status='pending' THEN excluded.kind ELSE sync_jobs.kind END, \
+          payload_json=CASE WHEN sync_jobs.status='pending' THEN excluded.payload_json ELSE sync_jobs.payload_json END, \
+          priority=CASE WHEN sync_jobs.status='pending' THEN excluded.priority ELSE sync_jobs.priority END, \
+          schedule_config=CASE WHEN sync_jobs.status='pending' THEN excluded.schedule_config ELSE sync_jobs.schedule_config END, \
+          enabled=CASE WHEN sync_jobs.status='pending' THEN excluded.enabled ELSE sync_jobs.enabled END, \
+          max_recovery_attempts=CASE WHEN sync_jobs.status='pending' THEN excluded.max_recovery_attempts ELSE sync_jobs.max_recovery_attempts END, \
+          available_at=CASE WHEN sync_jobs.status='pending' THEN excluded.available_at ELSE sync_jobs.available_at END, \
+          available_at_epoch=CASE WHEN sync_jobs.status='pending' THEN excluded.available_at_epoch ELSE sync_jobs.available_at_epoch END, \
+          updated_at=CASE WHEN sync_jobs.status='pending' THEN excluded.updated_at ELSE sync_jobs.updated_at END \
+         RETURNING id",
+    )
+    .bind(&job.resource_key)
+    .bind(&job.name)
+    .bind(&job.kind)
+    .bind(&job.payload_json)
+    .bind(job.priority)
+    .bind(&job.schedule_config)
+    .bind(job.enabled)
+    .bind(job.max_recovery_attempts)
+    .bind(&job.available_at)
+    .bind(job.available_at_epoch)
+    .bind(&job.created_at)
+    .bind(&job.updated_at)
+    .bind(job.account_id)
+    .bind(&job.endpoint_key)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(id)
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub async fn enqueue_test_sync_job(pool: &sqlx::SqlitePool, job: &SyncJobDto) -> Result<i64> {
+    let mut conn = pool.acquire().await?;
+    sqlx::query(
+        "INSERT INTO accounts(id,provider,uid,display_name,session_ref,enabled,created_at) \
+         VALUES(1,'test-fixture','1','test fixture','sessions/test.json',1,?) \
+         ON CONFLICT(id) DO UPDATE SET enabled=1",
+    )
+    .bind(&job.created_at)
+    .execute(&mut *conn)
+    .await?;
+    enqueue_sync_job_on_conn(&mut conn, job).await
+}
+
+fn canonical_job(spec: &SyncJobSpec, available_at_epoch: i64, created_at: &str) -> SyncJobDto {
+    let (account_id, kind, endpoint, resource, payload, priority) = match spec {
+        SyncJobSpec::CollectUserPosts {
+            account_id,
+            uid,
+            max_pages,
+            priority,
+        } => (
+            *account_id,
+            "collect_user_posts",
+            "collect_user_posts",
+            format!("account:{account_id}:user:{uid}:posts"),
+            serde_json::json!({"uid":uid,"max_pages":max_pages}),
+            *priority,
+        ),
+        SyncJobSpec::CollectComments {
+            account_id,
+            post_id,
+            max_pages,
+            priority,
+        } => (
+            *account_id,
+            "collect_comments",
+            "collect_comments",
+            format!("account:{account_id}:post:{post_id}:comments"),
+            serde_json::json!({"post_id":post_id,"max_pages":max_pages}),
+            *priority,
+        ),
+        SyncJobSpec::CollectCommentReplies {
+            account_id,
+            post_id,
+            root_comment_id,
+            max_pages,
+            priority,
+        } => (
+            *account_id,
+            "collect_comment_replies",
+            "collect_comment_replies",
+            format!("account:{account_id}:post:{post_id}:comment:{root_comment_id}:replies"),
+            serde_json::json!({
+                "post_id": post_id,
+                "root_comment_id": root_comment_id,
+                "max_pages": max_pages
+            }),
+            *priority,
+        ),
+    };
+    SyncJobDto {
+        id: 0,
+        resource_key: resource,
+        name: kind.into(),
+        kind: kind.into(),
+        payload_json: Some(payload.to_string()),
+        status: "pending".into(),
+        priority,
+        schedule_config: None,
+        enabled: true,
+        recovery_count: 0,
+        max_recovery_attempts: 3,
+        available_at: None,
+        available_at_epoch,
+        claimed_at: None,
+        owner_token: None,
+        lease_until_epoch: None,
+        current_run_id: None,
+        generation: 0,
+        last_error: None,
+        created_at: created_at.into(),
+        updated_at: None,
+        account_id,
+        endpoint_key: endpoint.into(),
+        endpoint_gate_revision: 0,
+        account_gate_revision: 0,
+    }
+}
+
+pub async fn enqueue_sync_job_spec<'c, A>(
+    acquirer: A,
+    spec: &SyncJobSpec,
+    available_at_epoch: i64,
+    created_at: &str,
+) -> Result<i64>
+where
+    A: Acquire<'c, Database = Sqlite>,
+{
+    enqueue_validated_sync_job(
+        acquirer,
+        &canonical_job(spec, available_at_epoch, created_at),
+    )
+    .await
+}
+
+pub(crate) async fn enqueue_sync_job_spec_on_conn(
+    conn: &mut sqlx::SqliteConnection,
+    spec: &SyncJobSpec,
+    available_at_epoch: i64,
+    created_at: &str,
+) -> Result<i64> {
+    let job = canonical_job(spec, available_at_epoch, created_at);
+    validate_sync_job(&job)?;
+    ensure_enabled_account(conn, job.account_id).await?;
+    enqueue_sync_job_on_conn(conn, &job).await
+}
+
+async fn enqueue_validated_sync_job<'c, A>(acquirer: A, job: &SyncJobDto) -> Result<i64>
+where
+    A: Acquire<'c, Database = Sqlite>,
+{
+    validate_sync_job(job)?;
+    let mut conn = acquirer.acquire().await?;
+    ensure_enabled_account(&mut conn, job.account_id).await?;
+    enqueue_sync_job_on_conn(&mut conn, job).await
+}
+
+fn validate_sync_job(job: &SyncJobDto) -> Result<()> {
+    let payload: serde_json::Value = serde_json::from_str(
+        job.payload_json
+            .as_deref()
+            .ok_or_else(|| crate::error::Error::FormatError("missing payload".into()))?,
+    )?;
+    if payload
+        .get("max_pages")
+        .is_some_and(|value| !value.is_null() && value.as_u64().is_none())
+    {
+        return Err(crate::error::Error::FormatError(
+            "max_pages must be an unsigned integer".into(),
+        ));
+    }
+    let expected = match job.kind.as_str() {
+        "collect_user_posts" => payload
+            .get("uid")
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| {
+                (
+                    "collect_user_posts",
+                    format!("account:{}:user:{id}:posts", job.account_id),
+                )
+            }),
+        "collect_comments" => payload
+            .get("post_id")
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| {
+                (
+                    "collect_comments",
+                    format!("account:{}:post:{id}:comments", job.account_id),
+                )
+            }),
+        "collect_comment_replies" => payload
+            .get("post_id")
+            .and_then(serde_json::Value::as_i64)
+            .zip(
+                payload
+                    .get("root_comment_id")
+                    .and_then(serde_json::Value::as_i64),
+            )
+            .map(|(post_id, root_comment_id)| {
+                (
+                    "collect_comment_replies",
+                    format!(
+                        "account:{}:post:{post_id}:comment:{root_comment_id}:replies",
+                        job.account_id
+                    ),
+                )
+            }),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        crate::error::Error::FormatError(
+            "unknown job kind or missing required payload field".into(),
+        )
+    })?;
+    if job.account_id <= 0 || job.endpoint_key != expected.0 || job.resource_key != expected.1 {
+        return Err(crate::error::Error::FormatError(
+            "non-canonical sync job".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn ensure_enabled_account(conn: &mut sqlx::SqliteConnection, account_id: i64) -> Result<()> {
+    let enabled: bool = sqlx::query_scalar("SELECT enabled FROM accounts WHERE id=?")
+        .bind(account_id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(|| crate::error::Error::FormatError("account does not exist".into()))?;
+    if !enabled {
+        return Err(crate::error::Error::FormatError(
+            "account is disabled".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// 兼容旧调用名；语义已升级为持久队列 enqueue/upsert。
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub async fn save_sync_job<'c, A>(acquirer: A, job: &SyncJobDto) -> Result<i64>
+where
+    A: Acquire<'c, Database = Sqlite>,
+{
+    enqueue_validated_sync_job(acquirer, job).await
+}
+
+/// 按 id 读取同步任务。
+pub async fn get_sync_job<'e, E>(executor: E, id: i64) -> Result<Option<SyncJobDto>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let (sql, values) = Query::select()
+        .columns(sync_job_columns())
+        .from(SyncJobIden::Table)
+        .and_where(Expr::col(SyncJobIden::Id).eq(id))
         .build_sqlx(SqliteQueryBuilder);
-    let result = sqlx::query_with(&sql, values).execute(&mut *conn).await?;
-    Ok(result.last_insert_rowid())
+    Ok(sqlx::query_as_with::<Sqlite, SyncJobDto, _>(&sql, values)
+        .fetch_optional(executor)
+        .await?)
 }
 
 /// 读取全部同步任务。
@@ -638,16 +1304,7 @@ where
     E: Executor<'e, Database = Sqlite>,
 {
     let (sql, values) = Query::select()
-        .columns([
-            SyncJobIden::Id,
-            SyncJobIden::Name,
-            SyncJobIden::Kind,
-            SyncJobIden::Priority,
-            SyncJobIden::ScheduleConfig,
-            SyncJobIden::Enabled,
-            SyncJobIden::CreatedAt,
-            SyncJobIden::UpdatedAt,
-        ])
+        .columns(sync_job_columns())
         .from(SyncJobIden::Table)
         .order_by(SyncJobIden::Priority, sea_query::Order::Desc)
         .build_sqlx(SqliteQueryBuilder);
@@ -656,11 +1313,557 @@ where
         .await?)
 }
 
-/// 保存同步运行记录。
+/// 原子 claim 一个当前可执行任务。条件 UPDATE + RETURNING 保证并发单赢家。
+pub async fn claim_next_sync_job(
+    pool: &sqlx::SqlitePool,
+    claim: &ClaimRequest,
+) -> Result<Option<SyncJobDto>> {
+    claim_next_sync_job_with_gates(pool, claim, 0).await
+}
+
+/// Claim the highest-priority runnable job while honoring durable account and endpoint gates.
+/// The selected endpoint is reserved in the same transaction.
+pub async fn claim_next_sync_job_with_gates(
+    pool: &sqlx::SqlitePool,
+    claim: &ClaimRequest,
+    minimum_interval_secs: i64,
+) -> Result<Option<SyncJobDto>> {
+    if claim.owner_token.is_empty()
+        || claim.now_epoch < 0
+        || claim.lease_until_epoch <= claim.now_epoch
+    {
+        return Err(crate::error::Error::FormatError(
+            "invalid sync job claim".to_string(),
+        ));
+    }
+    let claim = claim.clone();
+    crate::sqlite_write::with_immediate_transaction(pool, |conn| Box::pin(async move {
+    recover_interrupted_sync_jobs_on_conn(conn, claim.now_epoch, &claim.claimed_at).await?;
+    let candidate: Option<i64> = sqlx::query_scalar(
+        "SELECT j.id FROM sync_jobs j WHERE j.status='pending' AND j.enabled=1 \
+         AND EXISTS(SELECT 1 FROM accounts a WHERE a.id=j.account_id AND a.enabled=1) \
+         AND j.available_at_epoch<=? AND NOT EXISTS(SELECT 1 FROM rate_limit_gates g \
+         WHERE g.account_id=j.account_id AND g.endpoint_key IN ('__account__',j.endpoint_key) \
+         AND g.next_allowed_epoch>?) ORDER BY j.priority DESC,j.id ASC LIMIT 1",
+    )
+    .bind(claim.now_epoch)
+    .bind(claim.now_epoch)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(candidate) = candidate else {
+        return Ok(None);
+    };
+    let claimed = sqlx::query_as::<_, SyncJobDto>(
+        "UPDATE sync_jobs SET status = 'running', claimed_at = ?, updated_at = ?, \
+         owner_token = ?, lease_until_epoch = ?, generation = generation + 1, \
+         endpoint_gate_revision=COALESCE((SELECT revision FROM rate_limit_gates \
+         WHERE account_id=sync_jobs.account_id AND endpoint_key=sync_jobs.endpoint_key),0), \
+         account_gate_revision=COALESCE((SELECT revision FROM rate_limit_gates \
+         WHERE account_id=sync_jobs.account_id AND endpoint_key='__account__'),0) \
+         WHERE id = ? \
+         AND status = 'pending' RETURNING id, resource_key, name, kind, payload_json, status, priority, \
+         schedule_config, enabled, recovery_count, max_recovery_attempts, available_at, available_at_epoch, \
+         claimed_at, owner_token, lease_until_epoch, current_run_id, generation, last_error, created_at, updated_at, \
+         account_id, endpoint_key, endpoint_gate_revision, account_gate_revision",
+    )
+    .bind(&claim.claimed_at)
+    .bind(&claim.claimed_at)
+    .bind(&claim.owner_token)
+    .bind(claim.lease_until_epoch)
+    .bind(candidate)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if minimum_interval_secs > 0
+        && let Some(job) = &claimed
+    {
+        let reserved_until = claim.now_epoch.saturating_add(minimum_interval_secs.max(0));
+        crate::rate_limit::apply_gate_on_conn(
+            conn,
+            &crate::rate_limit::GateUpdate {
+                account_id: job.account_id,
+                endpoint_key: &job.endpoint_key,
+                next_allowed_epoch: reserved_until,
+                backoff_level: 0,
+                retry_after_epoch: None,
+                updated_at: &claim.claimed_at,
+                updated_at_epoch: claim.now_epoch,
+            },
+        )
+        .await?;
+    }
+    Ok(claimed)
+    })).await
+}
+
+/// 仅当当前状态等于 expected 时迁移，并返回是否由本调用完成。
+pub async fn transition_sync_job<'c, A>(
+    acquirer: A,
+    job_id: i64,
+    expected: SyncJobStatus,
+    next: SyncJobStatus,
+    updated_at: &str,
+    error: Option<&str>,
+) -> Result<bool>
+where
+    A: Acquire<'c, Database = Sqlite>,
+{
+    if expected == SyncJobStatus::Running || next == SyncJobStatus::Running {
+        return Err(crate::error::Error::FormatError(
+            "running transitions require queue ownership CAS".to_string(),
+        ));
+    }
+    let mut conn = acquirer.acquire().await?;
+    let (sql, values) = Query::update()
+        .table(SyncJobIden::Table)
+        .value(SyncJobIden::Status, next.as_str())
+        .value(SyncJobIden::LastError, error)
+        .value(SyncJobIden::UpdatedAt, updated_at)
+        .and_where(Expr::col(SyncJobIden::Id).eq(job_id))
+        .and_where(Expr::col(SyncJobIden::Status).eq(expected.as_str()))
+        .build_sqlx(SqliteQueryBuilder);
+    let result = sqlx::query_with(&sql, values).execute(&mut *conn).await?;
+    Ok(result.rows_affected() == 1)
+}
+
+async fn current_sync_job_status(
+    conn: &mut sqlx::SqliteConnection,
+    job_id: i64,
+) -> Result<SyncJobStatus> {
+    let status: Option<String> = sqlx::query_scalar("SELECT status FROM sync_jobs WHERE id = ?")
+        .bind(job_id)
+        .fetch_optional(conn)
+        .await?;
+    let status = status.ok_or_else(|| {
+        crate::error::Error::InconsistentTask(format!("sync job {job_id} not found"))
+    })?;
+    match status.as_str() {
+        "pending" => Ok(SyncJobStatus::Pending),
+        "running" => Ok(SyncJobStatus::Running),
+        "paused" => Ok(SyncJobStatus::Paused),
+        "interrupted" => Ok(SyncJobStatus::Interrupted),
+        "completed" => Ok(SyncJobStatus::Completed),
+        "failed" => Ok(SyncJobStatus::Failed),
+        "cancelled" => Ok(SyncJobStatus::Cancelled),
+        _ => Err(crate::error::Error::InconsistentTask(format!(
+            "sync job {job_id} has invalid status {status}"
+        ))),
+    }
+}
+
+async fn finish_running_job_for_control(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    job_id: i64,
+    target: SyncJobStatus,
+    updated_at: &str,
+) -> Result<bool> {
+    let current_run_id: Option<i64> =
+        sqlx::query_scalar("SELECT current_run_id FROM sync_jobs WHERE id=? AND status='running'")
+            .bind(job_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .flatten();
+    if current_run_id.is_none() {
+        let job = sqlx::query(
+            "UPDATE sync_jobs SET status=?,generation=generation+1,owner_token=NULL, \
+             current_run_id=NULL,lease_until_epoch=NULL,updated_at=? \
+             WHERE id=? AND status='running' AND current_run_id IS NULL",
+        )
+        .bind(target.as_str())
+        .bind(updated_at)
+        .bind(job_id)
+        .execute(&mut **tx)
+        .await?;
+        return Ok(job.rows_affected() == 1);
+    }
+    let run = sqlx::query(
+        "UPDATE sync_runs SET status = ?, finished_at = ?, updated_at = ?, \
+         error = COALESCE(error, 'stopped by user control') WHERE id = \
+         (SELECT current_run_id FROM sync_jobs WHERE id = ? AND status = 'running') \
+         AND status = 'running'",
+    )
+    .bind(target.as_str())
+    .bind(updated_at)
+    .bind(updated_at)
+    .bind(job_id)
+    .execute(&mut **tx)
+    .await?;
+    if run.rows_affected() != 1 {
+        return Ok(false);
+    }
+    let job = sqlx::query(
+        "UPDATE sync_jobs SET status = ?, generation = generation + 1, owner_token = NULL, \
+         current_run_id = NULL, lease_until_epoch = NULL, updated_at = ? \
+         WHERE id = ? AND status = 'running'",
+    )
+    .bind(target.as_str())
+    .bind(updated_at)
+    .bind(job_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(job.rows_affected() == 1)
+}
+
+/// 暂停 pending/running 任务；running 控制同时 fence owner 并结束 run。
+pub async fn pause_sync_job<'c, A>(
+    acquirer: A,
+    job_id: i64,
+    updated_at: &str,
+) -> Result<JobControlResult>
+where
+    A: Acquire<'c, Database = Sqlite>,
+{
+    let mut conn = acquirer.acquire().await?;
+    let mut tx = conn.begin().await?;
+    let status = current_sync_job_status(&mut tx, job_id).await?;
+    let changed = match status {
+        SyncJobStatus::Paused => {
+            tx.commit().await?;
+            return Ok(JobControlResult::AlreadyApplied);
+        }
+        SyncJobStatus::Pending | SyncJobStatus::Interrupted => {
+            sqlx::query(
+                "UPDATE sync_jobs SET status='paused', updated_at=? WHERE id=? AND status=?",
+            )
+            .bind(updated_at)
+            .bind(job_id)
+            .bind(status.as_str())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+                == 1
+        }
+        SyncJobStatus::Running => {
+            finish_running_job_for_control(&mut tx, job_id, SyncJobStatus::Paused, updated_at)
+                .await?
+        }
+        _ => {
+            return Err(crate::error::Error::InconsistentTask(format!(
+                "cannot pause sync job {job_id} from {}",
+                status.as_str()
+            )));
+        }
+    };
+    if !changed {
+        tx.rollback().await?;
+        return Err(crate::error::Error::InconsistentTask(format!(
+            "sync job {job_id} changed during pause"
+        )));
+    }
+    tx.commit().await?;
+    Ok(JobControlResult::Changed)
+}
+
+/// 恢复 paused/interrupted 任务，仅迁移回 pending，不直接执行。
+pub async fn resume_sync_job<'c, A>(
+    acquirer: A,
+    job_id: i64,
+    updated_at: &str,
+) -> Result<JobControlResult>
+where
+    A: Acquire<'c, Database = Sqlite>,
+{
+    let mut conn = acquirer.acquire().await?;
+    let status = current_sync_job_status(&mut conn, job_id).await?;
+    if status == SyncJobStatus::Pending {
+        let enabled: bool = sqlx::query_scalar("SELECT enabled FROM sync_jobs WHERE id=?")
+            .bind(job_id)
+            .fetch_one(&mut *conn)
+            .await?;
+        if enabled {
+            return Ok(JobControlResult::AlreadyApplied);
+        }
+        let restored = sqlx::query(
+            "UPDATE sync_jobs SET enabled=1,updated_at=? WHERE id=? AND status='pending' \
+             AND enabled=0 AND EXISTS(SELECT 1 FROM accounts a \
+             WHERE a.id=sync_jobs.account_id AND a.enabled=1)",
+        )
+        .bind(updated_at)
+        .bind(job_id)
+        .execute(&mut *conn)
+        .await?;
+        if restored.rows_affected() == 1 {
+            return Ok(JobControlResult::Changed);
+        }
+        return Err(crate::error::Error::InconsistentTask(format!(
+            "cannot resume sync job {job_id} while its account is disabled"
+        )));
+    }
+    if !matches!(status, SyncJobStatus::Paused | SyncJobStatus::Interrupted) {
+        return Err(crate::error::Error::InconsistentTask(format!(
+            "cannot resume sync job {job_id} from {}",
+            status.as_str()
+        )));
+    }
+    let result = sqlx::query(
+        "UPDATE sync_jobs SET status='pending',enabled=1,claimed_at=NULL,owner_token=NULL, \
+          current_run_id=NULL,lease_until_epoch=NULL,last_error=NULL,updated_at=? \
+          WHERE id=? AND status=? AND EXISTS(SELECT 1 FROM accounts a \
+          WHERE a.id=sync_jobs.account_id AND a.enabled=1)",
+    )
+    .bind(updated_at)
+    .bind(job_id)
+    .bind(status.as_str())
+    .execute(&mut *conn)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(crate::error::Error::InconsistentTask(format!(
+            "sync job {job_id} changed during resume"
+        )));
+    }
+    Ok(JobControlResult::Changed)
+}
+
+/// 取消 pending/running/paused/interrupted 任务。
+pub async fn cancel_sync_job<'c, A>(
+    acquirer: A,
+    job_id: i64,
+    updated_at: &str,
+) -> Result<JobControlResult>
+where
+    A: Acquire<'c, Database = Sqlite>,
+{
+    let mut conn = acquirer.acquire().await?;
+    let mut tx = conn.begin().await?;
+    let status = current_sync_job_status(&mut tx, job_id).await?;
+    if status == SyncJobStatus::Cancelled {
+        tx.commit().await?;
+        return Ok(JobControlResult::AlreadyApplied);
+    }
+    let changed = match status {
+        SyncJobStatus::Running => {
+            finish_running_job_for_control(&mut tx, job_id, SyncJobStatus::Cancelled, updated_at)
+                .await?
+        }
+        SyncJobStatus::Pending | SyncJobStatus::Paused | SyncJobStatus::Interrupted => {
+            sqlx::query(
+                "UPDATE sync_jobs SET status='cancelled', generation=generation+1, \
+                 owner_token=NULL, current_run_id=NULL, lease_until_epoch=NULL, updated_at=? \
+                 WHERE id=? AND status=?",
+            )
+            .bind(updated_at)
+            .bind(job_id)
+            .bind(status.as_str())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+                == 1
+        }
+        _ => {
+            return Err(crate::error::Error::InconsistentTask(format!(
+                "cannot cancel sync job {job_id} from {}",
+                status.as_str()
+            )));
+        }
+    };
+    if !changed {
+        tx.rollback().await?;
+        return Err(crate::error::Error::InconsistentTask(format!(
+            "sync job {job_id} changed during cancel"
+        )));
+    }
+    tx.commit().await?;
+    Ok(JobControlResult::Changed)
+}
+
+/// 重试 failed 任务，仅迁移回 pending。
+pub async fn retry_sync_job<'c, A>(
+    acquirer: A,
+    job_id: i64,
+    updated_at: &str,
+) -> Result<JobControlResult>
+where
+    A: Acquire<'c, Database = Sqlite>,
+{
+    let mut conn = acquirer.acquire().await?;
+    let status = current_sync_job_status(&mut conn, job_id).await?;
+    if status == SyncJobStatus::Pending {
+        return Ok(JobControlResult::AlreadyApplied);
+    }
+    if status != SyncJobStatus::Failed {
+        return Err(crate::error::Error::InconsistentTask(format!(
+            "cannot retry sync job {job_id} from {}",
+            status.as_str()
+        )));
+    }
+    let result = sqlx::query(
+        "UPDATE sync_jobs SET status='pending', recovery_count=0, pre_run_recovery_count=0, claimed_at=NULL, \
+         owner_token=NULL, current_run_id=NULL, lease_until_epoch=NULL, last_error=NULL, \
+         available_at_epoch=0, updated_at=? WHERE id=? AND status='failed'",
+    )
+    .bind(updated_at)
+    .bind(job_id)
+    .execute(&mut *conn)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(crate::error::Error::InconsistentTask(format!(
+            "sync job {job_id} changed during retry"
+        )));
+    }
+    Ok(JobControlResult::Changed)
+}
+
+/// 为 running job 创建一次 run；lease 只从 job 事实行复制。
+pub async fn create_sync_run_at<'c, A>(
+    acquirer: A,
+    job_id: i64,
+    owner_token: &str,
+    generation: i64,
+    now_epoch: i64,
+    started_at: &str,
+) -> Result<Option<i64>>
+where
+    A: Acquire<'c, Database = Sqlite>,
+{
+    let mut conn = acquirer.acquire().await?;
+    let mut tx = conn.begin().await?;
+    let run_id: Option<i64> = sqlx::query_scalar(
+        "INSERT INTO sync_runs (job_id, status, started_at, attempt, updated_at, owner_token, generation, lease_until_epoch) \
+         SELECT id, 'running', ?, recovery_count + 1, ?, owner_token, generation, lease_until_epoch FROM sync_jobs \
+         WHERE id = ? AND status = 'running' AND owner_token = ? AND generation = ? \
+          AND lease_until_epoch>? AND current_run_id IS NULL RETURNING id",
+    )
+    .bind(started_at)
+    .bind(started_at)
+    .bind(job_id)
+    .bind(owner_token)
+    .bind(generation)
+    .bind(now_epoch)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(run_id) = run_id else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    let updated = sqlx::query(
+        "UPDATE sync_jobs SET current_run_id = ? WHERE id = ? AND status = 'running' \
+         AND owner_token = ? AND generation = ? AND current_run_id IS NULL",
+    )
+    .bind(run_id)
+    .bind(job_id)
+    .bind(owner_token)
+    .bind(generation)
+    .execute(&mut *tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    tx.commit().await?;
+    Ok(Some(run_id))
+}
+
+#[cfg(debug_assertions)]
+pub async fn create_sync_run<'c, A>(
+    acquirer: A,
+    job_id: i64,
+    owner_token: &str,
+    generation: i64,
+    started_at: &str,
+) -> Result<Option<i64>>
+where
+    A: Acquire<'c, Database = Sqlite>,
+{
+    create_sync_run_at(acquirer, job_id, owner_token, generation, 0, started_at).await
+}
+
+/// 同一事务续租 job 与其 current run；旧 owner/generation 返回 false。
+#[allow(clippy::too_many_arguments)]
+pub async fn heartbeat_sync_run_at<'c, A>(
+    acquirer: A,
+    job_id: i64,
+    run_id: i64,
+    owner_token: &str,
+    generation: i64,
+    now_epoch: i64,
+    lease_until_epoch: i64,
+    updated_at: &str,
+) -> Result<bool>
+where
+    A: Acquire<'c, Database = Sqlite>,
+{
+    if owner_token.is_empty() || now_epoch < 0 || lease_until_epoch <= now_epoch {
+        return Err(crate::error::Error::FormatError(
+            "invalid sync heartbeat".to_string(),
+        ));
+    }
+    let mut conn = acquirer.acquire().await?;
+    let mut tx = conn.begin().await?;
+    let effective_lease: Option<i64> = sqlx::query_scalar(
+        "UPDATE sync_jobs SET lease_until_epoch=MAX(lease_until_epoch,?), updated_at=? WHERE id=? AND status='running' \
+           AND current_run_id=? AND owner_token=? AND generation=? AND enabled=1 \
+           AND lease_until_epoch>? \
+          AND EXISTS(SELECT 1 FROM accounts a WHERE a.id=sync_jobs.account_id AND a.enabled=1) \
+          RETURNING lease_until_epoch",
+    )
+    .bind(lease_until_epoch)
+    .bind(updated_at)
+    .bind(job_id)
+    .bind(run_id)
+    .bind(owner_token)
+    .bind(generation)
+    .bind(now_epoch)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(effective_lease) = effective_lease else {
+        tx.rollback().await?;
+        return Ok(false);
+    };
+    let run = sqlx::query(
+        "UPDATE sync_runs SET lease_until_epoch=?, updated_at=? WHERE id=? AND job_id=? \
+         AND status='running' AND owner_token=? AND generation=?",
+    )
+    .bind(effective_lease)
+    .bind(updated_at)
+    .bind(run_id)
+    .bind(job_id)
+    .bind(owner_token)
+    .bind(generation)
+    .execute(&mut *tx)
+    .await?;
+    if run.rows_affected() != 1 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
+#[cfg(debug_assertions)]
+pub async fn heartbeat_sync_run<'c, A>(
+    acquirer: A,
+    job_id: i64,
+    run_id: i64,
+    owner_token: &str,
+    generation: i64,
+    lease_until_epoch: i64,
+    updated_at: &str,
+) -> Result<bool>
+where
+    A: Acquire<'c, Database = Sqlite>,
+{
+    heartbeat_sync_run_at(
+        acquirer,
+        job_id,
+        run_id,
+        owner_token,
+        generation,
+        0,
+        lease_until_epoch,
+        updated_at,
+    )
+    .await
+}
+
+/// 兼容旧 DTO 写入；新代码应使用 create_sync_run/finish_sync_run。
 pub async fn save_sync_run<'c, A>(acquirer: A, run: &SyncRunDto) -> Result<i64>
 where
     A: Acquire<'c, Database = Sqlite>,
 {
+    if run.status == SyncJobStatus::Running.as_str() {
+        return Err(crate::error::Error::FormatError(
+            "running sync runs require queue ownership CAS".to_string(),
+        ));
+    }
     let mut conn = acquirer.acquire().await?;
     let (sql, values) = Query::insert()
         .into_table(SyncRunIden::Table)
@@ -671,6 +1874,11 @@ where
             SyncRunIden::FinishedAt,
             SyncRunIden::StatsJson,
             SyncRunIden::Error,
+            SyncRunIden::Attempt,
+            SyncRunIden::UpdatedAt,
+            SyncRunIden::OwnerToken,
+            SyncRunIden::Generation,
+            SyncRunIden::LeaseUntilEpoch,
         ])
         .values([
             run.job_id.into(),
@@ -679,47 +1887,486 @@ where
             run.finished_at.clone().into(),
             run.stats_json.clone().into(),
             run.error.clone().into(),
+            run.attempt.into(),
+            run.updated_at.clone().into(),
+            run.owner_token.clone().into(),
+            run.generation.into(),
+            run.lease_until_epoch.into(),
         ])?
+        .returning_col(SyncRunIden::Id)
         .build_sqlx(SqliteQueryBuilder);
-    let result = sqlx::query_with(&sql, values).execute(&mut *conn).await?;
-    Ok(result.last_insert_rowid())
+    Ok(sqlx::query_scalar_with(&sql, values)
+        .fetch_one(&mut *conn)
+        .await?)
 }
 
-/// 保存同步 checkpoint（按 stream 幂等 upsert）。
-pub async fn save_sync_checkpoint<'c, A>(acquirer: A, checkpoint: &SyncCheckpointDto) -> Result<()>
+/// 仅当 run 仍由调用方持有有效 lease 时结束它。
+pub async fn finish_sync_run_at(
+    pool: &sqlx::SqlitePool,
+    request: &FinishRunRequest,
+    now_epoch: i64,
+) -> Result<bool> {
+    if !matches!(
+        request.next_status,
+        SyncJobStatus::Completed
+            | SyncJobStatus::Failed
+            | SyncJobStatus::Cancelled
+            | SyncJobStatus::Interrupted
+    ) {
+        return Err(crate::error::Error::FormatError(
+            "invalid terminal sync run status".to_string(),
+        ));
+    }
+    let request = request.clone();
+    crate::sqlite_write::with_immediate_transaction(pool, |conn| Box::pin(async move {
+    let owned: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sync_jobs j JOIN sync_runs r ON r.id=j.current_run_id \
+         WHERE j.id=? AND j.status='running' AND j.enabled=1 AND j.current_run_id=? AND j.owner_token=? \
+         AND j.generation=? AND j.lease_until_epoch>? AND r.job_id=j.id AND r.status='running' \
+         AND r.owner_token=j.owner_token AND r.generation=j.generation \
+         AND EXISTS(SELECT 1 FROM accounts a WHERE a.id=j.account_id AND a.enabled=1))",
+    )
+    .bind(request.job_id)
+    .bind(request.run_id)
+    .bind(&request.owner_token)
+    .bind(request.generation)
+    .bind(now_epoch)
+    .fetch_one(&mut *conn)
+    .await?;
+    if !owned {
+        return Ok(false);
+    }
+    let job = sqlx::query(
+        "UPDATE sync_jobs SET status = ?, current_run_id = NULL, owner_token = NULL, \
+         lease_until_epoch = NULL, last_error = ?, updated_at = ?, \
+         rate_limit_backoff_level=CASE WHEN ?='completed' THEN 0 ELSE rate_limit_backoff_level END \
+          WHERE id = ? AND status = 'running' \
+          AND current_run_id = ? AND owner_token = ? AND generation = ? AND lease_until_epoch > ?",
+    )
+    .bind(request.next_status.as_str())
+    .bind(&request.error)
+    .bind(&request.finished_at)
+    .bind(request.next_status.as_str())
+    .bind(request.job_id)
+    .bind(request.run_id)
+    .bind(&request.owner_token)
+    .bind(request.generation)
+    .bind(now_epoch)
+    .execute(&mut *conn)
+    .await?;
+    if job.rows_affected() != 1 {
+        return Err(crate::error::Error::InconsistentTask(
+            "sync job finish lost ownership after preflight".into(),
+        ));
+    }
+    if request.next_status == SyncJobStatus::Completed {
+        sqlx::query(
+            "UPDATE rate_limit_gates SET backoff_level=0,retry_after_epoch=NULL,updated_at=? \
+             WHERE account_id=(SELECT account_id FROM sync_jobs WHERE id=?) \
+             AND endpoint_key=(SELECT endpoint_key FROM sync_jobs WHERE id=?) \
+             AND revision=(SELECT endpoint_gate_revision FROM sync_jobs WHERE id=?)",
+        )
+        .bind(&request.finished_at)
+        .bind(request.job_id)
+        .bind(request.job_id)
+        .bind(request.job_id)
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query(
+            "UPDATE rate_limit_gates SET backoff_level=0,retry_after_epoch=NULL,updated_at=? \
+             WHERE account_id=(SELECT account_id FROM sync_jobs WHERE id=?) \
+             AND endpoint_key='__account__' \
+             AND revision=(SELECT account_gate_revision FROM sync_jobs WHERE id=?)",
+        )
+        .bind(&request.finished_at)
+        .bind(request.job_id)
+        .bind(request.job_id)
+        .execute(&mut *conn)
+        .await?;
+    }
+    let run = sqlx::query(
+        "UPDATE sync_runs SET status = ?, finished_at = ?, stats_json = ?, error = ?, updated_at = ? \
+         WHERE id = ? AND job_id = ? AND status = 'running' AND owner_token = ? AND generation = ?",
+    )
+    .bind(request.next_status.as_str())
+    .bind(&request.finished_at)
+    .bind(&request.stats_json)
+    .bind(&request.error)
+    .bind(&request.finished_at)
+    .bind(request.run_id)
+    .bind(request.job_id)
+    .bind(&request.owner_token)
+    .bind(request.generation)
+    .execute(&mut *conn)
+    .await?;
+    if run.rows_affected() != 1 {
+        return Err(crate::error::Error::InconsistentTask(
+            "sync run finish lost ownership after preflight".into(),
+        ));
+    }
+    Ok(true)
+    })).await
+}
+
+#[cfg(debug_assertions)]
+pub async fn finish_sync_run(pool: &sqlx::SqlitePool, request: &FinishRunRequest) -> Result<bool> {
+    finish_sync_run_at(pool, request, -1).await
+}
+
+/// 按 job 读取最近的运行历史。
+pub async fn get_sync_run_history<'e, E>(
+    executor: E,
+    job_id: i64,
+    limit: u64,
+) -> Result<Vec<SyncRunDto>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let (sql, values) = Query::select()
+        .columns([
+            SyncRunIden::Id,
+            SyncRunIden::JobId,
+            SyncRunIden::Status,
+            SyncRunIden::StartedAt,
+            SyncRunIden::FinishedAt,
+            SyncRunIden::StatsJson,
+            SyncRunIden::Error,
+            SyncRunIden::Attempt,
+            SyncRunIden::UpdatedAt,
+            SyncRunIden::OwnerToken,
+            SyncRunIden::Generation,
+            SyncRunIden::LeaseUntilEpoch,
+        ])
+        .from(SyncRunIden::Table)
+        .and_where(Expr::col(SyncRunIden::JobId).eq(job_id))
+        .order_by(SyncRunIden::Id, sea_query::Order::Desc)
+        .limit(limit)
+        .build_sqlx(SqliteQueryBuilder);
+    Ok(sqlx::query_as_with::<Sqlite, SyncRunDto, _>(&sql, values)
+        .fetch_all(executor)
+        .await?)
+}
+
+/// 启动恢复统计。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoverySummary {
+    pub requeued: u64,
+    pub failed: u64,
+}
+
+/// 当前 owned run 真实中断后的单 job 恢复结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterruptedRecoveryResult {
+    pub status: SyncJobStatus,
+    pub recovery_count: i64,
+}
+
+/// 原子结束真实中断的 owned run，并仅按该 job 自身恢复上限转 pending/failed。
+pub async fn recover_interrupted_sync_run_at<'c, A>(
+    acquirer: A,
+    request: &FinishRunRequest,
+    now_epoch: i64,
+) -> Result<Option<InterruptedRecoveryResult>>
 where
     A: Acquire<'c, Database = Sqlite>,
 {
     let mut conn = acquirer.acquire().await?;
-    let (sql, values) = Query::insert()
-        .into_table(SyncCheckpointIden::Table)
-        .columns([
-            SyncCheckpointIden::Stream,
-            SyncCheckpointIden::CursorJson,
-            SyncCheckpointIden::FetchedCount,
-            SyncCheckpointIden::LastSequence,
-            SyncCheckpointIden::UpdatedAt,
-        ])
-        .values([
-            checkpoint.stream.clone().into(),
-            checkpoint.cursor_json.clone().into(),
-            checkpoint.fetched_count.into(),
-            checkpoint.last_sequence.into(),
-            checkpoint.updated_at.clone().into(),
-        ])?
-        .on_conflict(
-            OnConflict::column(SyncCheckpointIden::Stream)
-                .update_columns([
-                    SyncCheckpointIden::CursorJson,
-                    SyncCheckpointIden::FetchedCount,
-                    SyncCheckpointIden::LastSequence,
-                    SyncCheckpointIden::UpdatedAt,
-                ])
-                .to_owned(),
+    let mut tx = conn.begin().await?;
+    let recovered: Option<(String, i64)> = sqlx::query_as(
+        "UPDATE sync_jobs SET recovery_count = recovery_count + 1, \
+         status = CASE WHEN recovery_count + 1 >= max_recovery_attempts THEN 'failed' ELSE 'pending' END, \
+         current_run_id = NULL, owner_token = NULL, lease_until_epoch = NULL, claimed_at = NULL, \
+          last_error = ?, updated_at = ? WHERE id = ? AND status = 'running' \
+          AND current_run_id = ? AND owner_token = ? AND generation = ? \
+          AND enabled=1 AND lease_until_epoch>? \
+          AND EXISTS(SELECT 1 FROM accounts a WHERE a.id=sync_jobs.account_id AND a.enabled=1) \
+          RETURNING status, recovery_count",
+    )
+    .bind(&request.error)
+    .bind(&request.finished_at)
+    .bind(request.job_id)
+    .bind(request.run_id)
+    .bind(&request.owner_token)
+    .bind(request.generation)
+    .bind(now_epoch)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((status, recovery_count)) = recovered else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+    let run = sqlx::query(
+        "UPDATE sync_runs SET status = 'interrupted', finished_at = ?, stats_json = ?, \
+         error = ?, updated_at = ? WHERE id = ? AND job_id = ? AND status = 'running' \
+         AND owner_token = ? AND generation = ?",
+    )
+    .bind(&request.finished_at)
+    .bind(&request.stats_json)
+    .bind(&request.error)
+    .bind(&request.finished_at)
+    .bind(request.run_id)
+    .bind(request.job_id)
+    .bind(&request.owner_token)
+    .bind(request.generation)
+    .execute(&mut *tx)
+    .await?;
+    if run.rows_affected() != 1 {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    let status = match status.as_str() {
+        "pending" => SyncJobStatus::Pending,
+        "failed" => SyncJobStatus::Failed,
+        _ => {
+            tx.rollback().await?;
+            return Err(crate::error::Error::InconsistentTask(format!(
+                "unexpected interrupted recovery status {status}"
+            )));
+        }
+    };
+    tx.commit().await?;
+    Ok(Some(InterruptedRecoveryResult {
+        status,
+        recovery_count,
+    }))
+}
+
+/// 正常退出时原子中断 owned run 并重排 job，不消耗故障恢复预算。
+pub async fn interrupt_sync_run_for_shutdown_at<'c, A>(
+    acquirer: A,
+    request: &FinishRunRequest,
+    now_epoch: i64,
+) -> Result<bool>
+where
+    A: Acquire<'c, Database = Sqlite>,
+{
+    let mut conn = acquirer.acquire().await?;
+    let mut tx = conn.begin().await?;
+    let job = sqlx::query(
+        "UPDATE sync_jobs SET status='pending', current_run_id=NULL, owner_token=NULL, \
+         lease_until_epoch=NULL, claimed_at=NULL, last_error=?, updated_at=? \
+         WHERE id=? AND status='running' AND current_run_id=? AND owner_token=? AND generation=? \
+         AND enabled=1 AND lease_until_epoch>? \
+         AND EXISTS(SELECT 1 FROM accounts a WHERE a.id=sync_jobs.account_id AND a.enabled=1)",
+    )
+    .bind(&request.error)
+    .bind(&request.finished_at)
+    .bind(request.job_id)
+    .bind(request.run_id)
+    .bind(&request.owner_token)
+    .bind(request.generation)
+    .bind(now_epoch)
+    .execute(&mut *tx)
+    .await?;
+    if job.rows_affected() != 1 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let run = sqlx::query(
+        "UPDATE sync_runs SET status='interrupted', finished_at=?, stats_json=?, error=?, updated_at=? \
+         WHERE id=? AND job_id=? AND status='running' AND owner_token=? AND generation=?",
+    )
+    .bind(&request.finished_at)
+    .bind(&request.stats_json)
+    .bind(&request.error)
+    .bind(&request.finished_at)
+    .bind(request.run_id)
+    .bind(request.job_id)
+    .bind(&request.owner_token)
+    .bind(request.generation)
+    .execute(&mut *tx)
+    .await?;
+    if run.rows_affected() != 1 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
+#[cfg(debug_assertions)]
+pub async fn recover_interrupted_sync_run<'c, A>(
+    acquirer: A,
+    request: &FinishRunRequest,
+) -> Result<Option<InterruptedRecoveryResult>>
+where
+    A: Acquire<'c, Database = Sqlite>,
+{
+    recover_interrupted_sync_run_at(acquirer, request, -1).await
+}
+
+/// 原子恢复 lease 已过期的 running job 及其全部 running run。
+pub async fn recover_interrupted_sync_jobs<'c, A>(
+    acquirer: A,
+    now_epoch: i64,
+    recovered_at: &str,
+) -> Result<RecoverySummary>
+where
+    A: Acquire<'c, Database = Sqlite>,
+{
+    let mut conn = acquirer.acquire().await?;
+    let mut tx = conn.begin().await?;
+    let summary = recover_interrupted_sync_jobs_on_conn(&mut tx, now_epoch, recovered_at).await?;
+    tx.commit().await?;
+    Ok(summary)
+}
+
+async fn recover_interrupted_sync_jobs_on_conn(
+    conn: &mut sqlx::SqliteConnection,
+    now_epoch: i64,
+    recovered_at: &str,
+) -> Result<RecoverySummary> {
+    let expired: Vec<(i64, Option<i64>)> = sqlx::query_as(
+        "SELECT id, current_run_id FROM sync_jobs WHERE status = 'running' \
+         AND lease_until_epoch IS NOT NULL AND lease_until_epoch <= ?",
+    )
+    .bind(now_epoch)
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut requeued = 0;
+    let mut failed = 0;
+    for (job_id, run_id) in expired {
+        if let Some(run_id) = run_id {
+            sqlx::query(
+                "UPDATE sync_runs SET status = 'interrupted', finished_at = ?, updated_at = ?, \
+                 error = COALESCE(error, 'worker lease expired') WHERE id = ? AND job_id = ? \
+                 AND status = 'running'",
+            )
+            .bind(recovered_at)
+            .bind(recovered_at)
+            .bind(run_id)
+            .bind(job_id)
+            .execute(&mut *conn)
+            .await?;
+        }
+        let status: Option<String> = sqlx::query_scalar(
+        "UPDATE sync_jobs SET recovery_count = recovery_count + CASE WHEN current_run_id IS NULL THEN 0 ELSE 1 END, \
+             pre_run_recovery_count = pre_run_recovery_count + CASE WHEN current_run_id IS NULL THEN 1 ELSE 0 END, \
+             status = CASE WHEN current_run_id IS NULL AND pre_run_recovery_count + 1 >= max_recovery_attempts THEN 'failed' \
+             WHEN current_run_id IS NULL THEN 'pending' \
+             WHEN recovery_count + 1 >= max_recovery_attempts THEN 'failed' ELSE 'pending' END, \
+             claimed_at = NULL, current_run_id = NULL, owner_token = NULL, lease_until_epoch = NULL, \
+             updated_at = ?, last_error = CASE WHEN current_run_id IS NULL AND pre_run_recovery_count + 1 >= max_recovery_attempts \
+             THEN 'worker lease expired before run started: recovery limit reached' WHEN current_run_id IS NULL \
+             THEN 'worker lease expired before run started' ELSE 'worker lease expired' END \
+             WHERE id = ? AND status = 'running' \
+              AND lease_until_epoch IS NOT NULL AND lease_until_epoch <= ? RETURNING status",
         )
-        .build_sqlx(SqliteQueryBuilder);
-    sqlx::query_with(&sql, values).execute(&mut *conn).await?;
-    Ok(())
+        .bind(recovered_at)
+        .bind(job_id)
+        .bind(now_epoch)
+        .fetch_optional(&mut *conn)
+        .await?;
+        match status.as_deref() {
+            Some("pending") => requeued += 1,
+            Some("failed") => failed += 1,
+            _ => {}
+        }
+    }
+    Ok(RecoverySummary { requeued, failed })
+}
+
+/// 保存同步 checkpoint。
+///
+/// Sidecar sequence 只在单次 request 内有意义。ad-hoc 请求使用累计
+/// `fetched_count` 防倒退；persistent 请求还必须持有 resource 对应 job 的当前
+/// run/generation。checkpoint 以 stream/resource 为稳定身份，允许后续 job 接管。
+pub async fn save_sync_checkpoint_at<'c, A>(
+    acquirer: A,
+    checkpoint: &SyncCheckpointDto,
+    now_epoch: i64,
+) -> Result<bool>
+where
+    A: Acquire<'c, Database = Sqlite>,
+{
+    let mut conn = acquirer.acquire().await?;
+    if checkpoint.fetched_count < 0 {
+        return Err(crate::error::Error::FormatError(
+            "checkpoint fetched_count cannot be negative".to_string(),
+        ));
+    }
+    let result = match &checkpoint.owner {
+        CheckpointOwner::AdHoc => {
+            sqlx::query(
+                "INSERT INTO sync_checkpoints \
+                 (stream, cursor_json, fetched_count, last_sequence, updated_at, job_id, run_id, generation, owner_token) \
+                 VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL) ON CONFLICT(stream) DO UPDATE SET \
+                 cursor_json=excluded.cursor_json, fetched_count=excluded.fetched_count, \
+                 last_sequence=excluded.last_sequence, updated_at=excluded.updated_at, job_id=NULL, \
+                 run_id=NULL, generation=NULL, owner_token=NULL \
+                 WHERE sync_checkpoints.job_id IS NULL \
+                 AND excluded.fetched_count > sync_checkpoints.fetched_count",
+            )
+            .bind(&checkpoint.stream)
+            .bind(&checkpoint.cursor_json)
+            .bind(checkpoint.fetched_count)
+            .bind(checkpoint.last_sequence)
+            .bind(&checkpoint.updated_at)
+            .execute(&mut *conn)
+            .await?
+        }
+        CheckpointOwner::Persistent {
+            run_id,
+            generation,
+            owner_token,
+        } => {
+            let Some(job_id) = checkpoint.job_id else {
+                return Err(crate::error::Error::FormatError(
+                    "persistent checkpoint requires job_id".to_string(),
+                ));
+            };
+            sqlx::query(
+                "INSERT INTO sync_checkpoints \
+                 (stream, cursor_json, fetched_count, last_sequence, updated_at, job_id, run_id, generation, owner_token) \
+                 SELECT ?, ?, ?, ?, ?, j.id, r.id, j.generation, j.owner_token \
+                 FROM sync_jobs j JOIN sync_runs r ON r.id = j.current_run_id \
+                   WHERE j.id = ? AND j.status = 'running' AND j.enabled=1 AND j.current_run_id = ? \
+                   AND j.resource_key = ? \
+                   AND j.generation = ? AND j.owner_token = ? AND j.lease_until_epoch > ? \
+                   AND r.status = 'running' \
+                  AND r.generation = ? AND r.owner_token = ? \
+                  AND EXISTS(SELECT 1 FROM accounts a WHERE a.id=j.account_id AND a.enabled=1) \
+                 ON CONFLICT(stream) DO UPDATE SET cursor_json=excluded.cursor_json, \
+                 fetched_count=excluded.fetched_count, last_sequence=excluded.last_sequence, \
+                 updated_at=excluded.updated_at, job_id=excluded.job_id, run_id=excluded.run_id, \
+                 generation=excluded.generation, owner_token=excluded.owner_token \
+                 WHERE excluded.stream = ? AND ( \
+                  excluded.fetched_count > sync_checkpoints.fetched_count OR ( \
+                   excluded.fetched_count = sync_checkpoints.fetched_count \
+                   AND excluded.cursor_json IS NOT sync_checkpoints.cursor_json \
+                  ) \
+                 )",
+            )
+            .bind(&checkpoint.stream)
+            .bind(&checkpoint.cursor_json)
+            .bind(checkpoint.fetched_count)
+            .bind(checkpoint.last_sequence)
+            .bind(&checkpoint.updated_at)
+            .bind(job_id)
+            .bind(run_id)
+            .bind(&checkpoint.stream)
+            .bind(generation)
+            .bind(owner_token)
+            .bind(now_epoch)
+            .bind(generation)
+            .bind(owner_token)
+            .bind(&checkpoint.stream)
+            .execute(&mut *conn)
+            .await?
+        }
+    };
+    Ok(result.rows_affected() == 1)
+}
+
+#[cfg(debug_assertions)]
+pub async fn save_sync_checkpoint<'c, A>(
+    acquirer: A,
+    checkpoint: &SyncCheckpointDto,
+) -> Result<bool>
+where
+    A: Acquire<'c, Database = Sqlite>,
+{
+    save_sync_checkpoint_at(acquirer, checkpoint, -1).await
 }
 
 /// 按 stream 读取同步 checkpoint。
@@ -737,15 +2384,31 @@ where
             SyncCheckpointIden::FetchedCount,
             SyncCheckpointIden::LastSequence,
             SyncCheckpointIden::UpdatedAt,
+            SyncCheckpointIden::JobId,
+            SyncCheckpointIden::RunId,
+            SyncCheckpointIden::Generation,
+            SyncCheckpointIden::OwnerToken,
         ])
         .from(SyncCheckpointIden::Table)
         .and_where(Expr::col(SyncCheckpointIden::Stream).eq(stream))
         .build_sqlx(SqliteQueryBuilder);
-    Ok(
-        sqlx::query_as_with::<Sqlite, SyncCheckpointDto, _>(&sql, values)
-            .fetch_optional(executor)
-            .await?,
-    )
+    let mut checkpoint = sqlx::query_as_with::<Sqlite, SyncCheckpointDto, _>(&sql, values)
+        .fetch_optional(executor)
+        .await?;
+    if let Some(checkpoint) = checkpoint.as_mut()
+        && let (Some(run_id), Some(generation), Some(owner_token)) = (
+            checkpoint.run_id,
+            checkpoint.generation,
+            checkpoint.owner_token.clone(),
+        )
+    {
+        checkpoint.owner = CheckpointOwner::Persistent {
+            run_id,
+            generation,
+            owner_token,
+        };
+    }
+    Ok(checkpoint)
 }
 
 /// 记录已处理的幂等事件。返回 `true` 表示新插入，`false` 表示重复（已存在）。
@@ -911,7 +2574,7 @@ pub mod transactional {
         /// 在单个事务中执行：幂等去重 → 写评论/媒体 → 更新 checkpoint。
         ///
         /// 重复 `event_id` 不产生重复数据；业务主键冲突由 upsert 吸收。
-        pub async fn execute<'c, A>(&self, acquirer: A) -> Result<CommitOutcome>
+        pub async fn execute_at<'c, A>(&self, acquirer: A, now_epoch: i64) -> Result<CommitOutcome>
         where
             A: Acquire<'c, Database = Sqlite>,
         {
@@ -951,7 +2614,11 @@ pub mod transactional {
             for media in &self.media {
                 save_media_reference(&mut *tx, media).await?;
             }
-            save_sync_checkpoint(&mut *tx, &self.checkpoint).await?;
+            if !save_sync_checkpoint_at(&mut *tx, &self.checkpoint, now_epoch).await? {
+                return Err(crate::error::Error::InconsistentTask(
+                    "checkpoint ownership or progress rejected".to_string(),
+                ));
+            }
 
             record_processed_event(
                 &mut *tx,
@@ -968,6 +2635,14 @@ pub mod transactional {
 
             tx.commit().await?;
             Ok(CommitOutcome::Applied)
+        }
+
+        #[cfg(debug_assertions)]
+        pub async fn execute<'c, A>(&self, acquirer: A) -> Result<CommitOutcome>
+        where
+            A: Acquire<'c, Database = Sqlite>,
+        {
+            self.execute_at(acquirer, -1).await
         }
     }
 }
@@ -1137,7 +2812,23 @@ mod tests {
     #[tokio::test]
     async fn test_monitored_user_roundtrip() {
         let db = setup_db().await;
+        let account_id = save_account(
+            &db,
+            &AccountDto {
+                id: 0,
+                provider: "test".into(),
+                uid: "monitor".into(),
+                display_name: None,
+                session_ref: "sessions/monitor.json".into(),
+                enabled: true,
+                created_at: now(),
+                updated_at: None,
+            },
+        )
+        .await
+        .unwrap();
         let user = MonitoredUserDto {
+            account_id,
             uid: 10001,
             screen_name: Some("小明".into()),
             refresh_strategy: "daily".into(),
@@ -1145,6 +2836,11 @@ mod tests {
             last_refreshed_at: None,
             created_at: now(),
             updated_at: None,
+            tier: RefreshTier::Cold,
+            interval_secs: 0,
+            jitter_secs: 0,
+            next_refresh_epoch: 0,
+            last_refresh_epoch: None,
         };
         save_monitored_user(&db, &user).await.unwrap();
         let enabled = get_enabled_monitored_users(&db).await.unwrap();
@@ -1155,34 +2851,56 @@ mod tests {
     #[tokio::test]
     async fn test_sync_job_and_run_roundtrip() {
         let db = setup_db().await;
-        let job = SyncJobDto {
-            id: 0,
-            name: "用户帖子增量".into(),
-            kind: "collect_user_posts".into(),
-            priority: 1,
-            schedule_config: Some("{\"interval\":\"6h\"}".into()),
-            enabled: true,
-            created_at: now(),
-            updated_at: None,
-        };
-        let job_id = save_sync_job(&db, &job).await.unwrap();
+        let account_id = save_account(
+            &db,
+            &AccountDto {
+                id: 0,
+                provider: "test".into(),
+                uid: "job".into(),
+                display_name: None,
+                session_ref: "sessions/job.json".into(),
+                enabled: true,
+                created_at: now(),
+                updated_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        let job_id = enqueue_sync_job_spec(
+            &db,
+            &SyncJobSpec::CollectUserPosts {
+                account_id,
+                uid: 123,
+                max_pages: None,
+                priority: 1,
+            },
+            0,
+            &now(),
+        )
+        .await
+        .unwrap();
         assert!(job_id > 0);
 
         let run = SyncRunDto {
             id: 0,
             job_id,
-            status: "running".into(),
+            status: "completed".into(),
             started_at: now(),
             finished_at: None,
             stats_json: None,
             error: None,
+            attempt: 1,
+            updated_at: None,
+            owner_token: None,
+            generation: 0,
+            lease_until_epoch: None,
         };
         let run_id = save_sync_run(&db, &run).await.unwrap();
         assert!(run_id > 0);
 
         let jobs = get_sync_jobs(&db).await.unwrap();
         assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].name, "用户帖子增量");
+        assert_eq!(jobs[0].kind, "collect_user_posts");
     }
 
     #[tokio::test]
@@ -1194,6 +2912,11 @@ mod tests {
             fetched_count: 20,
             last_sequence: Some(20),
             updated_at: now(),
+            job_id: None,
+            run_id: None,
+            generation: None,
+            owner_token: None,
+            owner: CheckpointOwner::AdHoc,
         };
         save_sync_checkpoint(&db, &cp).await.unwrap();
         let fetched = get_sync_checkpoint(&db, "user:123:posts")
@@ -1205,9 +2928,10 @@ mod tests {
         // upsert 更新游标，不产生第二行。
         let mut cp2 = cp.clone();
         cp2.fetched_count = 40;
+        cp2.last_sequence = Some(40);
         cp2.cursor_json = Some("{\"cursor\":{\"max_id\":\"p2_after\"}}".into());
         save_sync_checkpoint(&db, &cp2).await.unwrap();
-        let all: Vec<SyncCheckpointDto> = sqlx::query_as("SELECT stream, cursor_json, fetched_count, last_sequence, updated_at FROM sync_checkpoints")
+        let all: Vec<SyncCheckpointDto> = sqlx::query_as("SELECT stream, cursor_json, fetched_count, last_sequence, updated_at, job_id, run_id, generation, owner_token FROM sync_checkpoints")
             .fetch_all(&db)
             .await
             .unwrap();
@@ -1242,6 +2966,11 @@ mod tests {
             fetched_count: 1,
             last_sequence: Some(1),
             updated_at: now(),
+            job_id: None,
+            run_id: None,
+            generation: None,
+            owner_token: None,
+            owner: CheckpointOwner::AdHoc,
         };
         let plan = transactional::CommitPlan {
             request_id: Some("req-1".into()),
@@ -1351,6 +3080,11 @@ mod tests {
             fetched_count: 1,
             last_sequence: Some(1),
             updated_at: now(),
+            job_id: None,
+            run_id: None,
+            generation: None,
+            owner_token: None,
+            owner: CheckpointOwner::AdHoc,
         };
         let plan = transactional::CommitPlan {
             request_id: Some("req-p1".into()),
@@ -1441,6 +3175,11 @@ mod tests {
                 fetched_count: 1,
                 last_sequence: Some(1),
                 updated_at: now(),
+                job_id: None,
+                run_id: None,
+                generation: None,
+                owner_token: None,
+                owner: CheckpointOwner::AdHoc,
             },
             processed_at: now(),
         };
