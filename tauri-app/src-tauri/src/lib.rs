@@ -415,6 +415,7 @@ mod tests {
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
 
         assert_eq!(config["productName"], "WeiBack Next");
+        assert_eq!(config["mainBinaryName"], "weiback-next");
         assert_eq!(config["identifier"], "com.weiback.next");
         assert_eq!(config["app"]["windows"][0]["title"], "WeiBack Next");
     }
