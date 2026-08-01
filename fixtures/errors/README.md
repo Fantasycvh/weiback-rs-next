@@ -12,11 +12,11 @@
 | `AUTH_REQUIRED` | true | request | 需要登录态 |
 | `UPSTREAM_RATE_LIMITED` | true | endpoint | 上游限流，带 `retry_after_ms` |
 | `UPSTREAM_UNAVAILABLE` | true | request | 上游临时不可用 |
-| `RESPONSE_SCHEMA_CHANGED` | true | request | 上游返回结构变化 |
-| `BROWSER_NOT_INSTALLED` | false | sidecar | Playwright 浏览器缺失 |
+| `RESPONSE_SCHEMA_CHANGED` | false | request | 上游返回结构变化 |
+| `BROWSER_NOT_INSTALLED` | true | sidecar | Playwright 浏览器缺失 |
 | `BROWSER_START_FAILED` | true | sidecar | 浏览器启动失败 |
 | `REQUEST_CANCELLED` | false | request | 请求被取消（不视为错误重试） |
-| `INTERNAL_ERROR` | false | sidecar | Sidecar 内部错误 |
+| `INTERNAL_ERROR` | false | request | Sidecar 内部错误 |
 
 ## 文件索引
 
