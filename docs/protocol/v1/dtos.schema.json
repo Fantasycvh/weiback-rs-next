@@ -1,0 +1,245 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://weiback-next.local/protocol/v1/dtos.schema.json",
+  "title": "WeiBack Next 协议 v1 — 事件 payload DTO",
+  "description": "事件 payload 中的规范化 DTO。字段与 Python collector 输出及 Rust models 对齐。",
+  "definitions": {
+    "ready_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sidecar_name", "sidecar_version", "protocol_version"],
+      "properties": {
+        "sidecar_name": { "type": "string", "const": "weiback-collector" },
+        "sidecar_version": { "type": "string" },
+        "protocol_version": { "type": "integer", "const": 1 }
+      }
+    },
+    "capabilities_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_versions", "commands"],
+      "properties": {
+        "protocol_versions": {
+          "type": "array",
+          "items": { "type": "integer" },
+          "minItems": 1
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "hello",
+              "health",
+              "collect_user_posts",
+              "collect_comments",
+              "collect_comment_replies",
+              "cancel",
+              "shutdown"
+            ]
+          }
+        },
+        "browser_installed": { "type": "boolean" },
+        "browser_version": { "type": ["string", "null"] },
+        "auth_state": { "type": ["string", "null"], "enum": ["unknown", "authenticated", "guest"] }
+      }
+    },
+    "started_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stream"],
+      "properties": {
+        "stream": { "type": "string" }
+      }
+    },
+    "progress_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase"],
+      "properties": {
+        "phase": { "type": "string", "description": "如 login、parsing、fetching" },
+        "message": { "type": "string" }
+      }
+    },
+    "user_dto": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": { "type": ["integer", "string"] },
+        "screen_name": { "type": ["string", "null"] },
+        "avatar_hd": { "type": ["string", "null"] },
+        "avatar_large": { "type": ["string", "null"] },
+        "profile_image_url": { "type": ["string", "null"] },
+        "domain": { "type": ["string", "null"] },
+        "following": { "type": ["boolean", "integer"] },
+        "follow_me": { "type": ["boolean", "integer"] }
+      }
+    },
+    "post_dto": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "uid"],
+      "properties": {
+        "id": { "type": ["integer", "string"] },
+        "uid": { "type": ["integer", "string"], "description": "帖子作者 uid" },
+        "text": { "type": ["string", "null"] },
+        "created_at": { "type": ["string", "null"], "description": "RFC3339" },
+        "attitudes_count": { "type": "integer" },
+        "attitudes_status": { "type": "integer" },
+        "comments_count": { "type": "integer" },
+        "reposts_count": { "type": "integer" },
+        "repost_type": { "type": "integer" },
+        "retweeted_id": { "type": ["integer", "string", "null"] },
+        "pic_ids": { "type": ["array", "null"], "items": { "type": "string" } },
+        "pic_infos": { "type": ["object", "string", "null"] },
+        "pic_num": { "type": "integer" },
+        "geo": { "type": ["string", "null"] },
+        "mblogid": { "type": ["string", "null"] },
+        "mix_media_ids": { "type": ["array", "string", "null"] },
+        "mix_media_info": { "type": ["object", "string", "null"] },
+        "page_info": { "type": ["object", "string", "null"] },
+        "region_name": { "type": ["string", "null"] },
+        "source": { "type": ["string", "null"] },
+        "tag_struct": { "type": ["array", "object", "string", "null"] },
+        "url_struct": { "type": ["array", "object", "string", "null"] },
+        "deleted": { "type": ["boolean", "integer"] },
+        "edit_count": { "type": "integer" },
+        "favorited": { "type": ["boolean", "integer"] },
+        "bid": { "type": ["string", "null"] },
+        "location": { "type": ["string", "null"] },
+        "topic_ids": { "type": ["array", "string", "null"], "items": { "type": "string" } },
+        "at_users": { "type": ["array", "string", "null"], "items": { "type": "string" } },
+        "is_long_text": { "type": ["boolean", "integer"] },
+        "video_url": { "type": ["string", "null"] },
+        "raw_data": { "type": ["object", "string", "null"], "description": "保留原始响应诊断摘要" },
+        "content_status": { "type": "string", "enum": ["partial", "complete"] },
+        "fetch_error": { "type": ["string", "null"] },
+        "first_fetched_at": { "type": ["string", "null"] },
+        "last_refreshed_at": { "type": ["string", "null"] }
+      }
+    },
+    "comment_dto": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "post_id"],
+      "properties": {
+        "id": { "type": "string" },
+        "post_id": { "type": ["integer", "string"] },
+        "user_id": { "type": ["string", "integer", "null"] },
+        "user_screen_name": { "type": ["string", "null"] },
+        "text": { "type": ["string", "null"] },
+        "created_at": { "type": ["string", "null"] },
+        "like_count": { "type": "integer" },
+        "reply_id": { "type": ["string", "null"] },
+        "root_id": { "type": ["string", "null"] },
+        "parent_id": { "type": ["string", "null"] },
+        "depth": { "type": "integer", "minimum": 0 },
+        "source": { "type": ["string", "null"] },
+        "user_avatar_url": { "type": ["string", "null"] },
+        "user_verified": { "type": ["boolean", "integer"] },
+        "liked": { "type": ["boolean", "integer"] },
+        "reply_text": { "type": ["string", "null"] },
+        "pic_url": { "type": ["string", "null"] },
+        "child_count": { "type": "integer" },
+        "raw_data": { "type": ["object", "string", "null"] },
+        "last_refreshed_at": { "type": ["string", "null"] }
+      }
+    },
+    "media_reference_dto": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owner_type", "owner_id", "media_type", "url"],
+      "properties": {
+        "id": { "type": ["string", "null"] },
+        "owner_type": { "type": "string", "enum": ["post", "user", "comment"] },
+        "owner_id": { "type": ["string", "integer"] },
+        "post_id": { "type": ["string", "integer", "null"] },
+        "user_id": { "type": ["string", "integer", "null"] },
+        "media_type": { "type": "string", "enum": ["picture", "video", "avatar", "emoji"] },
+        "url": { "type": "string" },
+        "definition": { "type": ["string", "null"], "description": "图片清晰度等级" }
+      }
+    },
+    "checkpoint_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cursor", "fetched_count", "has_more"],
+      "properties": {
+        "cursor": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["max_id", "max_id_type"],
+          "properties": {
+            "max_id": { "type": ["string", "integer"] },
+            "max_id_type": { "type": "integer" }
+          }
+        },
+        "fetched_count": { "type": "integer", "minimum": 0 },
+        "has_more": { "type": "boolean" },
+        "reason": { "type": "string" }
+      }
+    },
+    "rate_limited_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["retryable"],
+      "properties": {
+        "code": { "type": "string", "const": "UPSTREAM_RATE_LIMITED" },
+        "retryable": { "type": "boolean", "const": true },
+        "retry_after_ms": { "type": ["integer", "null"] },
+        "scope": { "type": "string", "enum": ["account", "endpoint", "request"] }
+      }
+    },
+    "auth_required_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code"],
+      "properties": {
+        "code": { "type": "string", "const": "AUTH_REQUIRED" },
+        "retryable": { "type": "boolean" },
+        "message": { "type": "string" }
+      }
+    },
+    "warning_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["message"],
+      "properties": {
+        "message": { "type": "string" },
+        "code": { "type": ["string", "null"] }
+      }
+    },
+    "error_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "retryable"],
+      "properties": {
+        "code": { "type": "string" },
+        "message": { "type": "string" },
+        "retryable": { "type": "boolean" },
+        "retry_after_ms": { "type": ["integer", "null"] },
+        "scope": { "type": "string", "enum": ["request", "stream", "sidecar"] }
+      }
+    },
+    "done_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "fetched_count", "has_more"],
+      "properties": {
+        "status": { "type": "string", "enum": ["completed", "stopped"] },
+        "fetched_count": { "type": "integer", "minimum": 0 },
+        "has_more": { "type": "boolean" }
+      }
+    },
+    "cancelled_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request_id"],
+      "properties": {
+        "request_id": { "type": "string" },
+        "fetched_count": { "type": "integer" }
+      }
+    }
+  }
+}

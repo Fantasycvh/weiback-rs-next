@@ -1,0 +1,88 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://weiback-next.local/protocol/v1/event.schema.json",
+  "title": "WeiBack Next 协议 v1 — 事件信封",
+  "description": "Sidecar 到 Rust 的事件。stdout 每行一个该对象。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol_version", "request_id", "event_id", "type", "occurred_at"],
+  "properties": {
+    "protocol_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "request_id": {
+      "$ref": "#/definitions/uuid_v7",
+      "description": "关联的命令 request_id；handshake/生命周期事件可为 null"
+    },
+    "event_id": {
+      "$ref": "#/definitions/uuid_v7",
+      "description": "单个事件的全局幂等键"
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "ready",
+        "capabilities",
+        "started",
+        "progress",
+        "user",
+        "post",
+        "comment",
+        "media_reference",
+        "checkpoint",
+        "rate_limited",
+        "auth_required",
+        "warning",
+        "error",
+        "done",
+        "cancelled"
+      ]
+    },
+    "stream": {
+      "type": "string",
+      "description": "逻辑资源流，如 user:123:posts、post:456:comments；事件相关时必填",
+      "pattern": "^(user:[^:]+:posts|post:[^:]+:comments|post:[^:]+:replies)$"
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "同一请求、同一 stream 内从 1 开始单调递增"
+    },
+    "total_expected": {
+      "type": ["integer", "null"],
+      "description": "当前可见总数的估算，可为 null，不可作为完成判据"
+    },
+    "occurred_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Sidecar 生成事件的 UTC 时间，仅用于诊断"
+    },
+    "payload": {
+      "type": "object",
+      "oneOf": [
+        { "$ref": "dtos.schema.json#/definitions/ready_payload" },
+        { "$ref": "dtos.schema.json#/definitions/capabilities_payload" },
+        { "$ref": "dtos.schema.json#/definitions/started_payload" },
+        { "$ref": "dtos.schema.json#/definitions/progress_payload" },
+        { "$ref": "dtos.schema.json#/definitions/user_dto" },
+        { "$ref": "dtos.schema.json#/definitions/post_dto" },
+        { "$ref": "dtos.schema.json#/definitions/comment_dto" },
+        { "$ref": "dtos.schema.json#/definitions/media_reference_dto" },
+        { "$ref": "dtos.schema.json#/definitions/checkpoint_payload" },
+        { "$ref": "dtos.schema.json#/definitions/rate_limited_payload" },
+        { "$ref": "dtos.schema.json#/definitions/auth_required_payload" },
+        { "$ref": "dtos.schema.json#/definitions/warning_payload" },
+        { "$ref": "dtos.schema.json#/definitions/error_payload" },
+        { "$ref": "dtos.schema.json#/definitions/done_payload" },
+        { "$ref": "dtos.schema.json#/definitions/cancelled_payload" }
+      ]
+    }
+  },
+  "definitions": {
+    "uuid_v7": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    }
+  }
+}

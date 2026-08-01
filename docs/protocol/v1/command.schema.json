@@ -1,0 +1,120 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://weiback-next.local/protocol/v1/command.schema.json",
+  "title": "WeiBack Next 协议 v1 — 命令信封",
+  "description": "Rust 到 Sidecar 的命令。stdin 每行一个该对象。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol_version", "request_id", "type"],
+  "properties": {
+    "protocol_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "协议版本，首期固定为 1"
+    },
+    "request_id": {
+      "$ref": "#/definitions/uuid_v7",
+      "description": "一次 Rust 采集请求的关联 ID"
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "hello",
+        "health",
+        "collect_user_posts",
+        "collect_comments",
+        "collect_comment_replies",
+        "cancel",
+        "shutdown"
+      ]
+    },
+    "payload": {
+      "type": "object",
+      "oneOf": [
+        { "$ref": "#/definitions/hello_payload" },
+        { "$ref": "#/definitions/health_payload" },
+        { "$ref": "#/definitions/collect_user_posts_payload" },
+        { "$ref": "#/definitions/collect_comments_payload" },
+        { "$ref": "#/definitions/collect_comment_replies_payload" },
+        { "$ref": "#/definitions/cancel_payload" },
+        { "$ref": "#/definitions/shutdown_payload" }
+      ]
+    }
+  },
+  "definitions": {
+    "uuid_v7": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "description": "UUID v7"
+    },
+    "hello_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["client_name", "client_version"],
+      "properties": {
+        "client_name": { "type": "string", "const": "weiback-next" },
+        "client_version": { "type": "string" }
+      }
+    },
+    "health_payload": {
+      "type": "object",
+      "additionalProperties": false
+    },
+    "collect_user_posts_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uid"],
+      "properties": {
+        "uid": { "type": "string", "description": "目标用户 ID" },
+        "max_pages": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "checkpoint": { "$ref": "#/definitions/cursor" }
+      }
+    },
+    "collect_comments_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["post_id"],
+      "properties": {
+        "post_id": { "type": "string" },
+        "max_pages": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "checkpoint": { "$ref": "#/definitions/cursor" }
+      }
+    },
+    "collect_comment_replies_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["post_id", "root_comment_id"],
+      "properties": {
+        "post_id": { "type": "string" },
+        "root_comment_id": { "type": "string" },
+        "max_pages": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "checkpoint": { "$ref": "#/definitions/cursor" }
+      }
+    },
+    "cancel_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request_id"],
+      "properties": {
+        "request_id": { "$ref": "#/definitions/uuid_v7", "description": "要取消的请求 ID" }
+      }
+    },
+    "shutdown_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "grace_ms": { "type": "integer", "minimum": 0, "description": "优雅退出宽限期（毫秒），默认 3000" }
+      }
+    },
+    "cursor": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "可持久化远端游标，与 PLAN.md §5.5 一致",
+      "required": ["max_id", "max_id_type"],
+      "properties": {
+        "max_id": { "type": ["string", "integer"], "description": "远端分页游标" },
+        "max_id_type": { "type": "integer", "description": "游标类型，0 为常规" }
+      }
+    }
+  }
+}

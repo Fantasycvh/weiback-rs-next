@@ -553,10 +553,10 @@ running --进程退出--> interrupted -> pending/running
 
 - [x] 记录 Rust 和前端现有测试基线；Python Sidecar 建立后补充 Python 基线。
 - [x] 确认主项目 Git 边界，避免构建产物或相邻项目误入版本控制。
-- [ ] 建立 ADR：混合架构、Rust 单 writer、JSONL stdio、Windows x64 首发、永久独立身份、一次性快照导入。
-- [ ] 将协议消息定义为 JSON Schema 或等价的可验证类型。
-- [ ] 建立帖子、评论、checkpoint、错误的黄金 fixture。
-- [ ] 明确敏感字段和日志脱敏规则。
+- [x] 建立 ADR：混合架构、Rust 单 writer、JSONL stdio、Windows x64 首发、永久独立身份、一次性快照导入（`docs/adr/ADR-001..006`）。
+- [x] 将协议消息定义为 JSON Schema 或等价的可验证类型（`docs/protocol/v1/`：command/event/dtos schema + errors.md）。
+- [x] 建立帖子、评论、checkpoint、错误的黄金 fixture（`fixtures/`，已验证逐行合法 JSONL）。
+- [x] 明确敏感字段和日志脱敏规则（`docs/security.md`）。
 
 完成门槛：
 
