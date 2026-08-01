@@ -385,6 +385,17 @@ pub fn convert_old_to_internal_post(
         text: old.text_raw,
         uid: old.uid,
         url_struct,
+        bid: None,
+        location: None,
+        topic_ids: None,
+        at_users: None,
+        is_long_text: false,
+        video_url: None,
+        raw_data: None,
+        content_status: "complete".to_string(),
+        fetch_error: None,
+        first_fetched_at: None,
+        last_refreshed_at: None,
     })
 }
 

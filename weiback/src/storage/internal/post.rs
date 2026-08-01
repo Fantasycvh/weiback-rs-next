@@ -84,6 +84,17 @@ enum PostIden {
     Text,
     Uid,
     UrlStruct,
+    Bid,
+    Location,
+    TopicIds,
+    AtUsers,
+    IsLongText,
+    VideoUrl,
+    RawData,
+    ContentStatus,
+    FetchError,
+    FirstFetchedAt,
+    LastRefreshedAt,
 }
 
 #[derive(Iden)]
@@ -131,6 +142,17 @@ pub struct PostInternal {
     pub text: String,
     pub uid: Option<i64>,
     pub url_struct: Option<Value>,
+    pub bid: Option<String>,
+    pub location: Option<String>,
+    pub topic_ids: Option<Value>,
+    pub at_users: Option<Value>,
+    pub is_long_text: bool,
+    pub video_url: Option<String>,
+    pub raw_data: Option<Value>,
+    pub content_status: String,
+    pub fetch_error: Option<String>,
+    pub first_fetched_at: Option<String>,
+    pub last_refreshed_at: Option<String>,
 }
 
 impl TryFrom<Post> for PostInternal {
@@ -167,6 +189,17 @@ impl TryFrom<Post> for PostInternal {
             text: post.text,
             uid: post.user.map(|u| u.id),
             url_struct: post.url_struct.map(to_value).transpose()?,
+            bid: post.bid,
+            location: post.location,
+            topic_ids: post.topic_ids.map(|v| to_value(&v)).transpose()?,
+            at_users: post.at_users.map(|v| to_value(&v)).transpose()?,
+            is_long_text: post.is_long_text.unwrap_or(false),
+            video_url: post.video_url,
+            raw_data: post.raw_data,
+            content_status: post.content_status.unwrap_or_else(|| "complete".into()),
+            fetch_error: post.fetch_error,
+            first_fetched_at: post.first_fetched_at.map(|t| t.to_rfc3339()),
+            last_refreshed_at: post.last_refreshed_at.map(|t| t.to_rfc3339()),
         })
     }
 }
@@ -207,6 +240,23 @@ impl TryInto<Post> for PostInternal {
             text: self.text,
             url_struct: self.url_struct.map(from_value).transpose()?,
             user: None,
+            bid: self.bid,
+            location: self.location,
+            topic_ids: self.topic_ids.map(from_value).transpose()?,
+            at_users: self.at_users.map(from_value).transpose()?,
+            is_long_text: Some(self.is_long_text),
+            video_url: self.video_url,
+            raw_data: self.raw_data,
+            content_status: Some(self.content_status),
+            fetch_error: self.fetch_error,
+            first_fetched_at: self
+                .first_fetched_at
+                .map(|s| DateTime::parse_from_rfc3339(&s))
+                .transpose()?,
+            last_refreshed_at: self
+                .last_refreshed_at
+                .map(|s| DateTime::parse_from_rfc3339(&s))
+                .transpose()?,
         })
     }
 }
@@ -309,6 +359,17 @@ where
             PostIden::Text,
             PostIden::Uid,
             PostIden::UrlStruct,
+            PostIden::Bid,
+            PostIden::Location,
+            PostIden::TopicIds,
+            PostIden::AtUsers,
+            PostIden::IsLongText,
+            PostIden::VideoUrl,
+            PostIden::RawData,
+            PostIden::ContentStatus,
+            PostIden::FetchError,
+            PostIden::FirstFetchedAt,
+            PostIden::LastRefreshedAt,
         ])
         .values([
             post.attitudes_count.into(),
@@ -344,6 +405,17 @@ where
             post.text.clone().into(),
             post.uid.into(),
             post.url_struct.as_ref().map(to_string).transpose()?.into(),
+            post.bid.clone().into(),
+            post.location.clone().into(),
+            post.topic_ids.as_ref().map(to_string).transpose()?.into(),
+            post.at_users.as_ref().map(to_string).transpose()?.into(),
+            post.is_long_text.into(),
+            post.video_url.clone().into(),
+            post.raw_data.as_ref().map(to_string).transpose()?.into(),
+            post.content_status.clone().into(),
+            post.fetch_error.clone().into(),
+            post.first_fetched_at.clone().into(),
+            post.last_refreshed_at.clone().into(),
         ])?
         .on_conflict(
             OnConflict::column(PostIden::Id)
@@ -372,6 +444,17 @@ where
                     PostIden::Text,
                     PostIden::Uid,
                     PostIden::UrlStruct,
+                    PostIden::Bid,
+                    PostIden::Location,
+                    PostIden::TopicIds,
+                    PostIden::AtUsers,
+                    PostIden::IsLongText,
+                    PostIden::VideoUrl,
+                    PostIden::RawData,
+                    PostIden::ContentStatus,
+                    PostIden::FetchError,
+                    PostIden::FirstFetchedAt,
+                    PostIden::LastRefreshedAt,
                 ])
                 .to_owned(),
         )
@@ -1244,5 +1327,94 @@ mod local_tests {
         let (results, total) = query_posts(&db, query).await.unwrap();
         assert_eq!(total, 0);
         assert_eq!(results.len(), 0);
+    }
+
+    /// 帖子扩展字段 save→get 逐字段完整往返。
+    #[tokio::test]
+    async fn test_save_and_get_post_extended_fields_roundtrip() {
+        let db = setup_db().await;
+        let base = create_test_posts().await;
+        let mut post = base.into_iter().next().expect("fixture has posts");
+
+        post.bid = Some("zhexample1".to_string());
+        post.location = Some("上海·静安".to_string());
+        post.topic_ids = Some(vec!["topic-1".to_string(), "topic-2".to_string()]);
+        post.at_users = Some(vec!["10001".to_string(), "10002".to_string()]);
+        post.is_long_text = Some(true);
+        post.video_url = Some("https://weibo.com/v/abc".to_string());
+        post.raw_data = Some(serde_json::json!({"orig": {"x": 1}}));
+        post.content_status = Some("partial".to_string());
+        post.fetch_error = Some("HTTP 429".to_string());
+        let fetched_at = chrono::DateTime::parse_from_rfc3339("2026-07-31T10:00:00+08:00").unwrap();
+        post.first_fetched_at = Some(fetched_at);
+        post.last_refreshed_at = Some(fetched_at);
+
+        let internal: PostInternal = post.clone().try_into().unwrap();
+        save_post(&db, &internal).await.unwrap();
+
+        let fetched: Post = get_post(&db, post.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .try_into()
+            .unwrap();
+
+        assert_eq!(fetched.bid, Some("zhexample1".to_string()));
+        assert_eq!(fetched.location, Some("上海·静安".to_string()));
+        assert_eq!(
+            fetched.topic_ids,
+            Some(vec!["topic-1".to_string(), "topic-2".to_string()])
+        );
+        assert_eq!(
+            fetched.at_users,
+            Some(vec!["10001".to_string(), "10002".to_string()])
+        );
+        assert_eq!(fetched.is_long_text, Some(true));
+        assert_eq!(fetched.video_url, Some("https://weibo.com/v/abc".to_string()));
+        assert_eq!(fetched.raw_data, Some(serde_json::json!({"orig": {"x": 1}})));
+        assert_eq!(fetched.content_status, Some("partial".to_string()));
+        assert_eq!(fetched.fetch_error, Some("HTTP 429".to_string()));
+        assert_eq!(fetched.first_fetched_at, Some(fetched_at));
+        assert_eq!(fetched.last_refreshed_at, Some(fetched_at));
+    }
+
+    /// 旧 posts 行（新列缺失）读取时新字段应为默认值。
+    #[tokio::test]
+    async fn test_read_legacy_post_row_defaults_extended_fields() {
+        let db = setup_db().await;
+        let base = create_test_posts().await;
+        let post = base.into_iter().next().expect("fixture has posts");
+        let internal: PostInternal = post.clone().try_into().unwrap();
+        save_post(&db, &internal).await.unwrap();
+
+        // 模拟旧数据：把扩展列清空成 NULL / 默认。
+        sqlx::query(
+            "UPDATE posts SET bid=NULL, location=NULL, topic_ids=NULL, at_users=NULL, \
+             is_long_text=0, video_url=NULL, raw_data=NULL, content_status='complete', \
+             fetch_error=NULL, first_fetched_at=NULL, last_refreshed_at=NULL WHERE id=?",
+        )
+        .bind(post.id)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let fetched: Post = get_post(&db, post.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .try_into()
+            .unwrap();
+
+        assert_eq!(fetched.bid, None);
+        assert_eq!(fetched.location, None);
+        assert_eq!(fetched.topic_ids, None);
+        assert_eq!(fetched.at_users, None);
+        assert_eq!(fetched.is_long_text, Some(false));
+        assert_eq!(fetched.video_url, None);
+        assert_eq!(fetched.raw_data, None);
+        assert_eq!(fetched.content_status, Some("complete".to_string()));
+        assert_eq!(fetched.fetch_error, None);
+        assert_eq!(fetched.first_fetched_at, None);
+        assert_eq!(fetched.last_refreshed_at, None);
     }
 }

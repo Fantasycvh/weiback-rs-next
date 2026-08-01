@@ -34,6 +34,39 @@ pub struct Post {
     pub text: String,
     pub url_struct: Option<UrlStruct>,
     pub user: Option<User>,
+    /// 微博短 ID，采集时补齐。
+    #[serde(default)]
+    pub bid: Option<String>,
+    /// 位置/地标文本。
+    #[serde(default)]
+    pub location: Option<String>,
+    /// 话题 ID 列表。
+    #[serde(default)]
+    pub topic_ids: Option<Vec<String>>,
+    /// @ 提及的用户 ID 列表。
+    #[serde(default)]
+    pub at_users: Option<Vec<String>>,
+    /// 是否为长文。
+    #[serde(default)]
+    pub is_long_text: Option<bool>,
+    /// 长文视频地址。
+    #[serde(default)]
+    pub video_url: Option<String>,
+    /// 上游原始响应体（JSON）。
+    #[serde(default)]
+    pub raw_data: Option<Value>,
+    /// 内容完整性状态：`complete` 或 `partial`。
+    #[serde(default)]
+    pub content_status: Option<String>,
+    /// 上次采集失败的错误描述。
+    #[serde(default)]
+    pub fetch_error: Option<String>,
+    /// 首次采集时间。
+    #[serde(default)]
+    pub first_fetched_at: Option<DateTime<FixedOffset>>,
+    /// 最近刷新时间。
+    #[serde(default)]
+    pub last_refreshed_at: Option<DateTime<FixedOffset>>,
 }
 
 #[cfg(test)]

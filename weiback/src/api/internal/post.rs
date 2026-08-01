@@ -102,6 +102,17 @@ impl TryFrom<PostInternal> for Post {
             text: value.text,
             url_struct: value.url_struct.map(|u| u.try_into()).transpose()?,
             user: value.user.map(|u| u.into()),
+            bid: None,
+            location: None,
+            topic_ids: None,
+            at_users: None,
+            is_long_text: Some(value.is_long_text),
+            video_url: None,
+            raw_data: None,
+            content_status: Some("complete".to_string()),
+            fetch_error: None,
+            first_fetched_at: None,
+            last_refreshed_at: None,
         };
         Ok(res)
     }

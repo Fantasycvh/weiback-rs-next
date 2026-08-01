@@ -585,12 +585,12 @@ running --进程退出--> interrupted -> pending/running
 
 交付物：
 
-- [ ] migration 前备份和失败恢复测试。
-- [ ] 帖子完整字段。
-- [ ] 评论、媒体、监控用户、任务、run、checkpoint、幂等事件表。
-- [ ] Storage DTO、round-trip 和查询扩展。
-- [ ] 数据事件 + checkpoint 同事务提交。
-- [ ] 旧 Rust 数据库 fixture 升级测试。
+- [x] migration 前备份和失败恢复测试。
+- [x] 帖子完整字段。
+- [x] 评论、媒体、监控用户、任务、run、checkpoint、幂等事件表。
+- [x] Storage DTO、round-trip 和查询扩展。
+- [x] 数据事件 + checkpoint 同事务提交。
+- [x] 旧 Rust 数据库 fixture 升级测试。
 
 完成门槛：
 

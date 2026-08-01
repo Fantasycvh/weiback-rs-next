@@ -36,14 +36,31 @@ pub enum TaskType {
 }
 
 /// The current execution state of a task.
+///
+/// 状态机（见 PLAN §6.4）：
+/// `pending -> running(InProgress) -> completed`
+///                              `-> failed`
+///                              `-> paused -> running`
+///                              `-> cancelled`
+/// `running --进程退出--> interrupted -> running`
+///
+/// 序列化保持既有 PascalCase 变体名，兼容现有前端（`Completed`/`Failed`/`InProgress`）。
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub enum TaskStatus {
+    /// The task has been created but not yet started.
+    Pending,
     /// The task is currently running.
     InProgress,
     /// The task has finished successfully.
     Completed,
     /// The task has stopped due to a fatal error.
     Failed,
+    /// The task was temporarily paused and can be resumed.
+    Paused,
+    /// The task was cancelled by the user.
+    Cancelled,
+    /// The task was interrupted by process exit and can be resumed.
+    Interrupted,
 }
 
 /// Represents a single unit of work being performed by the application.
@@ -272,6 +289,93 @@ impl TaskManager {
     pub fn get_current(&self) -> Result<Option<Task>> {
         Ok(self.current_task.lock()?.clone())
     }
+
+    /// 暂停当前任务（仅 `InProgress` → `Paused`）。
+    pub fn pause_current(&self) -> Result<()> {
+        self.transition_if(
+            TaskStatus::InProgress,
+            TaskStatus::Paused,
+            "Cannot pause task: it is not in progress.".to_string(),
+        )
+    }
+
+    /// 取消当前任务（`InProgress`/`Paused` → `Cancelled`）。
+    pub fn cancel_current(&self) -> Result<()> {
+        let mut task_guard = self.current_task.lock()?;
+        let Some(task) = task_guard.as_mut() else {
+            return Err(Error::InconsistentTask(
+                "Cannot cancel task: no active task.".to_string(),
+            ));
+        };
+        if task.status != TaskStatus::InProgress && task.status != TaskStatus::Paused {
+            return Err(Error::InconsistentTask(format!(
+                "Cannot cancel task: current status is {:?}.",
+                task.status
+            )));
+        }
+        task.status = TaskStatus::Cancelled;
+        let task_clone = task.clone();
+        drop(task_guard);
+        self.notify(&task_clone)?;
+        Ok(())
+    }
+
+    /// 标记当前任务为进程中断（仅 `InProgress` → `Interrupted`），
+    /// 用于应用启动时把遗留的 running 任务转为可恢复状态。
+    pub fn interrupt_current(&self) -> Result<()> {
+        self.transition_if(
+            TaskStatus::InProgress,
+            TaskStatus::Interrupted,
+            "Cannot interrupt task: it is not in progress.".to_string(),
+        )
+    }
+
+    /// 恢复被暂停或中断的任务（`Paused`/`Interrupted` → `InProgress`）。
+    pub fn resume_current(&self) -> Result<()> {
+        let mut task_guard = self.current_task.lock()?;
+        let Some(task) = task_guard.as_mut() else {
+            return Err(Error::InconsistentTask(
+                "Cannot resume task: no active task.".to_string(),
+            ));
+        };
+        if task.status != TaskStatus::Paused && task.status != TaskStatus::Interrupted {
+            return Err(Error::InconsistentTask(format!(
+                "Cannot resume task: current status is {:?}.",
+                task.status
+            )));
+        }
+        task.status = TaskStatus::InProgress;
+        let task_clone = task.clone();
+        drop(task_guard);
+        self.notify(&task_clone)?;
+        Ok(())
+    }
+
+    /// 从 `from` 状态迁移到 `to` 状态并通知监听器。
+    fn transition_if(&self, from: TaskStatus, to: TaskStatus, err_msg: String) -> Result<()> {
+        let mut task_guard = self.current_task.lock()?;
+        let Some(task) = task_guard.as_mut() else {
+            return Err(Error::InconsistentTask(
+                "Cannot transition task: no active task.".to_string(),
+            ));
+        };
+        if task.status != from {
+            return Err(Error::InconsistentTask(err_msg));
+        }
+        task.status = to;
+        let task_clone = task.clone();
+        drop(task_guard);
+        self.notify(&task_clone)?;
+        Ok(())
+    }
+
+    /// 通知监听器任务已更新。
+    fn notify(&self, task: &Task) -> Result<()> {
+        if let Some(listener) = self.listener.lock()?.as_ref() {
+            listener.on_task_updated(task);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -395,5 +499,71 @@ mod local_tests {
         let task = manager.get_current().unwrap().unwrap();
         assert_eq!(task.id, 2);
         assert_eq!(task.status, TaskStatus::InProgress);
+    }
+
+    #[test]
+    fn test_state_machine_pause_cancel_interrupt_resume() {
+        let manager = TaskManager::new();
+
+        // 中断非法状态：无任务。
+        assert!(manager.interrupt_current().is_err());
+
+        manager
+            .start_task(1, TaskType::BackupUser, "Test".into(), 10)
+            .unwrap();
+
+        // running -> paused -> running
+        manager.pause_current().unwrap();
+        assert_eq!(
+            manager.get_current().unwrap().unwrap().status,
+            TaskStatus::Paused
+        );
+        manager.resume_current().unwrap();
+        assert_eq!(
+            manager.get_current().unwrap().unwrap().status,
+            TaskStatus::InProgress
+        );
+
+        // running -> interrupted -> running
+        manager.interrupt_current().unwrap();
+        assert_eq!(
+            manager.get_current().unwrap().unwrap().status,
+            TaskStatus::Interrupted
+        );
+        manager.resume_current().unwrap();
+        assert_eq!(
+            manager.get_current().unwrap().unwrap().status,
+            TaskStatus::InProgress
+        );
+
+        // running -> cancelled
+        manager.cancel_current().unwrap();
+        assert_eq!(
+            manager.get_current().unwrap().unwrap().status,
+            TaskStatus::Cancelled
+        );
+
+        // 已取消不能再 pause/interrupt/resume。
+        assert!(manager.pause_current().is_err());
+        assert!(manager.interrupt_current().is_err());
+        assert!(manager.resume_current().is_err());
+    }
+
+    #[test]
+    fn test_start_task_blocked_while_running_but_allowed_after_cancel() {
+        let manager = TaskManager::new();
+        manager
+            .start_task(1, TaskType::BackupUser, "First".into(), 10)
+            .unwrap();
+        assert!(manager
+            .start_task(2, TaskType::BackupFavorites, "Second".into(), 5)
+            .is_err());
+
+        manager.cancel_current().unwrap();
+        // cancelled 后允许新任务。
+        assert!(manager
+            .start_task(3, TaskType::BackupFavorites, "Third".into(), 5)
+            .is_ok());
+        assert_eq!(manager.get_current().unwrap().unwrap().id, 3);
     }
 }
