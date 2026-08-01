@@ -6,7 +6,8 @@ from typing import Any
 
 from . import events
 from .events import EventEmitter
-from .fixture_source import FixtureSource, CATEGORY_DIRS
+from .collector import Collector
+from .fixture_source import FixtureSource
 from .protocol import PROTOCOL_VERSION
 
 SIDECAR_NAME = "weiback-collector"
@@ -21,11 +22,14 @@ _COMMAND_CATEGORY = {
 class CommandDispatcher:
     def __init__(
         self,
-        fixture_source: FixtureSource,
+        fixture_source: FixtureSource | None,
         sidecar_version: str,
+        collector: Collector | None = None,
     ) -> None:
         self.fixture_source = fixture_source
         self.sidecar_version = sidecar_version
+        self.collector = collector
+        self._default_max_pages = collector.max_pages if collector is not None else 10
         self._active_request: str | None = None
         self._browser_installed = False
         self._browser_version: str | None = None
@@ -139,7 +143,6 @@ class CommandDispatcher:
             )
             return True
 
-        category = _COMMAND_CATEGORY[command_type]
         stream = self._build_stream(command_type, payload)
         if stream is None:
             emitter = EventEmitter(request_id)
@@ -164,16 +167,41 @@ class CommandDispatcher:
                 request_id=request_id,
                 stream=stream,
             )
-            self.fixture_source.replay(
-                emitter,
-                category,
-                stream,
-                checkpoint=payload.get("checkpoint"),
-                is_replies=command_type == "collect_comment_replies",
-            )
+            if self.collector is not None:
+                self._collect_live(emitter, command_type, payload)
+            elif self.fixture_source is not None:
+                self.fixture_source.replay(
+                    emitter,
+                    _COMMAND_CATEGORY[command_type],
+                    stream,
+                    checkpoint=payload.get("checkpoint"),
+                    is_replies=command_type == "collect_comment_replies",
+                )
+            else:
+                raise RuntimeError("no collector backend configured")
         finally:
             self._active_request = None
         return True
+
+    def _collect_live(self, emitter: EventEmitter, command_type: str, payload: dict) -> None:
+        assert self.collector is not None
+        checkpoint = payload.get("checkpoint")
+        max_pages = payload.get("max_pages")
+        if isinstance(max_pages, int) and max_pages > 0:
+            self.collector.max_pages = min(max_pages, 1000)
+        else:
+            self.collector.max_pages = self._default_max_pages
+        if command_type == "collect_user_posts":
+            self.collector.collect_posts(emitter, payload["uid"], checkpoint=checkpoint)
+        elif command_type == "collect_comments":
+            self.collector.collect_comments(emitter, payload["post_id"], checkpoint=checkpoint)
+        else:
+            self.collector.collect_replies(
+                emitter,
+                payload["post_id"],
+                payload["root_comment_id"],
+                checkpoint=checkpoint,
+            )
 
     def _cancel(self, request_id: str, payload: dict) -> bool:
         target = payload.get("request_id")
@@ -217,5 +245,5 @@ class CommandDispatcher:
             root_id = payload.get("root_comment_id")
             if post_id is None or root_id is None:
                 return None
-            return f"post:{post_id}:replies"
+            return f"post:{post_id}:comment:{root_id}:replies"
         return None

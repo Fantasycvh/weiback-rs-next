@@ -168,12 +168,11 @@ class BackoffPolicy:
         base = self.base_seconds * (self.factor**attempt)
         base = min(base, self.max_seconds)
 
-        if retry_after_ms and retry_after_ms > 0:
-            retry_after_seconds = retry_after_ms / 1000.0
-            base = max(base, retry_after_seconds)
-
         jitter = base * self.jitter_ratio
-        return max(0.0, base + self.rng.uniform(-jitter, jitter))
+        delay = max(0.0, base + self.rng.uniform(-jitter, jitter))
+        if retry_after_ms and retry_after_ms > 0:
+            delay = max(delay, retry_after_ms / 1000.0)
+        return delay
 
     def should_retry(self, attempt: int) -> bool:
         """`attempt` 为已尝试次数（首次=1），返回是否还有重试机会。"""

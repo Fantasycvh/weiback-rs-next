@@ -35,7 +35,10 @@ EVENT_TYPES = {
 }
 
 # stream 格式（event.schema.json pattern）
-STREAM_RE = re.compile(r"^(user:[^:]+:posts|post:[^:]+:comments|post:[^:]+:replies)$")
+STREAM_RE = re.compile(
+    r"^(user:[^:]+:posts|post:[^:]+:comments|"
+    r"post:[^:]+:(?:replies|comment:[^:]+:replies))$"
+)
 
 # 各事件的必填 payload 字段（dtos.schema.json）
 _REQUIRED_PAYLOAD = {

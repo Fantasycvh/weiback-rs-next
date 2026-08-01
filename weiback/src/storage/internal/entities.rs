@@ -384,10 +384,7 @@ where
 }
 
 /// 按 post_id 读取评论（二级回复一并返回，由调用方按 depth 组装树）。
-pub async fn get_comments_by_post<'e, E>(
-    executor: E,
-    post_id: i64,
-) -> Result<Vec<CommentDto>>
+pub async fn get_comments_by_post<'e, E>(executor: E, post_id: i64) -> Result<Vec<CommentDto>>
 where
     E: Executor<'e, Database = Sqlite>,
 {
@@ -466,6 +463,44 @@ where
                 ])
                 .to_owned(),
         )
+        .build_sqlx(SqliteQueryBuilder);
+    sqlx::query_with(&sql, values).execute(&mut *conn).await?;
+    Ok(())
+}
+
+/// Saves a collected media reference without resetting downloader-owned state.
+pub async fn save_media_reference<'c, A>(acquirer: A, media: &MediaDto) -> Result<()>
+where
+    A: Acquire<'c, Database = Sqlite>,
+{
+    let mut conn = acquirer.acquire().await?;
+    let (sql, values) = Query::insert()
+        .into_table(MediaIden::Table)
+        .columns([
+            MediaIden::OwnerType,
+            MediaIden::OwnerId,
+            MediaIden::MediaType,
+            MediaIden::Url,
+            MediaIden::LocalPath,
+            MediaIden::Status,
+            MediaIden::RetryCount,
+            MediaIden::LastError,
+            MediaIden::CreatedAt,
+            MediaIden::UpdatedAt,
+        ])
+        .values([
+            media.owner_type.clone().into(),
+            media.owner_id.into(),
+            media.media_type.clone().into(),
+            media.url.clone().into(),
+            media.local_path.clone().into(),
+            media.status.clone().into(),
+            media.retry_count.into(),
+            media.last_error.clone().into(),
+            media.created_at.clone().into(),
+            media.updated_at.clone().into(),
+        ])?
+        .on_conflict(OnConflict::column(MediaIden::Url).do_nothing().to_owned())
         .build_sqlx(SqliteQueryBuilder);
     sqlx::query_with(&sql, values).execute(&mut *conn).await?;
     Ok(())
@@ -559,9 +594,11 @@ where
         .and_where(Expr::col(MonitoredUserIden::Enabled).eq(true))
         .order_by(MonitoredUserIden::Uid, sea_query::Order::Asc)
         .build_sqlx(SqliteQueryBuilder);
-    Ok(sqlx::query_as_with::<Sqlite, MonitoredUserDto, _>(&sql, values)
-        .fetch_all(executor)
-        .await?)
+    Ok(
+        sqlx::query_as_with::<Sqlite, MonitoredUserDto, _>(&sql, values)
+            .fetch_all(executor)
+            .await?,
+    )
 }
 
 /// 保存同步任务（id=0 时按自增插入）。
@@ -686,7 +723,10 @@ where
 }
 
 /// 按 stream 读取同步 checkpoint。
-pub async fn get_sync_checkpoint<'e, E>(executor: E, stream: &str) -> Result<Option<SyncCheckpointDto>>
+pub async fn get_sync_checkpoint<'e, E>(
+    executor: E,
+    stream: &str,
+) -> Result<Option<SyncCheckpointDto>>
 where
     E: Executor<'e, Database = Sqlite>,
 {
@@ -701,16 +741,15 @@ where
         .from(SyncCheckpointIden::Table)
         .and_where(Expr::col(SyncCheckpointIden::Stream).eq(stream))
         .build_sqlx(SqliteQueryBuilder);
-    Ok(sqlx::query_as_with::<Sqlite, SyncCheckpointDto, _>(&sql, values)
-        .fetch_optional(executor)
-        .await?)
+    Ok(
+        sqlx::query_as_with::<Sqlite, SyncCheckpointDto, _>(&sql, values)
+            .fetch_optional(executor)
+            .await?,
+    )
 }
 
 /// 记录已处理的幂等事件。返回 `true` 表示新插入，`false` 表示重复（已存在）。
-pub async fn record_processed_event<'c, A>(
-    acquirer: A,
-    event: &ProcessedEventDto,
-) -> Result<bool>
+pub async fn record_processed_event<'c, A>(acquirer: A, event: &ProcessedEventDto) -> Result<bool>
 where
     A: Acquire<'c, Database = Sqlite>,
 {
@@ -751,7 +790,9 @@ where
         .from(ProcessedEventIden::Table)
         .and_where(Expr::col(ProcessedEventIden::EventId).eq(event_id))
         .build_sqlx(SqliteQueryBuilder);
-    let count: i64 = sqlx::query_scalar_with(&sql, values).fetch_one(executor).await?;
+    let count: i64 = sqlx::query_scalar_with(&sql, values)
+        .fetch_one(executor)
+        .await?;
     Ok(count > 0)
 }
 
@@ -779,6 +820,59 @@ where
 pub mod transactional {
     use super::*;
 
+    fn is_placeholder_url(url: &url::Url) -> bool {
+        url.host_str() == Some("example.invalid")
+    }
+
+    fn merge_collected_user(
+        existing: crate::models::User,
+        incoming: &crate::models::User,
+    ) -> crate::models::User {
+        let sparse = incoming.screen_name.is_empty()
+            || incoming.domain.is_empty()
+            || is_placeholder_url(&incoming.avatar_hd)
+            || is_placeholder_url(&incoming.avatar_large)
+            || is_placeholder_url(&incoming.profile_image_url);
+        crate::models::User {
+            id: incoming.id,
+            screen_name: if incoming.screen_name.is_empty() {
+                existing.screen_name
+            } else {
+                incoming.screen_name.clone()
+            },
+            domain: if incoming.domain.is_empty() {
+                existing.domain
+            } else {
+                incoming.domain.clone()
+            },
+            avatar_hd: if is_placeholder_url(&incoming.avatar_hd) {
+                existing.avatar_hd
+            } else {
+                incoming.avatar_hd.clone()
+            },
+            avatar_large: if is_placeholder_url(&incoming.avatar_large) {
+                existing.avatar_large
+            } else {
+                incoming.avatar_large.clone()
+            },
+            profile_image_url: if is_placeholder_url(&incoming.profile_image_url) {
+                existing.profile_image_url
+            } else {
+                incoming.profile_image_url.clone()
+            },
+            following: if sparse {
+                incoming.following || existing.following
+            } else {
+                incoming.following
+            },
+            follow_me: if sparse {
+                incoming.follow_me || existing.follow_me
+            } else {
+                incoming.follow_me
+            },
+        }
+    }
+
     /// 单事务提交的输入。
     #[derive(Debug)]
     pub struct CommitPlan {
@@ -790,6 +884,10 @@ pub mod transactional {
         pub sequence: i64,
         /// 事件全局幂等键。
         pub event_id: String,
+        /// 本事件携带的用户。
+        pub users: Vec<crate::models::User>,
+        /// 本事件携带的帖子（P1-B 起支持同事务写入）。
+        pub posts: Vec<super::super::post::PostInternal>,
         /// 本事件携带的评论。
         pub comments: Vec<CommentDto>,
         /// 本事件携带的媒体引用。
@@ -827,11 +925,31 @@ pub mod transactional {
                 return Ok(CommitOutcome::Duplicate);
             }
 
+            for user in &self.users {
+                let merged = match super::super::user::get_user(&mut *tx, user.id).await? {
+                    Some(existing) => merge_collected_user(existing, user),
+                    None => user.clone(),
+                };
+                super::super::user::save_user(&mut *tx, &merged).await?;
+            }
+            for post in &self.posts {
+                let preserved;
+                let post = if post.content_status == "partial" {
+                    preserved = super::super::post::get_post(&mut *tx, post.id).await?;
+                    match preserved.as_ref() {
+                        Some(existing) if existing.content_status == "complete" => existing,
+                        _ => post,
+                    }
+                } else {
+                    post
+                };
+                super::super::post::save_post(&mut *tx, post).await?;
+            }
             for comment in &self.comments {
                 save_comment(&mut *tx, comment).await?;
             }
             for media in &self.media {
-                save_media(&mut *tx, media).await?;
+                save_media_reference(&mut *tx, media).await?;
             }
             save_sync_checkpoint(&mut *tx, &self.checkpoint).await?;
 
@@ -891,6 +1009,47 @@ mod tests {
         }
     }
 
+    fn sample_post(id: i64) -> crate::storage::internal::post::PostInternal {
+        crate::storage::internal::post::PostInternal {
+            attitudes_count: None,
+            attitudes_status: 0,
+            comments_count: None,
+            created_at: now(),
+            deleted: false,
+            edit_count: None,
+            favorited: false,
+            geo: None,
+            id,
+            mblogid: format!("Mb{id}"),
+            mix_media_ids: None,
+            mix_media_info: None,
+            page_info: None,
+            pic_ids: None,
+            pic_infos: None,
+            pic_num: None,
+            region_name: None,
+            reposts_count: None,
+            repost_type: None,
+            retweeted_id: None,
+            source: None,
+            tag_struct: None,
+            text: format!("post {id}"),
+            uid: Some(10001),
+            url_struct: None,
+            bid: None,
+            location: None,
+            topic_ids: None,
+            at_users: None,
+            is_long_text: false,
+            video_url: None,
+            raw_data: None,
+            content_status: "complete".into(),
+            fetch_error: None,
+            first_fetched_at: None,
+            last_refreshed_at: None,
+        }
+    }
+
     #[tokio::test]
     async fn test_comment_roundtrip() {
         let db = setup_db().await;
@@ -934,6 +1093,45 @@ mod tests {
         let fetched2 = get_media_by_url(&db, &media.url).await.unwrap().unwrap();
         assert_eq!(fetched2.local_path.as_deref(), Some("pictures/abc_v2.jpg"));
         assert_eq!(fetched2.status, "downloaded");
+    }
+
+    #[tokio::test]
+    async fn test_media_reference_preserves_download_state() {
+        let db = setup_db().await;
+        let downloaded = MediaDto {
+            id: 0,
+            owner_type: "post".into(),
+            owner_id: Some(9001),
+            media_type: "picture".into(),
+            url: "https://example.com/preserved.jpg".into(),
+            local_path: Some("pictures/preserved.jpg".into()),
+            status: MediaStatus::Downloaded.as_str().into(),
+            retry_count: 2,
+            last_error: Some("old error".into()),
+            created_at: now(),
+            updated_at: Some(now()),
+        };
+        save_media(&db, &downloaded).await.unwrap();
+
+        let pending_reference = MediaDto {
+            owner_id: Some(9002),
+            local_path: None,
+            status: MediaStatus::Pending.as_str().into(),
+            retry_count: 0,
+            last_error: None,
+            ..downloaded.clone()
+        };
+        save_media_reference(&db, &pending_reference).await.unwrap();
+
+        let fetched = get_media_by_url(&db, &downloaded.url)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.local_path, downloaded.local_path);
+        assert_eq!(fetched.status, "downloaded");
+        assert_eq!(fetched.retry_count, 2);
+        assert_eq!(fetched.last_error, downloaded.last_error);
+        assert_eq!(fetched.owner_id, downloaded.owner_id);
     }
 
     #[tokio::test]
@@ -998,7 +1196,10 @@ mod tests {
             updated_at: now(),
         };
         save_sync_checkpoint(&db, &cp).await.unwrap();
-        let fetched = get_sync_checkpoint(&db, "user:123:posts").await.unwrap().unwrap();
+        let fetched = get_sync_checkpoint(&db, "user:123:posts")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(fetched.fetched_count, 20);
 
         // upsert 更新游标，不产生第二行。
@@ -1047,6 +1248,8 @@ mod tests {
             stream: "user:123:posts".into(),
             sequence: 1,
             event_id: "019fbbd7-ea26-7b7c-b113-c89ac2788773".into(),
+            users: vec![],
+            posts: vec![],
             comments: vec![sample_comment(42)],
             media: vec![],
             checkpoint,
@@ -1057,14 +1260,21 @@ mod tests {
         let outcome = plan.execute(&db).await.unwrap();
         assert_eq!(outcome, transactional::CommitOutcome::Applied);
         assert!(get_comment(&db, 42).await.unwrap().is_some());
-        let cp = get_sync_checkpoint(&db, "user:123:posts").await.unwrap().unwrap();
+        let cp = get_sync_checkpoint(&db, "user:123:posts")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(cp.fetched_count, 1);
 
         // 重复提交：Duplicate，不产生重复数据。
         let outcome2 = plan.execute(&db).await.unwrap();
         assert_eq!(outcome2, transactional::CommitOutcome::Duplicate);
         assert_eq!(get_comments_by_post(&db, 9001).await.unwrap().len(), 1);
-        assert!(event_already_processed(&db, "019fbbd7-ea26-7b7c-b113-c89ac2788773").await.unwrap());
+        assert!(
+            event_already_processed(&db, "019fbbd7-ea26-7b7c-b113-c89ac2788773")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1090,5 +1300,159 @@ mod tests {
         assert!(!event_already_processed(&db, "event-0").await.unwrap());
         assert!(event_already_processed(&db, "event-3").await.unwrap());
         assert!(!event_already_processed(&db, "event-2").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_transactional_commit_writes_post_and_comment_atomically() {
+        use crate::storage::internal::post::PostInternal;
+
+        let db = setup_db().await;
+        let post = PostInternal {
+            attitudes_count: None,
+            attitudes_status: 0,
+            comments_count: None,
+            created_at: now(),
+            deleted: false,
+            edit_count: None,
+            favorited: false,
+            geo: None,
+            id: 9001,
+            mblogid: "Mb123".into(),
+            mix_media_ids: None,
+            mix_media_info: None,
+            page_info: None,
+            pic_ids: None,
+            pic_infos: None,
+            pic_num: None,
+            region_name: None,
+            reposts_count: None,
+            repost_type: None,
+            retweeted_id: None,
+            source: None,
+            tag_struct: None,
+            text: "post text".into(),
+            uid: Some(10001),
+            url_struct: None,
+            bid: None,
+            location: None,
+            topic_ids: None,
+            at_users: None,
+            is_long_text: false,
+            video_url: None,
+            raw_data: None,
+            content_status: "complete".into(),
+            fetch_error: None,
+            first_fetched_at: None,
+            last_refreshed_at: None,
+        };
+        let checkpoint = SyncCheckpointDto {
+            stream: "user:123:posts".into(),
+            cursor_json: Some("{\"cursor\":{\"max_id\":\"p1_after\"}}".into()),
+            fetched_count: 1,
+            last_sequence: Some(1),
+            updated_at: now(),
+        };
+        let plan = transactional::CommitPlan {
+            request_id: Some("req-p1".into()),
+            stream: "user:123:posts".into(),
+            sequence: 1,
+            event_id: "019fbbd7-ea26-7b7c-b113-c89ac2788999".into(),
+            users: vec![],
+            posts: vec![post.clone()],
+            comments: vec![sample_comment(4242)],
+            media: vec![],
+            checkpoint,
+            processed_at: now(),
+        };
+        let outcome = plan.execute(&db).await.unwrap();
+        assert_eq!(outcome, transactional::CommitOutcome::Applied);
+
+        // 帖子 + 评论 + checkpoint 全部落库。
+        let fetched: String = sqlx::query_scalar("SELECT text FROM posts WHERE id = 9001")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(fetched, "post text");
+        assert!(get_comment(&db, 4242).await.unwrap().is_some());
+        let cp = get_sync_checkpoint(&db, "user:123:posts")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cp.fetched_count, 1);
+        let _ = post;
+    }
+
+    #[tokio::test]
+    async fn test_transactional_collection_preserves_richer_existing_data() {
+        use crate::models::User;
+        use crate::storage::internal::{post, user};
+        use url::Url;
+
+        let db = setup_db().await;
+        let existing_user = User {
+            id: 10001,
+            screen_name: "完整用户名".into(),
+            domain: "complete-domain".into(),
+            avatar_hd: Url::parse("https://example.com/hd.jpg").unwrap(),
+            avatar_large: Url::parse("https://example.com/large.jpg").unwrap(),
+            profile_image_url: Url::parse("https://example.com/profile.jpg").unwrap(),
+            following: true,
+            follow_me: true,
+        };
+        user::save_user(&db, &existing_user).await.unwrap();
+
+        let mut existing_post = sample_post(9001);
+        existing_post.text = "完整长文".into();
+        existing_post.created_at = "2026-08-01T00:00:00Z".into();
+        existing_post.mblogid = "complete-id".into();
+        existing_post.pic_infos = Some(serde_json::json!({"p1": {"url": "x"}}));
+        existing_post.content_status = "complete".into();
+        post::save_post(&db, &existing_post).await.unwrap();
+
+        let sparse_user = User {
+            id: 10001,
+            screen_name: String::new(),
+            domain: String::new(),
+            avatar_hd: Url::parse("https://example.invalid/").unwrap(),
+            avatar_large: Url::parse("https://example.invalid/").unwrap(),
+            profile_image_url: Url::parse("https://example.invalid/").unwrap(),
+            following: false,
+            follow_me: false,
+        };
+        let mut sparse_post = sample_post(9001);
+        sparse_post.text = String::new();
+        sparse_post.created_at = String::new();
+        sparse_post.mblogid = String::new();
+        sparse_post.pic_infos = None;
+        sparse_post.content_status = "partial".into();
+
+        let plan = transactional::CommitPlan {
+            request_id: Some("req-preserve".into()),
+            stream: "user:10001:posts".into(),
+            sequence: 1,
+            event_id: "019fbbd7-ea26-7b7c-b113-c89ac2788111".into(),
+            users: vec![sparse_user],
+            posts: vec![sparse_post],
+            comments: vec![],
+            media: vec![],
+            checkpoint: SyncCheckpointDto {
+                stream: "user:10001:posts".into(),
+                cursor_json: Some("{\"cursor\":{\"max_id\":\"0\"}}".into()),
+                fetched_count: 1,
+                last_sequence: Some(1),
+                updated_at: now(),
+            },
+            processed_at: now(),
+        };
+        plan.execute(&db).await.unwrap();
+
+        let restored_user = user::get_user(&db, 10001).await.unwrap().unwrap();
+        assert_eq!(restored_user, existing_user);
+        let restored_post = post::get_post(&db, 9001).await.unwrap().unwrap();
+        assert_eq!(restored_post.text, "完整长文");
+        assert_eq!(restored_post.created_at, "2026-08-01T00:00:00Z");
+        assert_eq!(restored_post.mblogid, "complete-id");
+        assert_eq!(restored_post.pic_infos, existing_post.pic_infos);
+        assert_eq!(restored_post.content_status, "complete");
     }
 }

@@ -33,6 +33,12 @@ pub enum TaskType {
     RebackupMissingImages,
     /// Clean up invalid pictures (e.g., "image deleted" placeholders).
     CleanupInvalidPictures,
+    /// Collect a user's posts through the Python sidecar.
+    CollectUserPosts,
+    /// Collect first-level comments through the Python sidecar.
+    CollectComments,
+    /// Collect replies to a comment through the Python sidecar.
+    CollectCommentReplies,
 }
 
 /// The current execution state of a task.
@@ -217,6 +223,17 @@ impl TaskManager {
         }
     }
 
+    /// Updates progress only when `task_id` still identifies the active task.
+    pub fn update_progress_for(&self, task_id: u64, progress: u64, total: u64) -> Result<()> {
+        let mut task_guard = self.current_task.lock()?;
+        let task = Self::active_task_for(&mut task_guard, task_id, "update progress")?;
+        task.progress = progress;
+        task.total = total;
+        let task_clone = task.clone();
+        drop(task_guard);
+        self.notify(&task_clone)
+    }
+
     /// Marks the current task as `Completed`.
     ///
     /// # Errors
@@ -235,6 +252,11 @@ impl TaskManager {
                 "Cannot finish task: no task is in progress.".to_string(),
             ))
         }
+    }
+
+    /// Marks the matching active task as completed.
+    pub fn finish_for(&self, task_id: u64) -> Result<()> {
+        self.transition_for(task_id, TaskStatus::Completed, None, "finish")
     }
 
     /// Marks the current task as `Failed` and records an error message.
@@ -259,6 +281,11 @@ impl TaskManager {
                 "Cannot fail task: no task is in progress.".to_string(),
             ))
         }
+    }
+
+    /// Marks the matching active task as failed.
+    pub fn fail_for(&self, task_id: u64, error: String) -> Result<()> {
+        self.transition_for(task_id, TaskStatus::Failed, Some(error), "fail")
     }
 
     /// Reports a non-fatal task error.
@@ -320,6 +347,11 @@ impl TaskManager {
         Ok(())
     }
 
+    /// Cancels the matching active task.
+    pub fn cancel_for(&self, task_id: u64) -> Result<()> {
+        self.transition_for(task_id, TaskStatus::Cancelled, None, "cancel")
+    }
+
     /// 标记当前任务为进程中断（仅 `InProgress` → `Interrupted`），
     /// 用于应用启动时把遗留的 running 任务转为可恢复状态。
     pub fn interrupt_current(&self) -> Result<()> {
@@ -328,6 +360,11 @@ impl TaskManager {
             TaskStatus::Interrupted,
             "Cannot interrupt task: it is not in progress.".to_string(),
         )
+    }
+
+    /// Marks the matching active task as interrupted.
+    pub fn interrupt_for(&self, task_id: u64) -> Result<()> {
+        self.transition_for(task_id, TaskStatus::Interrupted, None, "interrupt")
     }
 
     /// 恢复被暂停或中断的任务（`Paused`/`Interrupted` → `InProgress`）。
@@ -367,6 +404,40 @@ impl TaskManager {
         drop(task_guard);
         self.notify(&task_clone)?;
         Ok(())
+    }
+
+    fn active_task_for<'a>(
+        task_guard: &'a mut Option<Task>,
+        task_id: u64,
+        operation: &str,
+    ) -> Result<&'a mut Task> {
+        let Some(task) = task_guard.as_mut() else {
+            return Err(Error::InconsistentTask(format!(
+                "Cannot {operation}: no active task."
+            )));
+        };
+        if task.id != task_id || task.status != TaskStatus::InProgress {
+            return Err(Error::InconsistentTask(format!(
+                "Cannot {operation}: task {task_id} is not the active in-progress task."
+            )));
+        }
+        Ok(task)
+    }
+
+    fn transition_for(
+        &self,
+        task_id: u64,
+        status: TaskStatus,
+        error: Option<String>,
+        operation: &str,
+    ) -> Result<()> {
+        let mut task_guard = self.current_task.lock()?;
+        let task = Self::active_task_for(&mut task_guard, task_id, operation)?;
+        task.status = status;
+        task.error = error;
+        let task_clone = task.clone();
+        drop(task_guard);
+        self.notify(&task_clone)
     }
 
     /// 通知监听器任务已更新。
@@ -555,15 +626,41 @@ mod local_tests {
         manager
             .start_task(1, TaskType::BackupUser, "First".into(), 10)
             .unwrap();
-        assert!(manager
-            .start_task(2, TaskType::BackupFavorites, "Second".into(), 5)
-            .is_err());
+        assert!(
+            manager
+                .start_task(2, TaskType::BackupFavorites, "Second".into(), 5)
+                .is_err()
+        );
 
         manager.cancel_current().unwrap();
         // cancelled 后允许新任务。
-        assert!(manager
-            .start_task(3, TaskType::BackupFavorites, "Third".into(), 5)
-            .is_ok());
+        assert!(
+            manager
+                .start_task(3, TaskType::BackupFavorites, "Third".into(), 5)
+                .is_ok()
+        );
         assert_eq!(manager.get_current().unwrap().unwrap().id, 3);
+    }
+
+    #[test]
+    fn stale_task_id_cannot_mutate_replacement_task() {
+        let manager = TaskManager::new();
+        manager
+            .start_task(1, TaskType::CollectUserPosts, "First".into(), 10)
+            .unwrap();
+        manager.cancel_current().unwrap();
+        manager
+            .start_task(2, TaskType::CollectComments, "Second".into(), 20)
+            .unwrap();
+
+        assert!(manager.update_progress_for(1, 7, 10).is_err());
+        assert!(manager.finish_for(1).is_err());
+        assert!(manager.fail_for(1, "stale failure".into()).is_err());
+
+        let current = manager.get_current().unwrap().unwrap();
+        assert_eq!(current.id, 2);
+        assert_eq!(current.status, TaskStatus::InProgress);
+        assert_eq!(current.progress, 0);
+        assert!(current.error.is_none());
     }
 }

@@ -72,7 +72,7 @@ impl CoreBuilder {
             let rt = Runtime::new()?;
             rt.block_on(database::create_db_pool())?
         };
-        let storage = StorageImpl::new(db_pool);
+        let storage = StorageImpl::new(db_pool.clone());
         info!("Storage initialized");
 
         let exporter = ExporterImpl::new();
@@ -104,7 +104,7 @@ impl CoreBuilder {
         let task_handler = TaskHandler::new(api_client, storage, exporter, handle)?;
         info!("TaskHandler initialized");
 
-        let core = Arc::new(Core::new(task_handler, sdk_api_client)?);
+        let core = Arc::new(Core::new(task_handler, sdk_api_client, db_pool)?);
         info!("Core service built successfully.");
 
         Ok((core, worker))

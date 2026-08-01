@@ -113,7 +113,8 @@
       "required": ["max_id", "max_id_type"],
       "properties": {
         "max_id": { "type": ["string", "integer"], "description": "远端分页游标" },
-        "max_id_type": { "type": "integer", "description": "游标类型，0 为常规" }
+        "max_id_type": { "type": "integer", "description": "游标类型，0 为常规" },
+        "fetched_count": { "type": "integer", "minimum": 0, "description": "最后已提交的累计抓取数" }
       }
     }
   }

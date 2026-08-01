@@ -89,6 +89,14 @@ class BackoffPolicyTest(unittest.TestCase):
         delay = self.policy.delay_for(0, retry_after_ms=5000)
         self.assertGreaterEqual(delay, 5.0)
 
+    def test_negative_jitter_never_undercuts_retry_after(self):
+        policy = BackoffPolicy(
+            base_seconds=1.0,
+            jitter_ratio=0.2,
+            rng=__import__("random").Random(1),
+        )
+        self.assertGreaterEqual(policy.delay_for(0, retry_after_ms=5000), 5.0)
+
     def test_jitter_bounds(self):
         policy = BackoffPolicy(
             base_seconds=10.0,

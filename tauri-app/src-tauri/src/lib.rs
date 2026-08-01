@@ -224,6 +224,36 @@ async fn backup_favorites(core: State<'_, Arc<Core>>, num_pages: u32) -> Result<
 }
 
 #[tauri::command]
+async fn collect_user_posts(
+    core: State<'_, Arc<Core>>,
+    uid: WeiboId,
+    max_pages: u32,
+) -> Result<()> {
+    Ok(core.collect_user_posts(uid.into(), max_pages).await?)
+}
+
+#[tauri::command]
+async fn collect_comments(
+    core: State<'_, Arc<Core>>,
+    post_id: WeiboId,
+    max_pages: u32,
+) -> Result<()> {
+    Ok(core.collect_comments(post_id.into(), max_pages).await?)
+}
+
+#[tauri::command]
+async fn collect_comment_replies(
+    core: State<'_, Arc<Core>>,
+    post_id: WeiboId,
+    root_comment_id: WeiboId,
+    max_pages: u32,
+) -> Result<()> {
+    Ok(core
+        .collect_comment_replies(post_id.into(), root_comment_id.into(), max_pages)
+        .await?)
+}
+
+#[tauri::command]
 async fn unfavorite_posts(core: State<'_, Arc<Core>>) -> Result<()> {
     info!("unfavorite_posts called");
     Ok(core.unfavorite_posts().await?)
@@ -410,6 +440,9 @@ pub fn run() -> Result<()> {
             init_backend,
             backup_user,
             backup_favorites,
+            collect_user_posts,
+            collect_comments,
+            collect_comment_replies,
             unfavorite_posts,
             export_posts,
             query_local_posts,

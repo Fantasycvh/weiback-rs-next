@@ -12,7 +12,7 @@
 //! - 进程意外退出时记录退出码，供上层将运行任务标记为 `interrupted`。
 use std::{
     io::{BufRead, BufReader, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::mpsc::{self, Receiver},
     thread::JoinHandle,
@@ -48,6 +48,29 @@ pub fn resolve_sidecar_command() -> Option<PathBuf> {
     };
     let p = dir.join(base);
     p.is_file().then_some(p)
+}
+
+/// 构造生产采集使用的 Sidecar 启动参数。
+///
+/// 认证文件路径只通过环境变量传给子进程，不进入命令行和日志。
+pub fn collection_spawn_options(session_path: &Path) -> Result<SpawnOptions, SidecarError> {
+    let program = resolve_sidecar_command().ok_or(SidecarError::SidecarNotFound)?;
+    let args = std::env::var("WEIBACK_COLLECTOR_ARGS")
+        .map(|value| value.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default();
+    Ok(SpawnOptions {
+        program,
+        args,
+        env: vec![
+            ("PYTHONUTF8".into(), "1".into()),
+            (
+                "WEIBACK_COLLECTOR_SESSION_PATH".into(),
+                session_path.to_string_lossy().into_owned(),
+            ),
+        ],
+        cwd: None,
+        handshake_timeout: Duration::from_secs(10),
+    })
 }
 
 /// Sidecar 启动选项。

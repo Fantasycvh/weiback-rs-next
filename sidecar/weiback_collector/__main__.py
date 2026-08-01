@@ -16,6 +16,8 @@ import sys
 
 from . import events
 from .commands import CommandDispatcher
+from .collector import Collector
+from .fetch import WeiboHttpFetcher
 from .fixture_source import FixtureSource
 from .protocol import InvalidCommandError, PROTOCOL_VERSION, parse_command
 from .uuid7 import uuid7
@@ -47,9 +49,12 @@ def _emit_command_error(request_id: str | None, message: str) -> None:
 def _force_utf8_stdio() -> None:
     """stdin/stdout/stderr 一律 UTF-8，避免 Windows 默认代码页破坏 JSONL 帧。"""
     for stream in (sys.stdin, sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
         try:
-            stream.reconfigure(encoding="utf-8")
-        except (AttributeError, ValueError):
+            reconfigure(encoding="utf-8")
+        except ValueError:
             pass
 
 
@@ -58,9 +63,23 @@ def main() -> int:
     fixture_dir = os.environ.get(
         "WEIBACK_COLLECTOR_FIXTURE_DIR", default_fixture_dir()
     )
-    source = FixtureSource(fixture_dir)
-    dispatcher = CommandDispatcher(source, __import__("weiback_collector").__version__)
-    events.log("info", "sidecar starting", fixture_dir=fixture_dir)
+    fixture_mode = (
+        os.environ.get("WEIBACK_COLLECTOR_MODE") == "fixture"
+        or "WEIBACK_COLLECTOR_FIXTURE" in os.environ
+        or "WEIBACK_COLLECTOR_FIXTURE_DIR" in os.environ
+    )
+    source = FixtureSource(fixture_dir) if fixture_mode else None
+    collector = None if fixture_mode else Collector(
+        fetch_page=WeiboHttpFetcher(
+            session_path=os.environ.get("WEIBACK_COLLECTOR_SESSION_PATH")
+        )
+    )
+    dispatcher = CommandDispatcher(
+        source,
+        __import__("weiback_collector").__version__,
+        collector,
+    )
+    events.log("info", "sidecar starting", mode="fixture" if fixture_mode else "live")
 
     running = True
     for raw in sys.stdin:

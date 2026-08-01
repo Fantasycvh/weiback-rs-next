@@ -9,6 +9,9 @@ export enum TaskType {
   RebackupPosts = 'RebackupPosts',
   RebackupMissingImages = 'RebackupMissingImages',
   CleanupInvalidPictures = 'CleanupInvalidPictures',
+  CollectUserPosts = 'CollectUserPosts',
+  CollectComments = 'CollectComments',
+  CollectCommentReplies = 'CollectCommentReplies',
 }
 
 export interface CleanupInvalidPostsOptions {
@@ -30,9 +33,13 @@ export interface CleanupPicturesOptions {
 }
 
 export enum TaskStatus {
+  Pending = 'Pending',
   InProgress = 'InProgress',
   Completed = 'Completed',
   Failed = 'Failed',
+  Paused = 'Paused',
+  Cancelled = 'Cancelled',
+  Interrupted = 'Interrupted',
 }
 
 export interface Task {

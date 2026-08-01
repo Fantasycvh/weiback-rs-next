@@ -42,7 +42,7 @@
     "stream": {
       "type": "string",
       "description": "逻辑资源流，如 user:123:posts、post:456:comments；事件相关时必填",
-      "pattern": "^(user:[^:]+:posts|post:[^:]+:comments|post:[^:]+:replies)$"
+      "pattern": "^(user:[^:]+:posts|post:[^:]+:comments|post:[^:]+:(replies|comment:[^:]+:replies))$"
     },
     "sequence": {
       "type": "integer",

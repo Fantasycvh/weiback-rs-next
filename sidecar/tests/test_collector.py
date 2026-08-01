@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 from weiback_collector import collector, contract
 from weiback_collector.collector import Collector, FetchPage, FixtureFetchPage
-from weiback_collector.upstream import BackoffPolicy
+from weiback_collector.upstream import BackoffPolicy, UpstreamError, classify_network_error
 
 FIXTURE_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "fixtures")
@@ -128,9 +128,14 @@ class RepliesCollectTest(unittest.TestCase):
 
     def test_stream_events_pass_contract(self):
         emitter, _result = self._collect("a")
+        expected_stream = (
+            "post:5550000000000000200:comment:"
+            "c200000000000000000:replies"
+        )
         for event in emitter.events:
             issues = contract.validate_event(event)
             self.assertEqual(issues, [], f"contract violations: {issues}")
+            self.assertEqual(event.get("stream"), expected_stream)
 
 
 class PaginationTest(unittest.TestCase):
@@ -171,15 +176,31 @@ class PaginationTest(unittest.TestCase):
             return 200, pages[0]
 
         emitter = BufferEmitter()
-        checkpoint = {"cursor": {"max_id": "p1_after", "max_id_type": 0}}
+        # command.schema.json defines checkpoint as the cursor object itself.
+        checkpoint = {
+            "max_id": "p1_after",
+            "max_id_type": 0,
+            "fetched_count": 20,
+        }
         result = _collector(fetch, max_pages=5).collect_replies(
             emitter, "1", "root1", checkpoint=checkpoint
         )
         self.assertEqual(calls[0]["max_id"], "p1_after")
         self.assertEqual(calls[0]["max_id_type"], 0)
-        self.assertEqual(result.fetched_count, 1)
+        self.assertEqual(result.fetched_count, 21)
         comments = emitter.events_of("comment")
         self.assertEqual(comments[0]["payload"]["id"], "r2")
+
+    def test_unknown_replies_envelope_fails_without_checkpoint(self):
+        emitter = BufferEmitter()
+        result = _collector(
+            lambda kind, params: (200, {"ok": 1, "data": {"unexpected": []}}),
+            max_pages=1,
+        ).collect_replies(emitter, "1", "root1")
+
+        self.assertEqual(result.status, "stopped")
+        self.assertIn("error", emitter.types())
+        self.assertEqual(emitter.events_of("checkpoint"), [])
 
     def test_max_pages_bounds_pagination(self):
         calls: list[int] = []
@@ -200,6 +221,21 @@ class PaginationTest(unittest.TestCase):
 
 
 class UpstreamErrorTest(unittest.TestCase):
+    def test_raised_network_error_retries_then_succeeds(self):
+        calls: list[int] = []
+
+        def fetch(kind: str, params: dict) -> tuple[int, dict]:
+            calls.append(1)
+            if len(calls) == 1:
+                raise UpstreamError(classify_network_error("connection reset"))
+            return 200, {"statuses": [], "since_id": "0"}
+
+        emitter = BufferEmitter()
+        result = _collector(fetch, max_pages=2).collect_posts(emitter, "123")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(result.status, "completed")
+        self.assertIn("warning", emitter.types())
+
     def test_rate_limited_retries_then_succeeds(self):
         calls: list[int] = []
 
@@ -220,6 +256,22 @@ class UpstreamErrorTest(unittest.TestCase):
         self.assertEqual(rate_limited["code"], "UPSTREAM_RATE_LIMITED")
         self.assertTrue(rate_limited["retryable"])
 
+    def test_rate_limit_exhaustion_emits_terminal_error(self):
+        def fetch(kind: str, params: dict) -> tuple[int, dict]:
+            return 429, {"msg": "rate limited"}
+
+        backoff = BackoffPolicy(
+            base_seconds=0.0,
+            factor=1.0,
+            max_seconds=0.0,
+            jitter_ratio=0.0,
+            max_attempts=1,
+        )
+        emitter = BufferEmitter()
+        result = Collector(fetch_page=fetch, backoff=backoff).collect_posts(emitter, "123")
+        self.assertEqual(result.status, "stopped")
+        self.assertEqual(emitter.events_of("error")[0]["payload"]["code"], "UPSTREAM_RATE_LIMITED")
+
     def test_auth_required_stops_and_marks_guest(self):
         def fetch(kind: str, params: dict) -> tuple[int, dict]:
             return 403, {"msg": "forbidden"}
@@ -231,6 +283,9 @@ class UpstreamErrorTest(unittest.TestCase):
         self.assertIn("auth_required", types)
         self.assertEqual(collector_inst.auth.value, "guest")
         self.assertEqual(result.status, "stopped")
+        auth_event = emitter.events_of("auth_required")[0]
+        self.assertEqual(auth_event["payload"]["code"], "AUTH_REQUIRED")
+        self.assertEqual(contract.validate_event(auth_event), [])
         done = emitter.events_of("done")[0]
         self.assertEqual(done["payload"]["status"], "stopped")
 
@@ -298,6 +353,9 @@ class PostsAndCommentsExtractTest(unittest.TestCase):
         result = _collector(fetch, max_pages=2).collect_posts(emitter, "1234567890")
         posts = emitter.events_of("post")
         self.assertEqual(len(posts), 1)
+        users = emitter.events_of("user")
+        self.assertEqual(len(users), 1)
+        self.assertEqual(users[0]["payload"]["id"], "1234567890")
         self.assertEqual(posts[0]["payload"]["uid"], 1234567890)
         self.assertIn("@用户B", posts[0]["payload"]["text"])
         self.assertNotIn("<a", posts[0]["payload"]["text"])
@@ -307,6 +365,7 @@ class PostsAndCommentsExtractTest(unittest.TestCase):
         self.assertEqual(refs[0]["payload"]["owner_type"], "post")
         self.assertEqual(refs[0]["payload"]["owner_id"], "4242424242424242")
         self.assertEqual(refs[0]["payload"]["media_type"], "picture")
+        self.assertEqual(result.fetched_count, 1)
         self.assertEqual(result.status, "completed")
 
     def test_collect_comments_emits_comment_and_media(self):
@@ -331,6 +390,7 @@ class PostsAndCommentsExtractTest(unittest.TestCase):
 
         emitter = BufferEmitter()
         result = _collector(fetch, max_pages=2).collect_comments(emitter, "5550000000000000200")
+        self.assertEqual(len(emitter.events_of("user")), 1)
         comments = emitter.events_of("comment")
         self.assertEqual(len(comments), 1)
         self.assertEqual(comments[0]["payload"]["depth"], 0)
@@ -339,8 +399,7 @@ class PostsAndCommentsExtractTest(unittest.TestCase):
         self.assertEqual(len(refs), 1)
         self.assertEqual(refs[0]["payload"]["owner_type"], "comment")
         self.assertEqual(refs[0]["payload"]["url"], "https://wx4.sinaimg.cn/comment.jpg")
-        # 1 comment + 1 media_reference
-        self.assertEqual(result.fetched_count, 2)
+        self.assertEqual(result.fetched_count, 1)
 
 
 if __name__ == "__main__":

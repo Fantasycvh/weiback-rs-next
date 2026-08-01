@@ -4,7 +4,7 @@
 
 两个集合分别对应两类 stream：
 - `post:<post_id>:comments` —— 一级评论及二楼（`depth` 0/1，父子关系经 `root_id`/`parent_id`/`reply_id` 表达）。
-- `post:<post_id>:replies` —— 针对某个一楼评论的回复子流（命令 `collect_comment_replies`，携带 `root_comment_id`）。
+- `post:<post_id>:comment:<root_comment_id>:replies` —— 针对某个一楼评论的回复子流。
 
 ## 文件索引
 

@@ -53,6 +53,7 @@ fn collector_options(python: &Path) -> SpawnOptions {
                 root.join("sidecar").to_string_lossy().to_string(),
             ),
             ("PYTHONUTF8".into(), "1".into()),
+            ("WEIBACK_COLLECTOR_MODE".into(), "fixture".into()),
         ],
         cwd: Some(root),
         handshake_timeout: Duration::from_secs(10),

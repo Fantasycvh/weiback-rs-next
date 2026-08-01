@@ -619,11 +619,11 @@ running --进程退出--> interrupted -> pending/running
 
 交付物：
 
-- [ ] Rust 发起真实用户帖子采集。
-- [ ] Python 输出数据和逐页 checkpoint。
-- [ ] Rust 批事务写入并发布可信 Tauri 进度。
-- [ ] 一级评论和二级评论按需采集。
-- [ ] Sidecar 崩溃和应用重启后的续传。
+- [x] Rust 发起真实用户帖子采集。
+- [x] Python 输出数据和逐页 checkpoint。
+- [x] Rust 批事务写入并发布可信 Tauri 进度。
+- [x] 一级评论和二级评论按需采集。
+- [x] Sidecar 崩溃和应用重启后的续传。
 
 完成门槛：
 
@@ -631,6 +631,8 @@ running --进程退出--> interrupted -> pending/running
 2. 重启后从最后已提交 cursor 继续。
 3. 已提交页不丢失、不重复。
 4. 认证失效和限流不会损坏任务或数据库。
+
+验证：Python `108` 项测试通过；Rust workspace 核心 `162` 项通过、`4` 项实时网络测试忽略；真实 Sidecar 纵向测试覆盖完整提交、无 checkpoint 拒绝落库、崩溃保留已提交页和 cursor 续传。
 
 ### P2：持久任务与智能刷新（第 3 周）
 

@@ -142,11 +142,11 @@ class Collector:
         *,
         checkpoint: dict | None = None,
     ) -> CollectResult:
-        """采集二级回复流 `post:{post_id}:replies`。
+        """采集二级回复流 `post:{post_id}:comment:{root_id}:replies`。
 
         兼容 hotFlowChild 两种信封格式（`extract.unpack_child_comment_page`）。
         """
-        stream = f"post:{post_id}:replies"
+        stream = f"post:{post_id}:comment:{root_comment_id}:replies"
         params = {"post_id": post_id, "root_comment_id": root_comment_id}
         return self._run(
             emitter,
@@ -168,7 +168,7 @@ class Collector:
         page_handler: Callable[[dict[str, Any], dict[str, Any]], tuple[dict, list, int]],
         checkpoint: dict | None,
     ) -> CollectResult:
-        result = CollectResult()
+        result = CollectResult(fetched_count=_checkpoint_fetched_count(checkpoint))
         emitter.emit("started", {"stream": stream}, stream=stream)
 
         cursor = _cursor_from(checkpoint)
@@ -191,7 +191,8 @@ class Collector:
                     raise
                 for event_type, payload in events:
                     emitter.emit(event_type, payload, stream=stream)
-                    result.fetched_count += 1
+                    if event_type in ("post", "comment"):
+                        result.fetched_count += 1
 
                 emitter.emit(
                     "checkpoint",
@@ -223,7 +224,11 @@ class Collector:
         attempt = 0
         while True:
             attempt += 1
-            status, body = self.fetch_page(kind, params)
+            try:
+                status, body = self.fetch_page(kind, params)
+            except UpstreamError as exc:
+                self._handle_classification(emitter, stream, exc.classification, attempt)
+                continue
             if status < 400:
                 return body
             classification = upstream.classify_http_status(
@@ -243,7 +248,11 @@ class Collector:
             self.auth = self.auth.mark(http_status=401)
             emitter.emit(
                 "auth_required",
-                {"auth_state": self.auth.value, "message": classification.message},
+                {
+                    "code": upstream.ERR_AUTH_REQUIRED,
+                    "auth_state": self.auth.value,
+                    "message": classification.message,
+                },
                 stream=stream,
             )
             raise _Stop("stopped", classification)
@@ -266,6 +275,16 @@ class Collector:
                 )
                 upstream.sleep_for(delay)
                 return
+            emitter.emit(
+                "error",
+                {
+                    "code": classification.code,
+                    "message": classification.message,
+                    "retryable": classification.retryable,
+                    "scope": classification.scope,
+                },
+                stream=stream,
+            )
             raise _Stop("stopped", classification)
 
         if classification.retryable and self.backoff.should_retry(attempt):
@@ -301,15 +320,17 @@ class Collector:
     def _page_to_posts_events(
         self, body: dict, params: dict[str, Any]
     ) -> tuple[dict, list, bool]:
-        raw_posts = body.get("statuses") or body.get("data")
+        raw_posts = body.get("statuses") if "statuses" in body else body.get("data")
         if not isinstance(raw_posts, list):
             raise UpstreamError(upstream.classify_schema_error("posts response missing list"))
 
         events: list[tuple[str, dict]] = []
+        emitted_users: set[str] = set()
         uid = params.get("uid")
         for raw_post in raw_posts:
             if not isinstance(raw_post, dict):
                 continue
+            _append_user_event(events, emitted_users, raw_post.get("user"))
             post_dto = extract.extract_post(raw_post, uid)
             events.append(("post", post_dto))
             for media_ref in extract.media_references_from_post(post_dto, raw_post):
@@ -327,10 +348,12 @@ class Collector:
             raise UpstreamError(upstream.classify_schema_error("comments response missing list"))
 
         events: list[tuple[str, dict]] = []
+        emitted_users: set[str] = set()
         post_id = params.get("post_id")
         for raw_comment in raw_comments:
             if not isinstance(raw_comment, dict):
                 continue
+            _append_user_event(events, emitted_users, raw_comment.get("user"))
             comment_dto = extract.extract_comment(raw_comment, post_id, depth=0)
             events.append(("comment", comment_dto))
             media_ref = extract.media_reference_from_comment(comment_dto)
@@ -347,13 +370,27 @@ class Collector:
     def _page_to_replies_events(
         self, body: dict, params: dict[str, Any]
     ) -> tuple[dict, list, bool]:
+        raw_data = body.get("data")
+        known_envelope = isinstance(raw_data, list) or (
+            isinstance(raw_data, dict)
+            and (
+                isinstance(raw_data.get("comments"), list)
+                or isinstance(raw_data.get("data"), list)
+            )
+        )
+        if not known_envelope:
+            raise UpstreamError(
+                upstream.classify_schema_error("replies response missing list")
+            )
         raw_comments, max_id, max_id_type = extract.unpack_child_comment_page(body)
 
         events: list[tuple[str, dict]] = []
+        emitted_users: set[str] = set()
         post_id = params.get("post_id")
         for raw_comment in raw_comments:
             if not isinstance(raw_comment, dict):
                 continue
+            _append_user_event(events, emitted_users, raw_comment.get("user"))
             comment_dto = extract.extract_comment(
                 raw_comment,
                 post_id,
@@ -371,6 +408,19 @@ class Collector:
         return next_cursor, events, has_more
 
 
+def _append_user_event(
+    events: list[tuple[str, dict]], emitted_users: set[str], raw_user: Any
+) -> None:
+    if not isinstance(raw_user, dict):
+        return
+    user = extract.extract_user(raw_user)
+    user_id = user.get("id")
+    if user_id is None or str(user_id) in emitted_users:
+        return
+    emitted_users.add(str(user_id))
+    events.append(("user", user))
+
+
 def _finish(emitter: Emitter, stream: str, result: CollectResult) -> None:
     emitter.emit(
         "done",
@@ -384,8 +434,16 @@ def _finish(emitter: Emitter, stream: str, result: CollectResult) -> None:
 def _cursor_from(checkpoint: dict | None) -> dict | None:
     if not isinstance(checkpoint, dict):
         return None
+    if checkpoint.get("max_id") is not None:
+        return checkpoint
     cursor = checkpoint.get("cursor")
     return cursor if isinstance(cursor, dict) and cursor.get("max_id") is not None else None
+
+
+def _checkpoint_fetched_count(checkpoint: dict | None) -> int:
+    if not isinstance(checkpoint, dict):
+        return 0
+    return max(_as_int(checkpoint.get("fetched_count"), 0), 0)
 
 
 def _next_posts_cursor(body: dict) -> dict:

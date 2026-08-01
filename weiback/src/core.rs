@@ -16,6 +16,7 @@ pub mod task_handler;
 pub mod task_manager;
 
 use bytes::Bytes;
+use sqlx::SqlitePool;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -33,6 +34,10 @@ use crate::error::Result;
 use crate::exporter::ExporterImpl;
 use crate::media_downloader::MediaDownloaderHandle;
 use crate::models::User;
+use crate::sidecar::{
+    CollectionRequest, CollectionStatus, CommandType, Sidecar, collection_spawn_options,
+    run_collection,
+};
 use crate::storage::StorageImpl;
 pub use task::{
     BackupFavoritesOptions, BackupUserPostsOptions, CleanupInvalidPostsOptions, DeletePostOptions,
@@ -77,18 +82,24 @@ pub struct Core {
     task_handler: Arc<TH>,
     task_manager: Arc<TaskManager>,
     sdk_api_client: Arc<CurrentSdkApiClient>,
+    db_pool: SqlitePool,
 }
 
 impl Core {
     /// Creates a new `Core` instance.
     ///
     /// This is an internal constructor used by `CoreBuilder`.
-    pub(crate) fn new(task_handler: TH, sdk_api_client: Arc<CurrentSdkApiClient>) -> Result<Self> {
+    pub(crate) fn new(
+        task_handler: TH,
+        sdk_api_client: Arc<CurrentSdkApiClient>,
+        db_pool: SqlitePool,
+    ) -> Result<Self> {
         Ok(Self {
             next_task_id: AtomicU64::new(1),
             task_handler: Arc::new(task_handler),
             task_manager: Arc::new(TaskManager::new()),
             sdk_api_client,
+            db_pool,
         })
     }
 
@@ -318,6 +329,112 @@ impl Core {
 
     // ========================= long tasks =========================
 
+    /// Starts collecting a user's posts through the Python sidecar.
+    pub async fn collect_user_posts(&self, uid: i64, max_pages: u32) -> Result<()> {
+        self.start_sidecar_collection(
+            TaskType::CollectUserPosts,
+            "采集用户微博",
+            CollectionRequest {
+                command_type: CommandType::CollectUserPosts,
+                stream: format!("user:{uid}:posts"),
+                payload: serde_json::json!({
+                    "uid": uid.to_string(),
+                    "max_pages": bounded_max_pages(max_pages),
+                }),
+            },
+        )
+    }
+
+    /// Starts collecting first-level comments for a post.
+    pub async fn collect_comments(&self, post_id: i64, max_pages: u32) -> Result<()> {
+        self.start_sidecar_collection(
+            TaskType::CollectComments,
+            "采集微博评论",
+            CollectionRequest {
+                command_type: CommandType::CollectComments,
+                stream: format!("post:{post_id}:comments"),
+                payload: serde_json::json!({
+                    "post_id": post_id.to_string(),
+                    "max_pages": bounded_max_pages(max_pages),
+                }),
+            },
+        )
+    }
+
+    /// Starts collecting replies below a first-level comment.
+    pub async fn collect_comment_replies(
+        &self,
+        post_id: i64,
+        root_comment_id: i64,
+        max_pages: u32,
+    ) -> Result<()> {
+        self.start_sidecar_collection(
+            TaskType::CollectCommentReplies,
+            "采集评论回复",
+            CollectionRequest {
+                command_type: CommandType::CollectCommentReplies,
+                stream: format!("post:{post_id}:comment:{root_comment_id}:replies"),
+                payload: serde_json::json!({
+                    "post_id": post_id.to_string(),
+                    "root_comment_id": root_comment_id.to_string(),
+                    "max_pages": bounded_max_pages(max_pages),
+                }),
+            },
+        )
+    }
+
+    fn start_sidecar_collection(
+        &self,
+        task_type: TaskType,
+        description: &str,
+        request: CollectionRequest,
+    ) -> Result<()> {
+        let session_path = get_config().read()?.session_path.clone();
+        let task_id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
+        self.task_manager
+            .start_task(task_id, task_type, description.into(), 0)?;
+
+        let pool = self.db_pool.clone();
+        let task_manager = self.task_manager.clone();
+        spawn(async move {
+            let blocking_task_manager = task_manager.clone();
+            let runtime = tokio::runtime::Handle::current();
+            let result = tokio::task::spawn_blocking(move || {
+                let options = collection_spawn_options(&session_path)
+                    .map_err(|e| crate::error::Error::FormatError(e.to_string()))?;
+                let (mut sidecar, _, _) = Sidecar::spawn_with_handshake(&options)
+                    .map_err(|e| crate::error::Error::FormatError(e.to_string()))?;
+                let result = runtime.block_on(run_collection(
+                    &mut sidecar,
+                    &pool,
+                    &request,
+                    |progress, total| {
+                        if let Err(e) = blocking_task_manager.update_progress_for(
+                            task_id,
+                            progress,
+                            total.max(progress),
+                        ) {
+                            warn!("failed to publish collection progress: {e}");
+                        }
+                    },
+                    std::time::Duration::from_secs(60),
+                ));
+                let _ = sidecar.shutdown(std::time::Duration::from_millis(500));
+                result
+            })
+            .await;
+
+            match result {
+                Ok(Ok(summary)) => {
+                    finish_collection_task(&task_manager, task_id, summary.status, summary.error)
+                }
+                Ok(Err(error)) => fail_collection_task(&task_manager, task_id, error.to_string()),
+                Err(error) => fail_collection_task(&task_manager, task_id, error.to_string()),
+            }
+        });
+        Ok(())
+    }
+
     /// Export local posts to another format (e.g., HTML).
     pub async fn export_posts(&self, request: TaskRequest) -> Result<()> {
         let ctx = self.create_long_task_context();
@@ -497,6 +614,36 @@ impl Core {
             config: get_config().read().unwrap().clone(),
             task_manager: self.task_manager.clone(),
         })
+    }
+}
+
+fn bounded_max_pages(max_pages: u32) -> u32 {
+    max_pages.clamp(1, 1000)
+}
+
+fn finish_collection_task(
+    task_manager: &TaskManager,
+    task_id: u64,
+    status: CollectionStatus,
+    error_message: Option<String>,
+) {
+    let result = match status {
+        CollectionStatus::Completed => task_manager.finish_for(task_id),
+        CollectionStatus::Stopped => task_manager.cancel_for(task_id),
+        CollectionStatus::Interrupted => task_manager.interrupt_for(task_id),
+        CollectionStatus::Failed => task_manager.fail_for(
+            task_id,
+            error_message.unwrap_or_else(|| "sidecar collection failed".to_string()),
+        ),
+    };
+    if let Err(error) = result {
+        warn!("failed to update collection task status: {error}");
+    }
+}
+
+fn fail_collection_task(task_manager: &TaskManager, task_id: u64, message: String) {
+    if let Err(error) = task_manager.fail_for(task_id, message) {
+        warn!("failed to mark collection task as failed: {error}");
     }
 }
 
