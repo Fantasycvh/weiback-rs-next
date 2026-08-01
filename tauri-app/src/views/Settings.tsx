@@ -16,6 +16,7 @@ import {
   Accordion,
   AccordionSummary,
   AccordionDetails,
+  Alert,
 } from '@mui/material'
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore'
 import Grid from '@mui/material/Grid'
@@ -102,6 +103,10 @@ const SettingsPage: React.FC = () => {
       </Typography>
       <Grid container justifyContent="center">
         <Grid size={{ xs: 12, md: 10, lg: 8 }}>
+          <Alert severity="warning" sx={{ mt: 3 }}>
+            若你同时使用旧版 WeiBack 与本版，请避免两个应用的自动同步同时开启，
+            以免同一账号被频繁请求导致微博接口限流。
+          </Alert>
           <Card sx={{ mt: 3 }}>
             <CardContent>
               <Box

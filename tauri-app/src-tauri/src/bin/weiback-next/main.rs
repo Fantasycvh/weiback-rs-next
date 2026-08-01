@@ -1,6 +1,4 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
-use std::fs;
-
 use anyhow::Result;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -16,12 +14,9 @@ fn main() -> Result<()> {
 }
 
 fn init_logger() -> Result<()> {
-    let log_dir = dirs::data_dir()
-        .unwrap_or_default()
-        .join(weiback::config::APP_NAMESPACE)
-        .join("logs");
-    fs::create_dir_all(&log_dir)?;
-    let log_path = log_dir.join("weiback-next.log");
+    let runtime = weiback::config::runtime_dirs();
+    runtime.ensure_created()?;
+    let log_path = runtime.logs_dir.join("weiback-next.log");
     let log_file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)

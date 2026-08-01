@@ -27,6 +27,74 @@ static CONFIG: OnceCell<Arc<RwLock<Config>>> = OnceCell::new();
 
 pub const APP_NAMESPACE: &str = "weiback-next";
 
+/// Runtime directory layout for the `weiback-next` namespace.
+///
+/// This is the single source of truth for the default per-user data directories
+/// of the new application. The new app never writes into the legacy `weiback`
+/// namespace; everything lives under `data/weiback-next`.
+#[derive(Debug, Clone)]
+pub struct RuntimeDirs {
+    /// Root data directory: `<data_dir>/weiback-next`.
+    pub data_dir: PathBuf,
+    /// SQLite database file: `<data_dir>/weiback-next/weiback.db`.
+    pub db_path: PathBuf,
+    /// Unified media directory: `<data_dir>/weiback-next/media`.
+    pub media_dir: PathBuf,
+    /// Downloaded pictures: `<data_dir>/weiback-next/media/pictures`.
+    pub pictures_dir: PathBuf,
+    /// Downloaded videos: `<data_dir>/weiback-next/media/videos`.
+    pub videos_dir: PathBuf,
+    /// Application logs: `<data_dir>/weiback-next/logs`.
+    pub logs_dir: PathBuf,
+    /// Python collector sidecar: `<data_dir>/weiback-next/sidecar`.
+    pub sidecar_dir: PathBuf,
+    /// Playwright Chromium cache: `<data_dir>/weiback-next/chromium`.
+    pub chromium_dir: PathBuf,
+    /// One-time legacy snapshot import staging: `<data_dir>/weiback-next/imports`.
+    pub imports_dir: PathBuf,
+}
+
+impl RuntimeDirs {
+    /// Builds the layout from a data root (usually `dirs::data_dir()`).
+    pub fn from_root(data_root: &std::path::Path) -> Self {
+        let data_dir = data_root.join(APP_NAMESPACE);
+        let media_dir = data_dir.join("media");
+        Self {
+            db_path: data_dir.join("weiback.db"),
+            data_dir: data_dir.clone(),
+            media_dir: media_dir.clone(),
+            pictures_dir: media_dir.join("pictures"),
+            videos_dir: media_dir.join("videos"),
+            logs_dir: data_dir.join("logs"),
+            sidecar_dir: data_dir.join("sidecar"),
+            chromium_dir: data_dir.join("chromium"),
+            imports_dir: data_dir.join("imports"),
+        }
+    }
+
+    /// Creates every runtime directory. Returns an error if any creation fails.
+    pub fn ensure_created(&self) -> std::io::Result<()> {
+        for dir in [
+            &self.data_dir,
+            &self.media_dir,
+            &self.pictures_dir,
+            &self.videos_dir,
+            &self.logs_dir,
+            &self.sidecar_dir,
+            &self.chromium_dir,
+            &self.imports_dir,
+        ] {
+            std::fs::create_dir_all(dir)?;
+        }
+        Ok(())
+    }
+}
+
+/// Returns the runtime directory layout based on the user's data directory.
+pub fn runtime_dirs() -> RuntimeDirs {
+    RuntimeDirs::from_root(&dirs::data_dir().unwrap_or_default())
+}
+
 /// Helper module for serializing/deserializing `std::time::Duration` as seconds.
 mod duration_as_secs {
     use std::time::Duration;
@@ -105,10 +173,9 @@ impl Default for Config {
 impl Config {
     fn from_roots(config_root: &std::path::Path, data_root: &std::path::Path) -> Self {
         let config_dir = config_root.join(APP_NAMESPACE);
-        let data_dir = data_root.join(APP_NAMESPACE);
-        let media_dir = data_dir.join("media");
+        let runtime = RuntimeDirs::from_root(data_root);
         Self {
-            db_path: data_dir.join("weiback.db"),
+            db_path: runtime.db_path,
             session_path: config_dir.join("session.json"),
             download_pictures: true,
             picture_definition: Default::default(),
@@ -117,8 +184,8 @@ impl Config {
             posts_per_html: 200,
             posts_count: 20,
             static_html: false,
-            picture_path: media_dir.join("pictures"),
-            video_path: media_dir.join("videos"),
+            picture_path: runtime.pictures_dir,
+            video_path: runtime.videos_dir,
             sdk_config: Default::default(),
             #[cfg(feature = "dev-mode")]
             dev_mode_out_dir: dirs::download_dir().map(|dir| dir.join("weiback-next-records")),
@@ -372,5 +439,70 @@ mod local_tests {
                 .iter()
                 .all(|path| !path.to_string_lossy().contains("weiback/config.toml"))
         );
+    }
+
+    #[test]
+    fn runtime_dirs_stay_inside_the_next_namespace() {
+        let dirs = RuntimeDirs::from_root(Path::new("data-root"));
+
+        assert_eq!(dirs.data_dir, PathBuf::from("data-root/weiback-next"));
+        assert_eq!(dirs.db_path, PathBuf::from("data-root/weiback-next/weiback.db"));
+        assert_eq!(dirs.media_dir, PathBuf::from("data-root/weiback-next/media"));
+        assert_eq!(
+            dirs.pictures_dir,
+            PathBuf::from("data-root/weiback-next/media/pictures")
+        );
+        assert_eq!(
+            dirs.videos_dir,
+            PathBuf::from("data-root/weiback-next/media/videos")
+        );
+        assert_eq!(dirs.logs_dir, PathBuf::from("data-root/weiback-next/logs"));
+        assert_eq!(dirs.sidecar_dir, PathBuf::from("data-root/weiback-next/sidecar"));
+        assert_eq!(
+            dirs.chromium_dir,
+            PathBuf::from("data-root/weiback-next/chromium")
+        );
+        assert_eq!(
+            dirs.imports_dir,
+            PathBuf::from("data-root/weiback-next/imports")
+        );
+
+        // None of the runtime paths may touch the legacy namespace.
+        for path in [
+            &dirs.data_dir,
+            &dirs.db_path,
+            &dirs.media_dir,
+            &dirs.pictures_dir,
+            &dirs.videos_dir,
+            &dirs.logs_dir,
+            &dirs.sidecar_dir,
+            &dirs.chromium_dir,
+            &dirs.imports_dir,
+        ] {
+            let s = path.to_string_lossy();
+            assert!(!s.contains("weiback/"), "path must not use legacy ns: {s}");
+            assert!(s.contains("weiback-next"), "path must use new ns: {s}");
+        }
+    }
+
+    #[test]
+    fn ensure_created_builds_all_runtime_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = RuntimeDirs::from_root(tmp.path());
+
+        dirs.ensure_created().unwrap();
+
+        for path in [
+            &dirs.data_dir,
+            &dirs.media_dir,
+            &dirs.pictures_dir,
+            &dirs.videos_dir,
+            &dirs.logs_dir,
+            &dirs.sidecar_dir,
+            &dirs.chromium_dir,
+            &dirs.imports_dir,
+        ] {
+            assert!(path.is_dir(), "expected directory: {path:?}");
+        }
     }
 }

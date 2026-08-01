@@ -14,6 +14,7 @@ pub mod error;
 pub mod exporter;
 pub mod html_generator;
 pub mod image_validator;
+pub mod legacy;
 pub mod media_downloader;
 pub mod message;
 pub mod models;

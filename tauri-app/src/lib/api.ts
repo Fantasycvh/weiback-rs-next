@@ -12,6 +12,7 @@ import {
   DeletePostOptions,
 } from '../types'
 import { Config } from '../types/config'
+import { LegacyDetection } from '../types/legacy'
 
 // Backend
 export type BackendStatus =
@@ -67,3 +68,6 @@ export const cleanupInvalidPictures = () => invoke('cleanup_invalid_pictures')
 // Config
 export const getConfig = () => invoke<Config>('get_config_command')
 export const setConfig = (config: Config) => invoke('set_config_command', { config })
+
+// Legacy
+export const detectLegacySources = () => invoke<LegacyDetection[]>('detect_legacy_sources')

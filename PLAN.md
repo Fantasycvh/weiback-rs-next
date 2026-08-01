@@ -530,13 +530,13 @@ running --进程退出--> interrupted -> pending/running
 交付物：
 
 - [x] 将永久产品身份改为 `WeiBack Next`、`com.weiback.next` 和 `weiback-next`。
-- [ ] 将数据库、配置、session、日志、媒体、Sidecar、Chromium 和导入临时文件全部迁入 `weiback-next` 命名空间。
+- [x] 将数据库、配置、session、日志、媒体、Sidecar、Chromium 和导入临时文件全部迁入 `weiback-next` 命名空间。
 - [x] 删除新版对旧 `weiback/config.toml` 的隐式查找和回写。
-- [ ] 保持 Windows per-user 安装，并验证安装器不会把新版识别为旧版升级。
-- [ ] 配置独立项目地址、Release 页面、更新检查地址和 HTTP capability 白名单。
-- [ ] 实现旧版安装与数据检测，但检测过程不得自动打开写连接或修改旧库。
-- [ ] 定义旧 Rust 库和 Python v2 库的一次性快照导入契约及 fixture。
-- [ ] 首次启用新版自动同步前提示同账号双应用并发采集的限流风险。
+- [x] 保持 Windows per-user 安装，并验证安装器不会把新版识别为旧版升级（NSIS `installMode: currentUser`，身份差异见 ADR-005）。
+- [ ] 配置独立项目地址、Release 页面、更新检查地址和 HTTP capability 白名单。（本迭代不实施）
+- [x] 实现旧版安装与数据检测，但检测过程不得自动打开写连接或修改旧库（`legacy::detect_legacy_sources` 仅解析文件头）。
+- [~] 定义旧 Rust 库和 Python v2 库的一次性快照导入契约及 fixture（检测契约 `LegacyDetection` 与两类 fixture 已就绪；快照 payload 输出格式随 P0-A 协议定义一并完成）。
+- [x] 首次启用新版自动同步前提示同账号双应用并发采集的限流风险（首启向导 + 设置页提示）。
 
 完成门槛：
 

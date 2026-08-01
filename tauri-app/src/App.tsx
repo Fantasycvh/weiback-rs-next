@@ -16,7 +16,7 @@ import AppRouter from './router'
 import { useTaskEvents } from './hooks/useTaskEvents'
 import { useTaskStore } from './stores/taskStore'
 import { useAuthStore } from './stores/authStore'
-import { getBackendStatus, initBackend, BackendStatus } from './lib/api'
+import { getBackendStatus, initBackend, BackendStatus, detectLegacySources } from './lib/api'
 import GlobalTaskProgress from './components/GlobalTaskProgress'
 import MediaDownloaderStatus from './components/MediaDownloaderStatus'
 import useCompletionNotifier from './hooks/useCompletionNotifier'
@@ -25,6 +25,9 @@ import UpdateBanner from './components/UpdateBanner'
 import { checkLatestRelease } from './lib/updateApi'
 import { useUpdateStore } from './stores/updateStore'
 import { getCurrentWindow } from '@tauri-apps/api/window'
+import LegacyImportDialog from './components/LegacyImportDialog'
+import { hasDismissedLegacyPrompt, dismissLegacyPrompt } from './lib/legacy'
+import { LegacyDetection } from './types/legacy'
 
 const drawerWidth = 200
 const taskProgressHeight = 80
@@ -37,6 +40,8 @@ const App: React.FC = () => {
   const isTaskRunning = currentTask?.status === 'InProgress'
   const [closeDialogOpen, setCloseDialogOpen] = useState(false)
   const userConfirmedCloseRef = useRef(false)
+  const [legacyDetections, setLegacyDetections] = useState<LegacyDetection[]>([])
+  const [legacyDialogOpen, setLegacyDialogOpen] = useState(false)
 
   const checkAndInitBackend = useCallback(async () => {
     setLoading(true)
@@ -61,6 +66,15 @@ const App: React.FC = () => {
         if (release) {
           useUpdateStore.getState().setLatestRelease(release)
           useUpdateStore.getState().setLastChecked(Date.now())
+        }
+
+        // Detect legacy installations once; show the import guide unless dismissed.
+        if (!hasDismissedLegacyPrompt()) {
+          const legacy = await detectLegacySources()
+          if (legacy.length > 0) {
+            setLegacyDetections(legacy)
+            setLegacyDialogOpen(true)
+          }
         }
       }
     } catch (e) {
@@ -189,6 +203,14 @@ const App: React.FC = () => {
         onCancel={handleCloseCancel}
       />
       <UpdateBanner />
+      <LegacyImportDialog
+        open={legacyDialogOpen}
+        detections={legacyDetections}
+        onClose={() => {
+          dismissLegacyPrompt()
+          setLegacyDialogOpen(false)
+        }}
+      />
     </Box>
   )
 }

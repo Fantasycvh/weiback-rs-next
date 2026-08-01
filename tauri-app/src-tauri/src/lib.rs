@@ -344,6 +344,12 @@ async fn cleanup_invalid_pictures(core: State<'_, Arc<Core>>) -> Result<()> {
         .await?)
 }
 
+#[tauri::command]
+fn detect_legacy_sources() -> Vec<weiback::legacy::LegacyDetection> {
+    info!("detect_legacy_sources called");
+    weiback::legacy::detect_legacy_sources(&dirs::data_dir().unwrap_or_default())
+}
+
 pub fn run() -> Result<()> {
     info!("Starting application");
 
@@ -378,7 +384,8 @@ pub fn run() -> Result<()> {
             cleanup_pictures,
             cleanup_outdated_avatars,
             cleanup_invalid_posts,
-            cleanup_invalid_pictures
+            cleanup_invalid_pictures,
+            detect_legacy_sources
         ])
         .build(tauri::generate_context!())
         .expect("tauri app build failed")
