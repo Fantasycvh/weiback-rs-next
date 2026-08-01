@@ -4,11 +4,12 @@
 
 只打包协议与 fixture 采集所需模块，不包含 FastAPI/模板/媒体下载路径。
 产物基础名 `weiback-collector`（ADR-005），Tauri 按 target triple 选择。
+使用 onefile，确保 Tauri `externalBin` 可直接携带完整运行时。
 
 构建（Windows x64）：
     pyinstaller --noconfirm weiback-collector.spec
 输出：
-    dist/weiback-collector/weiback-collector.exe  （onedir）
+    dist/weiback-collector.exe  （onefile）
 """
 
 from PyInstaller.utils.hooks import collect_submodules
@@ -16,7 +17,7 @@ from PyInstaller.utils.hooks import collect_submodules
 block_cipher = None
 
 a = Analysis(
-    ["weiback_collector/__main__.py"],
+    ["weiback_collector_entry.py"],
     pathex=["."],
     binaries=[],
     datas=[],
@@ -53,8 +54,10 @@ pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.datas,
     [],
-    exclude_binaries=True,
+    exclude_binaries=False,
     name="weiback-collector",
     debug=False,
     bootloader_ignore_signals=False,
@@ -66,15 +69,4 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-)
-
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=False,
-    upx_exclude=[],
-    name="weiback-collector",
 )

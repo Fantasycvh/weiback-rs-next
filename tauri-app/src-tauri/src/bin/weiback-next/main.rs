@@ -5,12 +5,29 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 fn main() -> Result<()> {
     init_logger()?;
+    install_panic_hook();
 
     info!("start running...");
     tauri_app::run()?;
 
     info!("done");
     Ok(())
+}
+
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|panic| {
+        let location = panic
+            .location()
+            .map(|location| location.to_string())
+            .unwrap_or_else(|| "unknown location".to_string());
+        let message = panic
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| panic.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("non-string panic payload");
+        tracing::error!(%location, %message, "application panicked");
+    }));
 }
 
 fn init_logger() -> Result<()> {

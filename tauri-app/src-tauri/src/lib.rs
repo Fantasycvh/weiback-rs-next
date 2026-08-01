@@ -442,7 +442,7 @@ async fn get_backend_status(state: State<'_, BackendState>) -> Result<BackendSta
     Ok(state.status.lock().unwrap().clone())
 }
 
-fn perform_init_backend(app_handle: &AppHandle, state: &BackendState) -> BackendStatus {
+async fn perform_init_backend(app_handle: &AppHandle, state: &BackendState) -> BackendStatus {
     let mut status_guard = state.status.lock().unwrap();
     if let BackendStatus::Running { .. } = *status_guard {
         return status_guard.clone();
@@ -502,8 +502,11 @@ fn perform_init_backend(app_handle: &AppHandle, state: &BackendState) -> Backend
 }
 
 #[tauri::command]
-fn init_backend(app_handle: AppHandle, state: State<'_, BackendState>) -> Result<BackendStatus> {
-    Ok(perform_init_backend(&app_handle, &state))
+async fn init_backend(
+    app_handle: AppHandle,
+    state: State<'_, BackendState>,
+) -> Result<BackendStatus> {
+    Ok(perform_init_backend(&app_handle, &state).await)
 }
 
 #[tauri::command(async)]
@@ -1114,7 +1117,6 @@ pub fn run() -> Result<()> {
                     }
                     #[cfg(feature = "dev-mode")]
                     weiback::dev_client::save_records();
-                    app_handle.cleanup_before_exit();
                     app_handle.exit(0);
                 });
             }

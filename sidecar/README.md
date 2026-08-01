@@ -6,6 +6,7 @@
 
 ```
 sidecar/
+  weiback_collector_entry.py  # PyInstaller 顶层入口
   weiback_collector/
     __main__.py       # headless 入口：stdin 命令 → stdout 事件
     protocol.py       # 协议常量与命令信封解析
@@ -56,5 +57,5 @@ python -m unittest discover -s tests -t . -v
 pyinstaller --noconfirm weiback-collector.spec
 ```
 
-产物 `dist/weiback-collector/weiback-collector.exe`，复制为 Tauri
+产物 `dist/weiback-collector.exe`，复制为 Tauri
 `binaries/weiback-collector-x86_64-pc-windows-msvc.exe` 由 `externalBin` 打包。

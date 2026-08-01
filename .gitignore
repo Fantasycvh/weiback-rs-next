@@ -19,6 +19,8 @@ target/
 # Python (sidecar)
 __pycache__/
 *.pyc
+sidecar/build/
+sidecar/dist/
 
 # Tauri sidecar binaries (built by release pipeline, never committed)
 tauri-app/src-tauri/binaries/

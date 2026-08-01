@@ -248,7 +248,12 @@ impl Core {
         );
         let cancelled = Arc::new(AtomicBool::new(false));
         let wake = Arc::new(tokio::sync::Notify::new());
-        let handle = spawn(scheduler.run_until_cancelled(
+        let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
+            crate::error::Error::Tokio(format!(
+                "persistent scheduler requires an active Tokio runtime: {error}"
+            ))
+        })?;
+        let handle = runtime.spawn(scheduler.run_until_cancelled(
             std::time::Duration::from_secs(1),
             cancelled.clone(),
             wake.clone(),
