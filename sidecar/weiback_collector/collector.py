@@ -337,7 +337,7 @@ class Collector:
                 events.append(("media_reference", media_ref))
 
         next_cursor = _next_posts_cursor(body)
-        has_more = _has_more(next_cursor)
+        has_more = bool(raw_posts) and _has_more(next_cursor)
         return next_cursor, events, has_more
 
     def _page_to_comments_events(
@@ -364,7 +364,7 @@ class Collector:
             "max_id": _as_id_str(body.get("max_id", 0)),
             "max_id_type": _as_int(body.get("max_id_type", 0)),
         }
-        has_more = _has_more(next_cursor)
+        has_more = bool(raw_comments) and _has_more(next_cursor)
         return next_cursor, events, has_more
 
     def _page_to_replies_events(
@@ -450,9 +450,9 @@ def _checkpoint_fetched_count(checkpoint: dict | None) -> int:
 
 
 def _next_posts_cursor(body: dict) -> dict:
-    # posts 分页用 since_id 作为游标；微博在无更多页时返回空串/0。
-    max_id = body.get("since_id") if body.get("since_id") is not None else body.get("max_id", 0)
-    return {"max_id": _as_id_str(max_id), "max_id_type": _as_int(body.get("max_id_type", 0))}
+    # posts 分页用 page 序号作为游标；微博在超页时返回空 list 终止。
+    page = _as_int(body.get("page"), 1)
+    return {"max_id": _as_id_str(page + 1), "max_id_type": 0}
 
 
 def _has_more(cursor: dict) -> bool:

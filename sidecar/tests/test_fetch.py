@@ -18,27 +18,64 @@ class FetcherTest(unittest.TestCase):
 
         def open_url(request, timeout):
             captured["url"] = request.full_url
-            body = {"data": {"cards": [
-                {"card_type": 9, "mblog": {"id": 1}},
-                {"card_type": 11},
-            ], "cardlistInfo": {"since_id": "next"}}}
+            body = {"data": {"list": [
+                {"id": 1},
+                {"id": 2},
+            ], "total": 100}}
             return 200, json.dumps(body).encode()
 
         fetcher = WeiboHttpFetcher(open_url=open_url)
-        status, body = fetcher(KIND_USER_POSTS, {"uid": "123", "max_id": "prev"})
+        status, body = fetcher(KIND_USER_POSTS, {"uid": "123", "max_id": "2"})
         self.assertEqual(status, 200)
-        self.assertEqual(body, {"statuses": [{"id": 1}], "since_id": "next"})
-        self.assertIn("containerid=107603123", captured["url"])
-        self.assertIn("since_id=prev", captured["url"])
+        self.assertEqual(body, {"statuses": [{"id": 1}, {"id": 2}], "page": 2, "total": 100})
+        self.assertIn("mymblog", captured["url"])
+        self.assertIn("page=2", captured["url"])
+
+    def test_posts_first_page_defaults_to_page_one(self):
+        captured = {}
+
+        def open_url(request, timeout):
+            captured["url"] = request.full_url
+            return 200, b'{"data": {"list": [], "total": 0}}'
+
+        fetcher = WeiboHttpFetcher(open_url=open_url)
+        _, body = fetcher(KIND_USER_POSTS, {"uid": "123"})
+        self.assertIn("page=1", captured["url"])
+        self.assertEqual(body["page"], 1)
 
     def test_comments_are_normalized(self):
-        raw = {"data": {"data": [{"id": "c1"}], "max_id": 5, "max_id_type": 1}}
+        raw = {"data": [{"id": "c1"}], "max_id": "5"}
         fetcher = WeiboHttpFetcher(
             open_url=lambda request, timeout: (200, json.dumps(raw).encode())
         )
         _, body = fetcher(KIND_COMMENTS, {"post_id": 9})
         self.assertEqual(body["data"], [{"id": "c1"}])
-        self.assertEqual(body["max_id"], 5)
+        self.assertEqual(body["max_id"], "5")
+
+    def test_comments_first_page_uses_reload(self):
+        captured = {}
+
+        def open_url(request, timeout):
+            captured["url"] = request.full_url
+            return 200, b'{"data": [], "max_id": "0"}'
+
+        fetcher = WeiboHttpFetcher(open_url=open_url)
+        _, _ = fetcher(KIND_COMMENTS, {"post_id": 9})
+        self.assertIn("buildComments", captured["url"])
+        self.assertIn("is_reload=1", captured["url"])
+        self.assertIn("id=9", captured["url"])
+
+    def test_comments_followup_page_uses_max_id(self):
+        captured = {}
+
+        def open_url(request, timeout):
+            captured["url"] = request.full_url
+            return 200, b'{"data": [], "max_id": "0"}'
+
+        fetcher = WeiboHttpFetcher(open_url=open_url)
+        _, _ = fetcher(KIND_COMMENTS, {"post_id": 9, "max_id": "208264901815794"})
+        self.assertIn("is_reload=0", captured["url"])
+        self.assertIn("max_id=208264901815794", captured["url"])
 
     def test_replies_preserve_both_known_envelopes(self):
         raw = {"data": [{"id": "r1"}], "max_id": 0, "max_id_type": 0}
@@ -53,6 +90,7 @@ class FetcherTest(unittest.TestCase):
             ({"ok": 0, "msg": "请先登录"}, 401),
             ({"ok": 0, "msg": "访问频次过高"}, 429),
             ({"ok": 0, "msg": "服务暂不可用"}, 502),
+            ({"ok": -100, "msg": "需要登录"}, 401),
         ]
         for raw, expected_status in cases:
             with self.subTest(raw=raw):
@@ -123,13 +161,68 @@ class FetcherTest(unittest.TestCase):
             def open_url(request, timeout):
                 captured["url"] = request.full_url
                 captured["cookie"] = request.headers.get("Cookie")
-                return 200, b'{"data": {"cards": []}}'
+                captured["x_requested_with"] = request.headers.get("X-requested-with")
+                return 200, b'{"data": {"list": []}}'
 
             fetcher = WeiboHttpFetcher(session_path=session_path, open_url=open_url)
             _, body = fetcher(KIND_USER_POSTS, {"uid": 1})
             self.assertEqual(captured["cookie"], "SUB=secret-cookie")
-            self.assertIn("gsid=secret-gsid", captured["url"])
+            self.assertEqual(captured["x_requested_with"], "XMLHttpRequest")
             self.assertNotIn("secret", json.dumps(body))
+
+    def test_session_gsid_only_injected_for_mobile_replies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session_path = os.path.join(directory, "session.json")
+            with open(session_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "gsid": "secret-gsid",
+                        "cookie_store": [
+                            {
+                                "raw_cookie": "SUB=secret-cookie; Path=/; Secure",
+                                "path": "/",
+                                "domain": {"HostOnly": "weibo.com"},
+                            }
+                        ],
+                    },
+                    handle,
+                )
+            captured = {}
+
+            def open_url(request, timeout):
+                captured["url"] = request.full_url
+                return 200, b'{"data": []}'
+
+            fetcher = WeiboHttpFetcher(session_path=session_path, open_url=open_url)
+            fetcher(KIND_REPLIES, {"post_id": 9, "root_comment_id": "c1"})
+            self.assertIn("gsid=secret-gsid", captured["url"])
+
+    def test_duplicate_cookie_names_keep_last_value(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session_path = os.path.join(directory, "session.json")
+            with open(session_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "cookie_store": [
+                            {"raw_cookie": "SUB=stale-sub; Path=/; Secure"},
+                            {"raw_cookie": "SUBP=old; Path=/; Secure"},
+                            {"raw_cookie": "SUB=fresh-sub; Path=/; Secure"},
+                        ]
+                    },
+                    handle,
+                )
+            captured = {}
+
+            def open_url(request, timeout):
+                captured["cookie"] = request.headers.get("Cookie")
+                return 200, b'{"data": {"list": []}}'
+
+            fetcher = WeiboHttpFetcher(session_path=session_path, open_url=open_url)
+            fetcher(KIND_USER_POSTS, {"uid": 1})
+            cookie = captured["cookie"]
+            self.assertEqual(cookie.count("SUB="), 1)
+            self.assertIn("SUB=fresh-sub", cookie)
+            self.assertNotIn("stale-sub", cookie)
 
 
 if __name__ == "__main__":

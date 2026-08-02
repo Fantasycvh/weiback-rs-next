@@ -24,8 +24,8 @@ from .upstream import (
     classify_schema_error,
 )
 
-_POSTS_URL = "https://m.weibo.cn/api/container/getIndex"
-_COMMENTS_URL = "https://m.weibo.cn/comments/hotflow"
+_POSTS_URL = "https://weibo.com/ajax/statuses/mymblog"
+_COMMENTS_URL = "https://weibo.com/ajax/statuses/buildComments"
 _REPLIES_URL = "https://m.weibo.cn/comments/hotFlowChild"
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -50,13 +50,14 @@ class WeiboHttpFetcher:
         self._cookie, self._gsid = _load_auth(session_path)
 
     def __call__(self, kind: str, params: dict[str, Any]) -> tuple[int, dict]:
-        url, query = self._request_for(kind, params)
-        if self._gsid:
+        url, query, referer = self._request_for(kind, params)
+        if kind == KIND_REPLIES and self._gsid:
             query.setdefault("gsid", self._gsid)
         headers = {
             "Accept": "application/json, text/plain, */*",
-            "Referer": "https://m.weibo.cn/",
+            "Referer": referer,
             "User-Agent": _USER_AGENT,
+            "X-Requested-With": "XMLHttpRequest",
         }
         if self._cookie:
             headers["Cookie"] = self._cookie
@@ -80,71 +81,74 @@ class WeiboHttpFetcher:
             raise UpstreamError(classify_network_error(str(exc))) from exc
         body = _decode_json(raw)
         status = _business_status(status, body)
-        return status, self._normalize(kind, body)
+        return status, self._normalize(kind, body, params)
 
     @staticmethod
-    def _request_for(kind: str, params: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    def _request_for(kind: str, params: dict[str, Any]) -> tuple[str, dict[str, Any], str]:
+        """构造上游请求。返回 (url, query, referer)。"""
         if kind == KIND_USER_POSTS:
             uid = params["uid"]
+            page = 1
+            cursor = params.get("max_id")
+            if cursor not in (None, "", "0", 0):
+                try:
+                    page = int(cursor)
+                except (TypeError, ValueError):
+                    page = 1
+            return _POSTS_URL, {"uid": uid, "page": page, "feature": 0}, "https://weibo.com/"
+        if kind == KIND_COMMENTS:
+            post_id = params["post_id"]
             query: dict[str, Any] = {
-                "type": "uid",
-                "value": uid,
-                "containerid": f"107603{uid}",
+                "is_reload": "1",
+                "id": post_id,
+                "is_show_bulletin": "2",
+                "is_mix": "0",
+                "count": "20",
+                "flow": "0",
             }
             cursor = params.get("max_id")
             if cursor not in (None, "", "0", 0):
-                query["since_id"] = cursor
-            return _POSTS_URL, query
-        if kind == KIND_COMMENTS:
-            post_id = params["post_id"]
-            return _COMMENTS_URL, {
-                "id": post_id,
-                "mid": post_id,
-                "max_id": params.get("max_id", 0),
-                "max_id_type": params.get("max_id_type", 0),
-            }
+                query["is_reload"] = "0"
+                query["max_id"] = cursor
+            return _COMMENTS_URL, query, "https://weibo.com/"
         if kind == KIND_REPLIES:
             return _REPLIES_URL, {
                 "cid": params["root_comment_id"],
                 "max_id": params.get("max_id", 0),
                 "max_id_type": params.get("max_id_type", 0),
-            }
+            }, "https://m.weibo.cn/"
         raise ValueError(f"unsupported fetch kind: {kind}")
 
     @staticmethod
-    def _normalize(kind: str, body: dict) -> dict:
+    def _normalize(kind: str, body: dict, params: dict[str, Any]) -> dict:
         if kind == KIND_USER_POSTS:
             raw_data = body.get("data")
             if not isinstance(raw_data, dict):
                 return body
             data: dict = raw_data
-            raw_cards = data.get("cards")
-            if not isinstance(raw_cards, list):
+            statuses = data.get("list")
+            if not isinstance(statuses, list):
                 return body
-            cards: list = raw_cards
-            statuses = [
-                card["mblog"]
-                for card in cards
-                if isinstance(card, dict) and isinstance(card.get("mblog"), dict)
-            ]
-            cardlist_info = data.get("cardlistInfo")
-            cardlist_info = cardlist_info if isinstance(cardlist_info, dict) else {}
+            page = 1
+            cursor = params.get("max_id")
+            if cursor not in (None, "", "0", 0):
+                try:
+                    page = int(cursor)
+                except (TypeError, ValueError):
+                    page = 1
             return {
                 "statuses": statuses,
-                "since_id": data.get("since_id", cardlist_info.get("since_id", 0)),
+                "page": page,
+                "total": data.get("total", 0),
             }
         if kind == KIND_COMMENTS:
-            raw_data = body.get("data")
-            if not isinstance(raw_data, dict):
-                return body
-            data = raw_data
-            comments = data.get("data") if "data" in data else data.get("comments")
+            comments = body.get("data")
             if not isinstance(comments, list):
                 return body
             return {
                 "data": comments,
-                "max_id": data.get("max_id", 0),
-                "max_id_type": data.get("max_id_type", 0),
+                "max_id": _as_id_str(body.get("max_id", 0)),
+                "max_id_type": 0,
             }
         return body
 
@@ -169,15 +173,24 @@ def _decode_json(raw: bytes, *, strict: bool = True) -> dict:
 
 
 def _business_status(status: int, body: dict) -> int:
-    """把微博 HTTP 200 的业务失败映射回稳定 HTTP 分类入口。"""
-    if status >= 400 or body.get("ok", 1) not in (0, False):
+    """把微博 HTTP 200 的业务失败映射回稳定 HTTP 分类入口。
+
+    ``ok`` 为负值时（微博常见 -100 表示需重新登录）视为认证失败，避免
+    把业务错误当成成功页返回。
+    """
+    if status >= 400:
         return status
-    message = str(body.get("msg") or body.get("message") or "").lower()
-    if any(marker in message for marker in ("登录", "登陆", "身份", "login", "auth")):
+    ok = body.get("ok", 1)
+    if isinstance(ok, int) and ok < 0:
         return 401
-    if any(marker in message for marker in ("频繁", "频次", "rate", "limit")):
-        return 429
-    return 502
+    if ok in (0, False):
+        message = str(body.get("msg") or body.get("message") or "").lower()
+        if any(marker in message for marker in ("登录", "登陆", "身份", "login", "auth")):
+            return 401
+        if any(marker in message for marker in ("频繁", "频次", "rate", "limit")):
+            return 429
+        return 502
+    return status
 
 
 def _retry_after_ms(value: str | None) -> int | None:
@@ -212,7 +225,14 @@ def _load_auth(session_path: str | None) -> tuple[str | None, str | None]:
     if not cookie:
         pairs: list[str] = []
         _collect_cookie_pairs(session.get("cookie_store"), pairs)
-        cookie = "; ".join(dict.fromkeys(pairs)) or None
+        # 同名 cookie 只保留最后一条（浏览器语义：同名由更新者覆盖，重复的
+        # SUB 会让服务器按过期的第一条解析导致 401）。
+        dedup: dict[str, str] = {}
+        for pair in pairs:
+            name, sep, value = pair.partition("=")
+            if sep:
+                dedup[name] = value
+        cookie = "; ".join(f"{name}={value}" for name, value in dedup.items()) or None
     return cookie, gsid
 
 
@@ -236,3 +256,9 @@ def _collect_cookie_pairs(value: Any, output: list[str]) -> None:
 
 def _string(value: Any) -> str | None:
     return str(value) if value not in (None, "") else None
+
+
+def _as_id_str(value) -> str:
+    if value is None:
+        return "0"
+    return str(value)

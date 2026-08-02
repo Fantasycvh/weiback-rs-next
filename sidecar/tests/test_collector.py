@@ -324,7 +324,7 @@ class UpstreamErrorTest(unittest.TestCase):
 
 class PostsAndCommentsExtractTest(unittest.TestCase):
     def test_collect_posts_emits_post_and_media(self):
-        body = {
+        page1 = {
             "statuses": [
                 {
                     "id": "4242424242424242",
@@ -343,11 +343,15 @@ class PostsAndCommentsExtractTest(unittest.TestCase):
                     "comments_count": 2,
                 }
             ],
-            "since_id": "0",
+            "page": 1,
+            "total": 1,
         }
+        page2 = {"statuses": [], "page": 2, "total": 1}
 
         def fetch(kind: str, params: dict) -> tuple[int, dict]:
-            return 200, body
+            if params.get("max_id") == "2":
+                return 200, page2
+            return 200, page1
 
         emitter = BufferEmitter()
         result = _collector(fetch, max_pages=2).collect_posts(emitter, "1234567890")
