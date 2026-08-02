@@ -618,6 +618,19 @@ impl Core {
         Ok(id)
     }
 
+    /// Reports whether an account points to a usable session inside the configured session root.
+    pub fn account_session_ready(&self, account: &AccountDto) -> Result<bool> {
+        let session_root = get_config()
+            .read()?
+            .session_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .ok_or_else(|| {
+                crate::error::Error::FormatError("configured session root is invalid".into())
+            })?;
+        Ok(account.enabled && validate_account_session(account, &session_root).is_ok())
+    }
+
     pub async fn delete_account(&self, id: i64) -> Result<bool> {
         let _admission = self.shutdown_admission.begin_write()?;
         delete_account(&self.db_pool, id).await
@@ -941,6 +954,7 @@ impl Core {
 
                 let ctx = self.create_short_task_context();
                 self.task_handler.save_user_info(ctx, &user).await?;
+                self.ensure_sync_account(&user).await?;
                 info!("Logged in user {} saved.", user_id);
 
                 Ok(user)
@@ -955,6 +969,7 @@ impl Core {
                     let _ = e;
                     error!("Existing login user parsing failed");
                 })?;
+                self.ensure_sync_account(&user).await?;
                 Ok(user)
             }
             LoginState::Init => {
@@ -985,25 +1000,45 @@ impl Core {
     /// Attempts to restore a session from the saved session file.
     ///
     /// Useful for persisting login across application restarts.
-    pub async fn login_with_session(&self) -> Result<()> {
+    pub async fn login_with_session(&self) -> Result<Option<User>> {
         let session_path = get_config().read()?.session_path.clone();
-        if let Ok(session) = Session::load(session_path.as_path()) {
-            let api_client = self.sdk_api_client.clone();
-            if let Err(e) = api_client.login_with_session(session).await {
-                error!("login with session failed: {e}");
-            }
-            info!("login with session successfully");
-            match api_client.session() {
-                Ok(session) => {
-                    if let Err(e) = session.save(session_path) {
-                        error!("save new session failed: {e}");
-                    }
-                }
-                Err(e) => {
-                    error!("get new session failed: {e}");
-                }
-            }
+        if !session_path.is_file() {
+            return Ok(None);
         }
+        let session = Session::load(session_path.as_path())?;
+        let api_client = self.sdk_api_client.clone();
+        api_client.login_with_session(session).await?;
+        let session = api_client.session()?;
+        session.save(&session_path)?;
+        let user: User = serde_json::from_value(session.user.clone())?;
+        let ctx = self.create_short_task_context();
+        self.task_handler.save_user_info(ctx, &user).await?;
+        self.ensure_sync_account(&user).await?;
+        info!(user_id = user.id, "saved login session restored");
+        Ok(Some(user))
+    }
+
+    async fn ensure_sync_account(&self, user: &User) -> Result<()> {
+        let session_path = get_config().read()?.session_path.clone();
+        let session_ref = session_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                crate::error::Error::FormatError("configured session path has no file name".into())
+            })?
+            .to_string();
+        self.save_account(AccountDto {
+            id: 0,
+            provider: "weibo".into(),
+            uid: user.id.to_string(),
+            display_name: Some(user.screen_name.clone()),
+            session_ref,
+            enabled: true,
+            created_at: String::new(),
+            updated_at: None,
+        })
+        .await?;
         Ok(())
     }
 

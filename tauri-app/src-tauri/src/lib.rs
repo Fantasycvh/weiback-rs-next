@@ -111,12 +111,13 @@ pub struct AccountWireDto {
     pub display_name: Option<String>,
     pub enabled: bool,
     pub has_session: bool,
+    pub session_ready: bool,
     pub created_at: String,
     pub updated_at: Option<String>,
 }
 
-impl From<AccountDto> for AccountWireDto {
-    fn from(account: AccountDto) -> Self {
+impl AccountWireDto {
+    fn from_account(account: AccountDto, session_ready: bool) -> Self {
         Self {
             id: account.id.to_string(),
             provider: account.provider,
@@ -124,10 +125,45 @@ impl From<AccountDto> for AccountWireDto {
             display_name: account.display_name,
             enabled: account.enabled,
             has_session: !account.session_ref.is_empty(),
+            session_ready,
             created_at: account.created_at,
             updated_at: account.updated_at,
         }
     }
+}
+
+async fn require_ready_sync_account(core: &Core, id: i64) -> Result<()> {
+    let account = core
+        .get_accounts()
+        .await
+        .map_err(|error| sync_core_error("require_ready_sync_account/get_accounts", error))?
+        .into_iter()
+        .find(|account| account.id == id)
+        .ok_or_else(|| stable_sync_error("Selected sync account was not found"))?;
+    if !account.enabled {
+        return Err(stable_sync_error("Selected sync account is disabled"));
+    }
+    if !core
+        .account_session_ready(&account)
+        .map_err(|error| sync_core_error("require_ready_sync_account/session", error))?
+    {
+        return Err(stable_sync_error(
+            "Selected sync account session is unavailable; log in again",
+        ));
+    }
+    Ok(())
+}
+
+async fn require_logged_in(core: &Core) -> Result<()> {
+    if core
+        .login_state()
+        .await
+        .map_err(|error| sync_core_error("require_logged_in", error))?
+        .is_none()
+    {
+        return Err(stable_sync_error("Log in before starting an online backup"));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -511,9 +547,11 @@ async fn get_backend_status(state: State<'_, BackendState>) -> Result<BackendSta
 }
 
 async fn perform_init_backend(app_handle: &AppHandle, state: &BackendState) -> BackendStatus {
-    let mut status_guard = state.status.lock().unwrap();
-    if let BackendStatus::Running { .. } = *status_guard {
-        return status_guard.clone();
+    {
+        let status_guard = state.status.lock().unwrap();
+        if let BackendStatus::Running { .. } = *status_guard {
+            return status_guard.clone();
+        }
     }
 
     info!("Initializing backend core...");
@@ -547,16 +585,25 @@ async fn perform_init_backend(app_handle: &AppHandle, state: &BackendState) -> B
                     }
                 });
             }
-            let core_clone = core.clone();
-            tauri::async_runtime::spawn(async move { core_clone.login_with_session().await });
+            if let Err(error) = core.login_with_session().await {
+                warn!(error = %error, "Saved login session could not be restored");
+                warning = Some(match warning {
+                    Some(existing) => {
+                        format!("{existing}; saved login session could not be restored")
+                    }
+                    None => "Saved login session could not be restored; log in again".to_string(),
+                });
+            }
 
             app_handle.manage(core);
+            let mut status_guard = state.status.lock().unwrap();
             *status_guard = BackendStatus::Running { warning };
             info!("Backend initialized successfully");
             status_guard.clone()
         }
         Err(e) => {
             error!("Backend initialization failed: {e}");
+            let mut status_guard = state.status.lock().unwrap();
             *status_guard = BackendStatus::Error {
                 message: "Backend initialization failed; see the application log".to_string(),
             };
@@ -642,6 +689,7 @@ async fn backup_user(
     num_pages: u32,
     backup_type: BackupType,
 ) -> Result<()> {
+    require_logged_in(&core).await?;
     info!(
         "backup_user called with uid: {:?}, pages num: {num_pages}, backup_type: {backup_type:?}",
         uid
@@ -657,6 +705,7 @@ async fn backup_user(
 
 #[tauri::command]
 async fn backup_favorites(core: State<'_, Arc<Core>>, num_pages: u32) -> Result<()> {
+    require_logged_in(&core).await?;
     info!("backup_favorites called with pages num: {num_pages}");
     Ok(core
         .backup_favorites(TaskRequest::BackupFavorites(BackupFavoritesOptions {
@@ -697,12 +746,16 @@ async fn collect_comment_replies(
 
 #[tauri::command]
 async fn get_sync_accounts(core: State<'_, Arc<Core>>) -> Result<Vec<AccountWireDto>> {
-    Ok(core
+    let accounts = core
         .get_accounts()
         .await
-        .map_err(|error| sync_core_error("get_sync_accounts", error))?
+        .map_err(|error| sync_core_error("get_sync_accounts", error))?;
+    Ok(accounts
         .into_iter()
-        .map(Into::into)
+        .map(|account| {
+            let session_ready = core.account_session_ready(&account).unwrap_or(false);
+            AccountWireDto::from_account(account, session_ready)
+        })
         .collect())
 }
 
@@ -790,6 +843,9 @@ async fn save_monitored_user(
     input: SaveMonitoredUserInput,
 ) -> Result<()> {
     validate_monitor_input(&input)?;
+    if input.enabled {
+        require_ready_sync_account(&core, input.account_id.0).await?;
+    }
     let existing = core
         .get_monitored_users()
         .await
@@ -850,6 +906,12 @@ async fn delete_monitored_user(
 #[tauri::command]
 async fn enqueue_sync_job(core: State<'_, Arc<Core>>, spec: SyncJobCommandSpec) -> Result<String> {
     validate_job_spec(&spec)?;
+    let account_id = match &spec {
+        SyncJobCommandSpec::CollectUserPosts { account_id, .. }
+        | SyncJobCommandSpec::CollectComments { account_id, .. }
+        | SyncJobCommandSpec::CollectCommentReplies { account_id, .. } => account_id.0,
+    };
+    require_ready_sync_account(&core, account_id).await?;
     core.enqueue_sync_job(spec.into())
         .await
         .map(|id| id.to_string())
@@ -922,6 +984,7 @@ async fn retry_sync_job(core: State<'_, Arc<Core>>, job_id: WeiboId) -> Result<S
 
 #[tauri::command]
 async fn unfavorite_posts(core: State<'_, Arc<Core>>) -> Result<()> {
+    require_logged_in(&core).await?;
     info!("unfavorite_posts called");
     Ok(core.unfavorite_posts().await?)
 }
@@ -1516,6 +1579,7 @@ mod tests {
             display_name: Some("Alice".into()),
             enabled: true,
             has_session: true,
+            session_ready: true,
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: None,
         };
@@ -1554,6 +1618,7 @@ mod tests {
         let job_json = serde_json::to_value(job.clone()).unwrap();
         let run_json = serde_json::to_value(run).unwrap();
         assert_eq!(account_json["id"], json!(i64::MAX.to_string()));
+        assert_eq!(account_json["session_ready"], json!(true));
         assert_eq!(job_json["current_run_id"], json!(i64::MAX.to_string()));
         assert_eq!(run_json["job_id"], json!(i64::MAX.to_string()));
         for value in [&account_json, &job_json, &run_json] {

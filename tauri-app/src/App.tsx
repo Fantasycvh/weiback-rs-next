@@ -68,7 +68,7 @@ const App: React.FC = () => {
             persist: true,
           })
         }
-        useAuthStore.getState().checkLoginState()
+        await useAuthStore.getState().checkLoginState()
 
         // Check for updates silently after backend is ready
         const release = await checkLatestRelease()

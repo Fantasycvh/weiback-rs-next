@@ -21,7 +21,6 @@ import {
   Tooltip,
   Typography,
 } from '@mui/material'
-import AddIcon from '@mui/icons-material/Add'
 import CancelIcon from '@mui/icons-material/Cancel'
 import DeleteIcon from '@mui/icons-material/Delete'
 import EditIcon from '@mui/icons-material/Edit'
@@ -125,6 +124,7 @@ const SyncCenter = () => {
   const [tab, setTab] = useState(0)
   const mountedRef = useRef(false)
   const refreshGenerationRef = useRef(0)
+  const usableAccounts = accounts.filter(account => account.enabled && account.session_ready)
 
   useEffect(() => {
     mountedRef.current = true
@@ -146,9 +146,13 @@ const SyncCenter = () => {
       setMonitors(nextMonitors)
       setJobs(nextJobs)
       setDiagnostics(nextDiagnostics)
-      setMonitorDraft(current => current.accountId || nextAccounts.length === 0
-        ? current
-        : { ...current, accountId: nextAccounts[0].id })
+      const nextUsableAccount = nextAccounts.find(account => account.enabled && account.session_ready)
+      setMonitorDraft(current => {
+        const currentIsUsable = nextAccounts.some(account => account.id === current.accountId && account.enabled && account.session_ready)
+        return currentIsUsable || !nextUsableAccount
+          ? current
+          : { ...current, accountId: nextUsableAccount.id }
+      })
       setSelectedJobId(current => nextJobs.some(job => job.id === current)
         ? current
         : nextJobs[0]?.id || '')
@@ -186,8 +190,8 @@ const SyncCenter = () => {
   }
 
   const submitAccount = async () => {
-    if (!accountDraft.uid.trim() || (!accountDraft.id && !accountDraft.sessionRef.trim())) {
-      enqueueSnackbar('账号 UID 和新账号的会话引用不能为空', { variant: 'warning' })
+    if (!accountDraft.id) {
+      enqueueSnackbar('请先登录微博，系统会自动创建可用的同步账号', { variant: 'info' })
       return
     }
     const sessionRef = !accountDraft.id || accountDraft.replaceSession
@@ -270,24 +274,22 @@ const SyncCenter = () => {
         <Grid size={{ xs: 12, lg: 5 }}>
           <Card sx={{ borderRadius: 1 }}><CardContent>
             <Stack direction="row" alignItems="center" justifyContent="space-between" mb={2}>
-              <Typography variant="h6">{accountDraft.id ? '编辑账号' : '创建账号'}</Typography>
-              {accountDraft.id && <Button size="small" startIcon={<AddIcon />} onClick={() => setAccountDraft(blankAccount())}>新建</Button>}
+              <Typography variant="h6">同步账号</Typography>
             </Stack>
             <Stack spacing={2}>
-              <TextField label="Provider" value={accountDraft.provider} disabled={!!accountDraft.id} onChange={e => setAccountDraft(v => ({ ...v, provider: e.target.value }))} />
-              <TextField label="UID" value={accountDraft.uid} disabled={!!accountDraft.id} onChange={e => setAccountDraft(v => ({ ...v, uid: e.target.value }))} />
+              {!accountDraft.id && <Alert severity="info">登录成功后，当前会话会自动注册为同步账号。</Alert>}
+              {accountDraft.id && <TextField label="Provider" value={accountDraft.provider} disabled />}
+              {accountDraft.id && <TextField label="UID" value={accountDraft.uid} disabled />}
               <TextField label="显示名称" value={accountDraft.displayName} onChange={e => setAccountDraft(v => ({ ...v, displayName: e.target.value }))} />
-              {accountDraft.id && <FormControlLabel control={<Switch checked={accountDraft.replaceSession} onChange={e => setAccountDraft(v => ({ ...v, replaceSession: e.target.checked }))} />} label="替换会话引用" />}
-              {(!accountDraft.id || accountDraft.replaceSession) && <TextField label="Session reference" type="password" value={accountDraft.sessionRef} onChange={e => setAccountDraft(v => ({ ...v, sessionRef: e.target.value }))} helperText="仅在创建或替换时提交" />}
-              <FormControlLabel control={<Switch checked={accountDraft.enabled} onChange={e => setAccountDraft(v => ({ ...v, enabled: e.target.checked }))} />} label="启用账号" />
-              <Button variant="contained" onClick={() => void submitAccount()} disabled={busyKey === 'account-save'}>保存账号</Button>
+              {accountDraft.id && <FormControlLabel control={<Switch checked={accountDraft.enabled} disabled={!accountDraft.enabled && !accounts.find(account => account.id === accountDraft.id)?.session_ready} onChange={e => setAccountDraft(v => ({ ...v, enabled: e.target.checked }))} />} label="启用账号" />}
+              {accountDraft.id && <Button variant="contained" onClick={() => void submitAccount()} disabled={busyKey === 'account-save'}>保存账号</Button>}
             </Stack>
           </CardContent></Card>
         </Grid>
         <Grid size={{ xs: 12, lg: 7 }}>
           <Stack spacing={1.5}>{accounts.length === 0 && <Alert severity="info">尚未创建同步账号。</Alert>}{accounts.map(account => <Card key={account.id} variant="outlined" sx={{ borderRadius: 1 }}><CardContent>
             <Stack direction="row" justifyContent="space-between" alignItems="flex-start" gap={1}>
-              <Box sx={{ minWidth: 0 }}><Typography fontWeight={500}>{account.display_name || account.uid}</Typography><Typography variant="body2" color="text.secondary" sx={{ overflowWrap: 'anywhere' }}>{account.provider} · {account.uid} · {account.has_session ? '会话已配置' : '无会话'}</Typography></Box>
+              <Box sx={{ minWidth: 0 }}><Typography fontWeight={500}>{account.display_name || account.uid}</Typography><Typography variant="body2" color="text.secondary" sx={{ overflowWrap: 'anywhere' }}>{account.provider} · {account.uid} · {account.session_ready ? '会话可用' : account.has_session ? '会话不可用，请重新登录' : '无会话'}</Typography></Box>
               <Stack direction="row"><Chip size="small" label={account.enabled ? '启用' : '停用'} color={account.enabled ? 'success' : 'default'} /><Tooltip title="编辑"><IconButton size="small" onClick={() => editAccount(account)}><EditIcon /></IconButton></Tooltip><Tooltip title="删除"><IconButton size="small" color="error" onClick={() => void runAction(`delete-account-${account.id}`, () => deleteSyncAccount(account.id), '账号已删除')}><DeleteIcon /></IconButton></Tooltip></Stack>
             </Stack>
           </CardContent></Card>)}</Stack>
@@ -295,17 +297,18 @@ const SyncCenter = () => {
 
         <Grid size={{ xs: 12, lg: 5 }}>
           <Card sx={{ borderRadius: 1 }}><CardContent><Typography variant="h6" mb={2}>监控用户</Typography><Stack spacing={2}>
-            <TextField select label="账号" value={monitorDraft.accountId} onChange={e => setMonitorDraft(v => ({ ...v, accountId: e.target.value }))}>{accounts.map(account => <MenuItem key={account.id} value={account.id}>{account.display_name || account.uid}</MenuItem>)}</TextField>
+            {usableAccounts.length === 0 && <Alert severity="warning">没有可用同步账号。请先登录微博或重新登录以恢复会话。</Alert>}
+            <TextField select label="账号" value={monitorDraft.accountId} onChange={e => setMonitorDraft(v => ({ ...v, accountId: e.target.value }))}>{usableAccounts.map(account => <MenuItem key={account.id} value={account.id}>{account.display_name || account.uid}</MenuItem>)}</TextField>
             <TextField label="用户 UID" value={monitorDraft.uid} onChange={e => setMonitorDraft(v => ({ ...v, uid: e.target.value }))} />
             <TextField label="用户名称" value={monitorDraft.screenName} onChange={e => setMonitorDraft(v => ({ ...v, screenName: e.target.value }))} />
             <TextField select label="刷新层级" value={monitorDraft.tier} onChange={e => { const tier = e.target.value as RefreshTier; setMonitorDraft(v => ({ ...v, tier, intervalSecs: String(DEFAULT_INTERVALS[tier]) })) }}>{(['hot', 'warm', 'cold'] as RefreshTier[]).map(tier => <MenuItem key={tier} value={tier}>{tier}</MenuItem>)}</TextField>
             <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}><TextField fullWidth label="间隔（秒）" type="number" value={monitorDraft.intervalSecs} onChange={e => setMonitorDraft(v => ({ ...v, intervalSecs: e.target.value }))} /><TextField fullWidth label="抖动（秒）" type="number" value={monitorDraft.jitterSecs} onChange={e => setMonitorDraft(v => ({ ...v, jitterSecs: e.target.value }))} /></Stack>
             <FormControlLabel control={<Switch checked={monitorDraft.enabled} onChange={e => setMonitorDraft(v => ({ ...v, enabled: e.target.checked }))} />} label="启用监控" />
-            <Button variant="contained" onClick={() => void submitMonitor()} disabled={!accounts.length || busyKey === 'monitor-save'}>保存监控</Button>
+            <Button variant="contained" onClick={() => void submitMonitor()} disabled={!usableAccounts.length || busyKey === 'monitor-save'}>保存监控</Button>
           </Stack></CardContent></Card>
         </Grid>
         <Grid size={{ xs: 12, lg: 7 }}><Stack spacing={1.5}>{monitors.length === 0 && <Alert severity="info">尚未配置监控用户。</Alert>}{monitors.map(monitor => <Card key={`${monitor.account_id}-${monitor.uid}`} variant="outlined" sx={{ borderRadius: 1 }}><CardContent>
-          <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" gap={1}><Box><Typography fontWeight={500}>{monitor.screen_name || monitor.uid}</Typography><Typography variant="body2" color="text.secondary">{monitor.tier} · 每 {monitor.interval_secs}s ± {monitor.jitter_secs}s</Typography><Typography variant="caption" color="text.secondary">下次刷新：{formatEpoch(monitor.next_refresh_epoch)}</Typography></Box><Stack direction="row" alignItems="center"><Tooltip title="立即采集帖子"><IconButton color="primary" onClick={() => void collectPosts(monitor)}><SyncIcon /></IconButton></Tooltip><Tooltip title="编辑"><IconButton onClick={() => editMonitor(monitor)}><EditIcon /></IconButton></Tooltip><Tooltip title="删除"><IconButton color="error" onClick={() => void runAction(`delete-monitor-${monitor.account_id}-${monitor.uid}`, () => deleteMonitoredUser(monitor.account_id, monitor.uid), '监控已删除')}><DeleteIcon /></IconButton></Tooltip></Stack></Stack>
+          <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" gap={1}><Box><Typography fontWeight={500}>{monitor.screen_name || monitor.uid}</Typography><Typography variant="body2" color="text.secondary">{monitor.tier} · 每 {monitor.interval_secs}s ± {monitor.jitter_secs}s</Typography><Typography variant="caption" color="text.secondary">下次刷新：{formatEpoch(monitor.next_refresh_epoch)}</Typography></Box><Stack direction="row" alignItems="center"><Tooltip title="立即采集帖子"><span><IconButton color="primary" disabled={!usableAccounts.some(account => account.id === monitor.account_id)} onClick={() => void collectPosts(monitor)}><SyncIcon /></IconButton></span></Tooltip><Tooltip title="编辑"><IconButton onClick={() => editMonitor(monitor)}><EditIcon /></IconButton></Tooltip><Tooltip title="删除"><IconButton color="error" onClick={() => void runAction(`delete-monitor-${monitor.account_id}-${monitor.uid}`, () => deleteMonitoredUser(monitor.account_id, monitor.uid), '监控已删除')}><DeleteIcon /></IconButton></Tooltip></Stack></Stack>
         </CardContent></Card>)}</Stack></Grid>
       </Grid>}
 

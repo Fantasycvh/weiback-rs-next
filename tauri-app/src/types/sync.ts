@@ -7,6 +7,7 @@ export interface SyncAccount {
   display_name: string | null
   enabled: boolean
   has_session: boolean
+  session_ready: boolean
   created_at: string
   updated_at: string | null
 }

@@ -13,6 +13,7 @@ import {
   InputLabel,
   FormControl,
   Grid,
+  Alert,
 } from '@mui/material'
 import { useTaskStore } from '../stores/taskStore'
 import { useAuthStore } from '../stores/authStore'
@@ -29,6 +30,8 @@ const UserBackupSection: React.FC = () => {
   const isTaskRunning = useTaskStore(state => state.currentTask?.status === TaskStatus.InProgress)
   const fetchCurrentTask = useTaskStore(state => state.fetchCurrentTask)
   const loggedInUser = useAuthStore(state => state.userInfo)
+  const isLoggedIn = useAuthStore(state => state.isLoggedIn)
+  const isAuthLoading = useAuthStore(state => state.isAuthLoading)
 
   useEffect(() => {
     const handler = setTimeout(() => {
@@ -47,6 +50,10 @@ const UserBackupSection: React.FC = () => {
   }, [userInput])
 
   const handleBackup = async () => {
+    if (!isLoggedIn) {
+      enqueueSnackbar('请先登录微博后再启动在线备份', { variant: 'warning' })
+      return
+    }
     let backupId: string | null = null
     if (userInput) {
       if (typeof userInput === 'object') {
@@ -86,6 +93,7 @@ const UserBackupSection: React.FC = () => {
         </Typography>
         <Box component="form" noValidate autoComplete="off">
           <Stack spacing={2}>
+            {!isAuthLoading && !isLoggedIn && <Alert severity="warning">请先登录微博后再启动在线备份。</Alert>}
             <UserSelector
               value={userInput}
               onChange={setUserInput}
@@ -120,7 +128,7 @@ const UserBackupSection: React.FC = () => {
               onChange={e => setNumPages(parseInt(e.target.value, 10) || 1)}
               slotProps={{ htmlInput: { min: 1 } }}
             />
-            <Button variant="contained" onClick={handleBackup} disabled={isTaskRunning}>
+            <Button variant="contained" onClick={handleBackup} disabled={isTaskRunning || isAuthLoading || !isLoggedIn}>
               {isTaskRunning ? '任务进行中...' : '开始备份'}
             </Button>
           </Stack>
@@ -135,8 +143,14 @@ const FavoritesBackupSection: React.FC = () => {
   const [numPages, setNumPages] = useState(1)
   const isTaskRunning = useTaskStore(state => state.currentTask?.status === TaskStatus.InProgress)
   const fetchCurrentTask = useTaskStore(state => state.fetchCurrentTask)
+  const isLoggedIn = useAuthStore(state => state.isLoggedIn)
+  const isAuthLoading = useAuthStore(state => state.isAuthLoading)
 
   const handleBackup = async () => {
+    if (!isLoggedIn) {
+      enqueueSnackbar('请先登录微博后再启动在线备份', { variant: 'warning' })
+      return
+    }
     if (numPages <= 0) {
       enqueueSnackbar('备份页数必须为正数', { variant: 'error' })
       return
@@ -151,6 +165,10 @@ const FavoritesBackupSection: React.FC = () => {
   }
 
   const handleUnfavorite = async () => {
+    if (!isLoggedIn) {
+      enqueueSnackbar('请先登录微博后再操作收藏', { variant: 'warning' })
+      return
+    }
     try {
       await unfavoritePosts()
       enqueueSnackbar('开始取消已备份收藏', { variant: 'success' })
@@ -168,6 +186,7 @@ const FavoritesBackupSection: React.FC = () => {
         </Typography>
         <Box component="form" noValidate autoComplete="off">
           <Stack spacing={2}>
+            {!isAuthLoading && !isLoggedIn && <Alert severity="warning">请先登录微博后再操作收藏。</Alert>}
             <TextField
               fullWidth
               label="备份页数"
@@ -176,10 +195,10 @@ const FavoritesBackupSection: React.FC = () => {
               onChange={e => setNumPages(parseInt(e.target.value, 10) || 1)}
               slotProps={{ htmlInput: { min: 1 } }}
             />
-            <Button variant="contained" onClick={handleBackup} disabled={isTaskRunning}>
+            <Button variant="contained" onClick={handleBackup} disabled={isTaskRunning || isAuthLoading || !isLoggedIn}>
               {isTaskRunning ? '任务进行中...' : '开始备份'}
             </Button>
-            <Button variant="contained" onClick={handleUnfavorite} disabled={isTaskRunning}>
+            <Button variant="contained" onClick={handleUnfavorite} disabled={isTaskRunning || isAuthLoading || !isLoggedIn}>
               {isTaskRunning ? '任务进行中...' : '取消已备份收藏'}
             </Button>
           </Stack>

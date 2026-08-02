@@ -44,6 +44,8 @@ const UserPage: React.FC = () => {
     isLoggedIn ? UserPageState.LoggedIn : UserPageState.Phone
   )
 
+  const displayedPageState = isLoggedIn ? UserPageState.LoggedIn : pageState
+
   const handleGetCode = async () => {
     if (!/^1\d{10}$/.test(phone)) {
       enqueueSnackbar('请输入有效的手机号码', { variant: 'error' })
@@ -110,7 +112,7 @@ const UserPage: React.FC = () => {
       )
     }
 
-    switch (pageState) {
+    switch (displayedPageState) {
       case UserPageState.LoggedIn:
         return userInfo ? (
           <Box>
