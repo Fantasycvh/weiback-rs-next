@@ -136,7 +136,8 @@ const UserSelector: React.FC<UserSelectorProps> = ({
           <TextField
             {...otherParams} // Spread the rest of the TextField params
             label={label}
-            type={searchMode === 'id' ? 'number' : 'text'}
+            type="text"
+            inputProps={searchMode === 'id' ? { inputMode: 'numeric', pattern: '[0-9]*' } : undefined}
             placeholder={searchMode === 'username' ? placeholderUsername : placeholderId}
             slotProps={{
               input: {

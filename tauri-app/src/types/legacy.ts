@@ -8,3 +8,16 @@ export interface LegacyDetection {
   picture_dir: string | null
   video_dir: string | null
 }
+
+export type LegacyImportStatus = 'completed' | 'already_completed' | 'partial_recoverable'
+
+export interface LegacyImportSummary {
+  source: LegacyDetection
+  status: LegacyImportStatus
+  posts: number
+  users: number
+  media_copied: number
+  media_pending: number
+  rollback_backup: string
+  diagnostic_code: string | null
+}

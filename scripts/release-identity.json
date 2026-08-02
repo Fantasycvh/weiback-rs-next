@@ -1,0 +1,16 @@
+{
+  "productName": "WeiBack Next",
+  "identifier": "com.weiback.next",
+  "mainBinaryName": "weiback-next",
+  "nsisInstallMode": "currentUser",
+  "sidecarBaseName": "weiback-collector",
+  "dataNamespace": "weiback-next",
+  "legacyIdentifier": "com.weiback.app",
+  "wixUpgradeCode": "13a0729c-a277-55ef-828c-495a6d30aa6d",
+  "approvedSigners": {
+    "thumbprints": [],
+    "subjectRegexes": [
+      "^CN=WeiBack Next Release Signing$"
+    ]
+  }
+}

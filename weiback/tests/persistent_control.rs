@@ -1,12 +1,12 @@
 use weiback::storage::database::create_db_pool_with_url;
 use weiback::storage::internal::entities::transactional::CommitPlan;
 use weiback::storage::internal::entities::{
-    CheckpointOwner, ClaimRequest, FinishRunRequest, JobControlResult, MediaDto, SyncCheckpointDto,
-    SyncJobDto, SyncJobStatus, cancel_sync_job, claim_next_sync_job, create_sync_run,
-    create_sync_run_at, enqueue_test_sync_job as enqueue_sync_job, finish_sync_run_at,
-    get_sync_checkpoint, get_sync_job, get_sync_run_history, heartbeat_sync_run,
-    heartbeat_sync_run_at, pause_sync_job, recover_interrupted_sync_jobs, resume_sync_job,
-    retry_sync_job, save_sync_checkpoint, save_sync_checkpoint_at,
+    CheckpointOwner, ClaimRequest, FinishRunRequest, JobControlResult, MediaReferenceDto,
+    SyncCheckpointDto, SyncJobDto, SyncJobStatus, cancel_sync_job, claim_next_sync_job,
+    create_sync_run, create_sync_run_at, enqueue_test_sync_job as enqueue_sync_job,
+    finish_sync_run_at, get_sync_checkpoint, get_sync_job, get_sync_run_history,
+    heartbeat_sync_run, heartbeat_sync_run_at, pause_sync_job, recover_interrupted_sync_jobs,
+    resume_sync_job, retry_sync_job, save_sync_checkpoint, save_sync_checkpoint_at,
 };
 
 fn now(second: u8) -> String {
@@ -322,18 +322,13 @@ async fn expired_lease_rolls_back_business_data_with_checkpoint() {
         users: vec![],
         posts: vec![],
         comments: vec![],
-        media: vec![MediaDto {
-            id: 0,
+        media: vec![MediaReferenceDto {
             owner_type: "post".into(),
             owner_id: None,
             media_type: "image".into(),
             url: "https://example.com/expired.jpg".into(),
-            local_path: None,
-            status: "pending".into(),
-            retry_count: 0,
-            last_error: None,
             created_at: now(11),
-            updated_at: None,
+            definition: None,
         }],
         checkpoint,
         processed_at: now(11),
@@ -356,6 +351,92 @@ async fn expired_lease_rolls_back_business_data_with_checkpoint() {
             .unwrap()
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn commit_plan_trigger_failures_roll_back_every_write_and_allow_retry() {
+    for (table, event_id) in [
+        ("processed_events", "trigger-processed-event"),
+        ("sync_checkpoints", "trigger-checkpoint"),
+    ] {
+        let db = create_db_pool_with_url(":memory:").await.unwrap();
+        let stream = format!("user:{table}:posts");
+        let plan = CommitPlan {
+            request_id: Some("trigger-request".into()),
+            stream: stream.clone(),
+            sequence: 1,
+            event_id: event_id.into(),
+            users: vec![],
+            posts: vec![],
+            comments: vec![],
+            media: vec![MediaReferenceDto {
+                owner_type: "post".into(),
+                owner_id: Some(42),
+                media_type: "picture".into(),
+                url: format!("https://example.test/{table}.jpg"),
+                created_at: now(1),
+                definition: Some("large".into()),
+            }],
+            checkpoint: SyncCheckpointDto {
+                stream: stream.clone(),
+                cursor_json: Some(r#"{"cursor":"trigger"}"#.into()),
+                fetched_count: 1,
+                last_sequence: Some(1),
+                updated_at: now(1),
+                job_id: None,
+                run_id: None,
+                generation: None,
+                owner_token: None,
+                owner: CheckpointOwner::AdHoc,
+            },
+            processed_at: now(1),
+        };
+        sqlx::query(&format!(
+            "CREATE TRIGGER fail_{table} BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT, 'injected {table} failure'); END"
+        ))
+        .execute(&db)
+        .await
+        .unwrap();
+
+        assert!(
+            plan.execute(&db).await.is_err(),
+            "{table} trigger must fail"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM media")
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            0,
+            "{table} failure must roll back business data"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM processed_events")
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            0,
+            "{table} failure must not record an event"
+        );
+        assert!(get_sync_checkpoint(&db, &stream).await.unwrap().is_none());
+
+        sqlx::query(&format!("DROP TRIGGER fail_{table}"))
+            .execute(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.execute(&db).await.unwrap(),
+            weiback::storage::internal::entities::transactional::CommitOutcome::Applied
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM media")
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(get_sync_checkpoint(&db, &stream).await.unwrap().is_some());
+    }
 }
 
 #[tokio::test]

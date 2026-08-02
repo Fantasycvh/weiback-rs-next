@@ -1,4 +1,4 @@
 export interface User {
-  id: number
+  id: string
   screen_name: string
 }

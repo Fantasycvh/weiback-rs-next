@@ -67,11 +67,13 @@ const SettingsPage: React.FC = () => {
     setConfigState(initialConfig)
   }
 
-  const handleSelectPath = async (field: 'picture_path' | 'video_path') => {
+  const handleSelectPath = async (field: 'picture_path' | 'video_path' | 'media_path') => {
+    const pathLabel =
+      field === 'media_path' ? '统一媒体' : field === 'picture_path' ? '图片' : '视频'
     const selected = await open({
       directory: true,
       multiple: false,
-      title: `选择${field === 'picture_path' ? '图片' : '视频'}保存路径`,
+      title: `选择${pathLabel}保存路径`,
     })
     if (typeof selected === 'string' && config) {
       handleChange(field, selected)
@@ -248,6 +250,23 @@ const SettingsPage: React.FC = () => {
                             />
                           </Grid>
 
+                          <Grid size={{ xs: 12 }}>
+                            <TextField
+                              fullWidth
+                              label="统一媒体保存路径"
+                              value={config.media_path}
+                              InputProps={{
+                                readOnly: true,
+                                endAdornment: (
+                                  <InputAdornment position="end">
+                                    <Button onClick={() => handleSelectPath('media_path')}>
+                                      选择
+                                    </Button>
+                                  </InputAdornment>
+                                ),
+                              }}
+                            />
+                          </Grid>
                           <Grid size={{ xs: 12 }}>
                             <TextField
                               fullWidth

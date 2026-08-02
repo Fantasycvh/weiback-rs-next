@@ -49,7 +49,8 @@
 ## 6. 发布校验
 
 - 打包时校验 Sidecar 版本与协议版本一致（`ready.sidecar_version` + `protocol_version`）。
-- 正式发布加入 Sidecar 文件哈希或签名检查；开发/调试构建例外须显式标注。
+- `scripts/verify-release.ps1` 对发布目录生成 SHA-256 清单，并验证 MSI/NSIS 中 Sidecar 与发布 Sidecar 同哈希。
+- 正式发布模式要求主 EXE、Sidecar、MSI、NSIS 的 Authenticode 状态均为 `Valid`，且证书指纹或主题必须匹配 `scripts/release-identity.json` 的批准 signer 策略；候选模式允许 unsigned，但报告必须明确记录且不得用于正式 Release。
 - 任何 debug 日志在合并前必须经本规则审计；发现认证秘密即阻塞发布。
 
 ## 7. 检查清单（提交前）

@@ -966,6 +966,9 @@ mod local_tests {
             reverse_order: false,
             page: 1,
             posts_per_page: 1_000_000_000,
+            content_type: None,
+            content_status: None,
+            source: None,
         };
         let paginated_posts = storage.query_posts(query).await.unwrap();
         let fetched_posts = paginated_posts.posts;
@@ -1012,6 +1015,9 @@ mod local_tests {
             reverse_order: false,
             page: 1,
             posts_per_page: 1_000_000,
+            content_type: None,
+            content_status: None,
+            source: None,
         };
         let fetched_posts = storage.query_posts(query.clone()).await.unwrap();
         assert_eq!(fetched_posts.posts.len(), ids.len());
@@ -1054,6 +1060,9 @@ mod local_tests {
             reverse_order: false,
             page: 1,
             posts_per_page: ones_post_ids.len() as u32,
+            content_type: None,
+            content_status: None,
+            source: None,
         };
         let fetched_posts = storage.query_posts(query.clone()).await.unwrap();
         assert_eq!(fetched_posts.posts.len(), ones_post_ids.len());
@@ -1088,6 +1097,9 @@ mod local_tests {
             reverse_order: false,
             page: 1,
             posts_per_page: 2,
+            content_type: None,
+            content_status: None,
+            source: None,
         };
         let paginated_posts = storage.query_posts(query).await.unwrap();
         assert_eq!(paginated_posts.total_items, favorited.len() as u64);

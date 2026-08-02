@@ -11,6 +11,8 @@ const Settings = React.lazy(() => import('./views/Settings'))
 const User = React.lazy(() => import('./views/User'))
 const DataManage = React.lazy(() => import('./views/DataManage'))
 const About = React.lazy(() => import('./views/About'))
+const SyncCenter = React.lazy(() => import('./views/SyncCenter'))
+const PostDetail = React.lazy(() => import('./views/PostDetail'))
 
 const AppRouter: React.FC = () => (
   <Suspense
@@ -31,6 +33,8 @@ const AppRouter: React.FC = () => (
       <Route path="/" element={<Navigate to="/online-backup" replace />} />
       <Route path="/online-backup" element={<OnlineBackup />} />
       <Route path="/explorer" element={<ContentExplorer />} />
+      <Route path="/posts/:id" element={<PostDetail />} />
+      <Route path="/sync" element={<SyncCenter />} />
       <Route path="/manage" element={<DataManage />} />
       <Route path="/settings" element={<Settings />} />
       <Route path="/user" element={<User />} />

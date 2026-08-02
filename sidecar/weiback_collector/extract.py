@@ -15,6 +15,7 @@ import html
 import json
 import re
 from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qsl, urlsplit
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 
@@ -26,6 +27,23 @@ _WEIBO_CREATED_AT_FORMATS = (
 )
 
 TZ_CST = timezone(timedelta(hours=8))
+
+_I64_MAX = 9_223_372_036_854_775_807
+_SENSITIVE_URL_KEYS = {
+    "access_token",
+    "auth",
+    "cookie",
+    "gsid",
+    "passport",
+    "session",
+    "sub",
+    "token",
+    "xsrf",
+}
+_SENSITIVE_URL_KEY_PARTS = (
+    "auth", "cookie", "credential", "gsid", "passport", "password", "secret",
+    "session", "signature", "token", "xsrf",
+)
 
 
 def clean_html_text(value) -> str | None:
@@ -86,6 +104,43 @@ def _as_str(value) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _owner_id(value) -> str | None:
+    """返回 Rust i64 可安全解析的规范十进制所有者 ID。"""
+    if isinstance(value, bool):
+        return None
+    text = str(value) if isinstance(value, (int, str)) else ""
+    if not re.fullmatch(r"0|[1-9][0-9]*", text):
+        return None
+    return text if int(text) <= _I64_MAX else None
+
+
+def _safe_media_url(value) -> str | None:
+    """只接受不携带认证信息或敏感查询参数的 HTTPS URL。"""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = urlsplit(value)
+        query_keys = {
+            key.lower() for key, _value in parse_qsl(parsed.query, keep_blank_values=True)
+        }
+    except ValueError:
+        return None
+    if parsed.scheme != "https" or not parsed.netloc:
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    if parsed.fragment or any(_is_sensitive_url_key(key) for key in query_keys):
+        return None
+    return value
+
+
+def _is_sensitive_url_key(key: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", key.lower())
+    return key.lower() in _SENSITIVE_URL_KEYS or any(
+        part in normalized for part in _SENSITIVE_URL_KEY_PARTS
+    )
 
 
 # -- 用户 ----------------------------------------------------------------
@@ -289,35 +344,60 @@ def unpack_child_comment_page(response: dict) -> tuple[list[dict], str, int]:
 
 # -- 媒体引用 ------------------------------------------------------------
 
+def media_reference_from_user(user_dto: dict) -> dict | None:
+    """为用户头像选择一个最佳安全 URL：HD → large → profile。"""
+    owner_id = _owner_id(user_dto.get("id"))
+    if owner_id is None:
+        return None
+    for field, definition in (
+        ("avatar_hd", "original"),
+        ("avatar_large", "large"),
+        ("profile_image_url", "bmiddle"),
+    ):
+        url = _safe_media_url(user_dto.get(field))
+        if url is not None:
+            return {
+                "owner_type": "user",
+                "owner_id": owner_id,
+                "post_id": None,
+                "user_id": owner_id,
+                "media_type": "avatar",
+                "url": url,
+                "definition": definition,
+            }
+    return None
+
 def media_references_from_post(post_dto: dict, raw: dict) -> list[dict]:
     """从帖子提取图片/视频 media_reference DTO（对齐 dtos.media_reference_dto）。
 
     从 `pic_infos` 遍历图片 URL；有 `video_url` 时额外产出 video 引用。
     """
     refs: list[dict] = []
-    owner_id = post_dto.get("id")
+    owner_id = _owner_id(post_dto.get("id"))
     if owner_id is None:
         return refs
 
+    user_id = _owner_id(post_dto.get("uid"))
+
     pic_infos = post_dto.get("pic_infos")
     if isinstance(pic_infos, dict):
-        for url in _collect_pic_urls(pic_infos):
+        for url, definition in _best_pic_urls(pic_infos):
             refs.append({
                 "owner_type": "post",
                 "owner_id": owner_id,
                 "post_id": owner_id,
-                "user_id": post_dto.get("uid"),
+                "user_id": user_id,
                 "media_type": "picture",
                 "url": url,
-                "definition": _pic_definition_for(pic_infos, url),
+                "definition": definition,
             })
-    video_url = post_dto.get("video_url")
-    if video_url:
+    video_url = _safe_media_url(post_dto.get("video_url"))
+    if video_url is not None:
         refs.append({
             "owner_type": "post",
             "owner_id": owner_id,
             "post_id": owner_id,
-            "user_id": post_dto.get("uid"),
+            "user_id": user_id,
             "media_type": "video",
             "url": video_url,
             "definition": None,
@@ -327,47 +407,34 @@ def media_references_from_post(post_dto: dict, raw: dict) -> list[dict]:
 
 def media_reference_from_comment(comment_dto: dict) -> dict | None:
     """从评论提取图片 media_reference DTO；无图时返回 None。"""
-    url = comment_dto.get("pic_url")
-    if not url:
+    owner_id = _owner_id(comment_dto.get("id"))
+    url = _safe_media_url(comment_dto.get("pic_url"))
+    if owner_id is None or url is None:
         return None
     return {
         "owner_type": "comment",
-        "owner_id": comment_dto["id"],
-        "post_id": comment_dto.get("post_id"),
-        "user_id": comment_dto.get("user_id"),
+        "owner_id": owner_id,
+        "post_id": _owner_id(comment_dto.get("post_id")),
+        "user_id": _owner_id(comment_dto.get("user_id")),
         "media_type": "picture",
         "url": url,
         "definition": None,
     }
 
 
-def _collect_pic_urls(pic_infos: dict) -> list[str]:
-    urls: list[str] = []
-    seen: set[str] = set()
+def _best_pic_urls(pic_infos: dict) -> list[tuple[str, str]]:
+    refs: list[tuple[str, str]] = []
     for info in pic_infos.values():
         if not isinstance(info, dict):
             continue
-        for candidate in (
-            (info.get("original_pic") or {}).get("url"),
-            (info.get("bmiddle_pic") or {}).get("url"),
-            (info.get("large_pic") or {}).get("url"),
+        for field, definition in (
+            ("original_pic", "original"),
+            ("large_pic", "large"),
+            ("bmiddle_pic", "bmiddle"),
         ):
-            if isinstance(candidate, str) and candidate and candidate not in seen:
-                seen.add(candidate)
-                urls.append(candidate)
-    return urls
-
-
-def _pic_definition_for(pic_infos: dict, url: str) -> str | None:
-    for info in pic_infos.values():
-        if not isinstance(info, dict):
-            continue
-        for definition in (
-            "original_pic",
-            "bmiddle_pic",
-            "large_pic",
-        ):
-            pic = info.get(definition)
-            if isinstance(pic, dict) and pic.get("url") == url:
-                return definition
-    return None
+            pic = info.get(field)
+            url = _safe_media_url(pic.get("url") if isinstance(pic, dict) else None)
+            if url is not None:
+                refs.append((url, definition))
+                break
+    return refs

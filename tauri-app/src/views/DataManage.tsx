@@ -1,4 +1,5 @@
-import React, { useState } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
+import { open } from '@tauri-apps/plugin-dialog'
 import {
   Box,
   Typography,
@@ -22,7 +23,15 @@ import {
   cleanupOutdatedAvatars,
   cleanupInvalidPosts,
   cleanupInvalidPictures,
+  inspectLegacySource,
+  createUserBackup,
+  listUserBackups,
+  restoreUserBackup,
+  UserBackup,
+  verifyUserBackup,
 } from '../lib/api'
+import LegacyImportDialog from '../components/LegacyImportDialog'
+import { LegacyDetection } from '../types/legacy'
 
 const DataManage: React.FC = () => {
   const { enqueueSnackbar } = useSnackbar()
@@ -31,6 +40,103 @@ const DataManage: React.FC = () => {
 
   const [policy, setPolicy] = useState<ResolutionPolicy>(ResolutionPolicy.Highest)
   const [cleanRetweetedInvalid, setCleanRetweetedInvalid] = useState(false)
+  const [legacyDetection, setLegacyDetection] = useState<LegacyDetection | null>(null)
+  const [legacyDialogOpen, setLegacyDialogOpen] = useState(false)
+  const [selectingLegacyFile, setSelectingLegacyFile] = useState(false)
+  const [userBackups, setUserBackups] = useState<UserBackup[]>([])
+  const [backupBusy, setBackupBusy] = useState(false)
+  const legacyDetections = useMemo(
+    () => (legacyDetection ? [legacyDetection] : []),
+    [legacyDetection]
+  )
+
+  const refreshUserBackups = async () => {
+    try {
+      setUserBackups(await listUserBackups())
+    } catch {
+      enqueueSnackbar('无法读取用户数据备份列表', { variant: 'error' })
+    }
+  }
+
+  useEffect(() => {
+    void listUserBackups()
+      .then(setUserBackups)
+      .catch(() => enqueueSnackbar('无法读取用户数据备份列表', { variant: 'error' }))
+  }, [enqueueSnackbar])
+
+  const handleCreateUserBackup = async () => {
+    setBackupBusy(true)
+    try {
+      const backup = await createUserBackup()
+      await refreshUserBackups()
+      enqueueSnackbar(`已创建备份，包含 ${backup.file_count} 个文件`, { variant: 'success' })
+    } catch {
+      enqueueSnackbar('创建用户数据备份失败', { variant: 'error' })
+    } finally {
+      setBackupBusy(false)
+    }
+  }
+
+  const handleVerifyUserBackup = async (backup: UserBackup) => {
+    setBackupBusy(true)
+    try {
+      await verifyUserBackup(backup.id)
+      enqueueSnackbar('备份校验通过', { variant: 'success' })
+    } catch {
+      enqueueSnackbar('备份校验失败，已拒绝恢复且当前数据未改变', { variant: 'error' })
+    } finally {
+      setBackupBusy(false)
+    }
+  }
+
+  const handleRestoreUserBackup = async (backup: UserBackup) => {
+    if (!window.confirm('恢复将替换当前数据库和媒体文件。系统会先创建回滚快照，确认继续吗？')) return
+    setBackupBusy(true)
+    try {
+      const result = await restoreUserBackup(backup.id)
+      enqueueSnackbar(
+        result.rollback_created
+          ? '恢复完成，已创建回滚快照。应用即将退出并可重新启动。'
+          : '恢复完成。应用即将退出并可重新启动。',
+        { variant: 'warning', persist: true }
+      )
+    } catch (error) {
+      const message = error instanceof Error ? error.message : ''
+      enqueueSnackbar(
+        message.includes('Restore blocked')
+          ? '恢复被拒绝：请先取消并等待当前任务结束。'
+          : message.includes('live data connection closed')
+            ? '恢复未完成，应用已停止访问当前数据。请手动重新启动后再检查数据。'
+          : '恢复失败，当前数据未被替换。',
+        { variant: 'error', persist: message.includes('live data connection closed') }
+      )
+    } finally {
+      setBackupBusy(false)
+    }
+  }
+
+  const handleSelectLegacySnapshot = async () => {
+    setSelectingLegacyFile(true)
+    try {
+      const selected = await open({
+        multiple: false,
+        title: '选择旧版 Weiback 快照',
+        filters: [{ name: 'WeiBack 数据库', extensions: ['db'] }],
+      })
+      if (typeof selected !== 'string') return
+      if (selected.split(/[\\/]/).pop()?.toLowerCase() !== 'weiback.db') {
+        enqueueSnackbar('仅可选择名为 weiback.db 的旧版快照', { variant: 'warning' })
+        return
+      }
+      const inspected = await inspectLegacySource(selected)
+      setLegacyDetection(inspected)
+      setLegacyDialogOpen(true)
+    } catch {
+      enqueueSnackbar('无法识别该旧版快照', { variant: 'error' })
+    } finally {
+      setSelectingLegacyFile(false)
+    }
+  }
 
   const handleCleanup = async () => {
     try {
@@ -79,6 +185,69 @@ const DataManage: React.FC = () => {
       </Typography>
 
       <Grid container spacing={3}>
+        <Grid size={{ xs: 12, md: 6 }}>
+          <Card>
+            <CardContent>
+              <Typography variant="h6" gutterBottom>
+                用户数据备份与恢复
+              </Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                创建 SQLite 一致性快照和已下载、仍被数据库引用的媒体文件。不会备份登录会话。
+              </Typography>
+              <Alert severity="warning" sx={{ mb: 2 }}>
+                恢复会先校验清单与文件哈希，并创建当前数据的回滚快照。恢复成功后必须重新启动应用。
+              </Alert>
+              <Button
+                variant="contained"
+                fullWidth
+                onClick={() => void handleCreateUserBackup()}
+                disabled={isTaskRunning || backupBusy}
+                sx={{ mb: 2 }}
+              >
+                {backupBusy ? '处理中...' : '创建用户数据备份'}
+              </Button>
+              {userBackups.map(backup => (
+                <Box key={backup.id} sx={{ mb: 1 }}>
+                  <Typography variant="caption" display="block">
+                    {new Date(backup.created_at).toLocaleString()}，{backup.file_count} 个文件
+                  </Typography>
+                  <Button size="small" onClick={() => void handleVerifyUserBackup(backup)} disabled={backupBusy}>
+                    校验
+                  </Button>
+                  <Button size="small" color="warning" onClick={() => void handleRestoreUserBackup(backup)} disabled={backupBusy}>
+                    恢复
+                  </Button>
+                </Box>
+              ))}
+            </CardContent>
+          </Card>
+        </Grid>
+
+        <Grid size={{ xs: 12, md: 6 }}>
+          <Card>
+            <CardContent>
+              <Typography variant="h6" gutterBottom>
+                旧版快照导入
+              </Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                从旧版 Weiback 的 `weiback.db`
+                创建一次性只读导入。导入前会进行兼容性检测，原快照不会被修改。
+              </Typography>
+              <Alert severity="info" sx={{ mb: 2 }}>
+                导入会创建回滚备份；若出现部分恢复，已导入内容可保留，待下载媒体会标记为待恢复。
+              </Alert>
+              <Button
+                variant="contained"
+                fullWidth
+                onClick={() => void handleSelectLegacySnapshot()}
+                disabled={isTaskRunning || selectingLegacyFile}
+              >
+                {selectingLegacyFile ? '正在选择并检测...' : '选择 weiback.db 并导入'}
+              </Button>
+            </CardContent>
+          </Card>
+        </Grid>
+
         <Grid size={{ xs: 12, md: 6 }}>
           <Card>
             <CardContent>
@@ -240,6 +409,17 @@ const DataManage: React.FC = () => {
           </Card>
         </Grid>
       </Grid>
+      <LegacyImportDialog
+        open={legacyDialogOpen}
+        detections={legacyDetections}
+        onCancel={() => setLegacyDialogOpen(false)}
+        onCompleted={() => {
+          setLegacyDialogOpen(false)
+          setLegacyDetection(null)
+          void fetchCurrentTask()
+          enqueueSnackbar('旧版快照导入结果已更新', { variant: 'success' })
+        }}
+      />
     </Box>
   )
 }

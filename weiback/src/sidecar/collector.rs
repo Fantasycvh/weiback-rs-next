@@ -27,8 +27,8 @@ use crate::sidecar::protocol::{CommandEnvelope, CommandType, EventType, new_uuid
 use crate::sidecar::supervisor::{Sidecar, SidecarError};
 use crate::storage::internal::entities::transactional::CommitPlan;
 use crate::storage::internal::entities::{
-    CheckpointOwner, CommentDto, MediaDto, SyncCheckpointDto, get_sync_checkpoint, get_sync_job,
-    heartbeat_sync_run_at,
+    CheckpointOwner, CommentDto, MediaReferenceDto, SyncCheckpointDto, get_sync_checkpoint,
+    get_sync_job, heartbeat_sync_run_at,
 };
 use crate::storage::internal::post::PostInternal;
 
@@ -472,12 +472,7 @@ async fn run_collection_with_execution(
                 } else {
                     CollectionStatus::Failed
                 };
-                let message = event
-                    .payload
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                summary.error = Some(format!("{code}: {message}"));
+                summary.error = Some(code.to_string());
                 done = true;
             }
             EventType::AuthRequired => {
@@ -485,9 +480,9 @@ async fn run_collection_with_execution(
                 summary.error = Some(
                     event
                         .payload
-                        .get("message")
+                        .get("code")
                         .and_then(Value::as_str)
-                        .unwrap_or("auth required")
+                        .unwrap_or("AUTH_REQUIRED")
                         .to_string(),
                 );
                 done = true;
@@ -766,24 +761,78 @@ fn comment_from_payload(payload: &Value) -> Result<CommentDto> {
 }
 
 /// 解析 `media_reference` 事件 payload 为 `MediaDto`。
-fn media_from_payload(payload: &Value) -> Result<MediaDto> {
+fn media_from_payload(payload: &Value) -> Result<MediaReferenceDto> {
     let url = get_str(payload, "url")
         .ok_or_else(|| Error::FormatError("media_reference.url missing".to_string()))?;
-    Ok(MediaDto {
-        id: 0,
+    validate_media_reference_url(url)?;
+    Ok(MediaReferenceDto {
         owner_type: get_str(payload, "owner_type").unwrap_or("post").to_string(),
         owner_id: get_i64(payload, "owner_id"),
         media_type: get_str(payload, "media_type")
             .unwrap_or("picture")
             .to_string(),
         url: url.to_string(),
-        local_path: None,
-        status: "pending".to_string(),
-        retry_count: 0,
-        last_error: None,
         created_at: now(),
-        updated_at: None,
+        definition: get_str(payload, "definition").map(str::to_string),
     })
+}
+
+fn validate_media_reference_url(raw_url: &str) -> Result<()> {
+    let url = url::Url::parse(raw_url)
+        .map_err(|_| Error::FormatError("media_reference.url is invalid".to_string()))?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(Error::FormatError(
+            "media_reference.url is unsafe".to_string(),
+        ));
+    }
+    for (key, _) in url.query_pairs() {
+        let normalized = key
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if matches!(
+            normalized.as_str(),
+            "accesstoken"
+                | "auth"
+                | "authorization"
+                | "cookie"
+                | "credential"
+                | "gsid"
+                | "passport"
+                | "password"
+                | "secret"
+                | "session"
+                | "sub"
+                | "token"
+                | "xsrf"
+        ) || [
+            "auth",
+            "cookie",
+            "credential",
+            "gsid",
+            "passport",
+            "password",
+            "secret",
+            "session",
+            "signature",
+            "token",
+            "xsrf",
+        ]
+        .iter()
+        .any(|needle| normalized.contains(needle))
+        {
+            return Err(Error::FormatError(
+                "media_reference.url contains sensitive credentials".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// 当前批次累积的数据，checkpoint 到达时同事务提交。
@@ -792,7 +841,7 @@ struct PendingBatch {
     users: Vec<User>,
     posts: Vec<PostInternal>,
     comments: Vec<CommentDto>,
-    media: Vec<MediaDto>,
+    media: Vec<MediaReferenceDto>,
 }
 
 impl PendingBatch {
@@ -960,12 +1009,30 @@ mod tests {
             "owner_type": "post",
             "owner_id": "9001",
             "media_type": "picture",
-            "url": "https://wx1.example.com/a.jpg"
+            "url": "https://wx1.example.com/a.jpg",
+            "definition": "original"
         }))
         .unwrap();
         assert_eq!(media.url, "https://wx1.example.com/a.jpg");
-        assert_eq!(media.status, "pending");
         assert_eq!(media.owner_id, Some(9001));
+        assert_eq!(media.definition.as_deref(), Some("original"));
+
+        for unsafe_url in [
+            "https://wx1.example.com/a.jpg?access-token=secret",
+            "https://wx1.example.com/a.jpg?x-signature=secret",
+            "https://wx1.example.com/a.jpg#token=secret",
+            "http://wx1.example.com/a.jpg",
+        ] {
+            assert!(
+                media_from_payload(&json!({
+                    "owner_type": "post",
+                    "owner_id": "9001",
+                    "media_type": "picture",
+                    "url": unsafe_url,
+                }))
+                .is_err()
+            );
+        }
     }
 
     #[test]

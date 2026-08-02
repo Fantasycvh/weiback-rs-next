@@ -16,6 +16,7 @@ pub mod html_generator;
 pub mod image_validator;
 pub mod legacy;
 pub mod media_downloader;
+pub mod media_pipeline;
 pub mod message;
 pub mod models;
 pub mod rate_limit;
@@ -24,6 +25,7 @@ pub mod sidecar;
 mod sqlite_write;
 pub mod storage;
 pub mod sync_executor;
+pub mod user_backup;
 pub mod utils;
 
 #[cfg(test)]

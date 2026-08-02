@@ -73,6 +73,54 @@ class ExtractUserTest(unittest.TestCase):
         dto = extract.extract_user(None)
         self.assertIsNone(dto["id"])
 
+    def test_user_avatar_reference_uses_one_best_url(self):
+        dto = extract.extract_user(raw_user())
+        ref = extract.media_reference_from_user(dto)
+        self.assertIsNotNone(ref)
+        assert ref is not None
+        self.assertEqual(ref["owner_type"], "user")
+        self.assertEqual(ref["owner_id"], "1234567890")
+        self.assertEqual(ref["media_type"], "avatar")
+        self.assertEqual(ref["url"], "https://tva1.sinaimg.cn/hd.jpg")
+
+    def test_user_avatar_reference_skips_sensitive_url(self):
+        dto = extract.extract_user(raw_user(
+            avatar_hd="https://x/hd.jpg?token=secret",
+            avatar_large="https://x/large.jpg",
+        ))
+        ref = extract.media_reference_from_user(dto)
+        self.assertIsNotNone(ref)
+        assert ref is not None
+        self.assertEqual(ref["url"], "https://x/large.jpg")
+
+    def test_user_avatar_reference_skips_fuzzy_credentials_and_fragment(self):
+        for url in (
+            "https://x/avatar.jpg?access-token=secret",
+            "https://x/avatar.jpg?session_id=secret",
+            "https://x/avatar.jpg?x-signature=secret",
+            "https://x/avatar.jpg#credential",
+            "https://x/avatar.jpg?token=",
+        ):
+            with self.subTest(url=url):
+                dto = extract.extract_user(raw_user(
+                    avatar_hd=url,
+                    avatar_large="https://x/large.jpg",
+                ))
+                ref = extract.media_reference_from_user(dto)
+                self.assertIsNotNone(ref)
+                assert ref is not None
+                self.assertEqual(ref["url"], "https://x/large.jpg")
+
+    def test_user_avatar_reference_skips_http_and_uses_https_fallback(self):
+        dto = extract.extract_user(raw_user(
+            avatar_hd="http://x/hd.jpg",
+            avatar_large="https://x/large.jpg",
+        ))
+        ref = extract.media_reference_from_user(dto)
+        self.assertIsNotNone(ref)
+        assert ref is not None
+        self.assertEqual(ref["url"], "https://x/large.jpg")
+
 
 class ExtractPostTest(unittest.TestCase):
     def test_full_post(self):
@@ -260,10 +308,10 @@ class MediaReferenceTest(unittest.TestCase):
         self.assertEqual(ref["owner_type"], "post")
         self.assertEqual(ref["owner_id"], "4876543210987654321")
         self.assertEqual(ref["post_id"], "4876543210987654321")
-        self.assertEqual(ref["user_id"], 1234567890)
+        self.assertEqual(ref["user_id"], "1234567890")
         self.assertEqual(ref["media_type"], "picture")
         self.assertEqual(ref["url"], "https://wx1.sinaimg.cn/orj360/original.jpg")
-        self.assertEqual(ref["definition"], "original_pic")
+        self.assertEqual(ref["definition"], "original")
 
     def test_post_video_reference(self):
         post = raw_post(video_url="https://video.weibo.com/x.mp4")
@@ -274,9 +322,35 @@ class MediaReferenceTest(unittest.TestCase):
         self.assertEqual(len(video), 1)
         self.assertEqual(video[0]["url"], "https://video.weibo.com/x.mp4")
 
+    def test_post_media_reference_skips_http_url(self):
+        post = raw_post(video_url="http://video.weibo.com/x.mp4")
+        dto = extract.extract_post(post, "1234567890")
+        refs = extract.media_references_from_post(dto, post)
+        self.assertFalse(any(ref["media_type"] == "video" for ref in refs))
+
+    def test_post_picture_reference_selects_one_url_per_picture(self):
+        post = raw_post(pic_infos={
+            "p1": {
+                "original_pic": {"url": "https://x/original.jpg"},
+                "large_pic": {"url": "https://x/large.jpg"},
+                "bmiddle_pic": {"url": "https://x/bmiddle.jpg"},
+            },
+            "p2": {
+                "large_pic": {"url": "https://x/large-2.jpg"},
+                "bmiddle_pic": {"url": "https://x/bmiddle-2.jpg"},
+            },
+        })
+        dto = extract.extract_post(post, "1234567890")
+        refs = [r for r in extract.media_references_from_post(dto, post)
+                if r["media_type"] == "picture"]
+        self.assertEqual([r["url"] for r in refs], [
+            "https://x/original.jpg", "https://x/large-2.jpg"
+        ])
+        self.assertEqual([r["definition"] for r in refs], ["original", "large"])
+
     def test_comment_media_reference(self):
         comment = {
-            "id": "c1",
+            "id": "100000000000000001",
             "text": "带图",
             "pic": {"large": {"url": "https://wx1.sinaimg.cn/comment_pic.jpg"}},
         }
@@ -285,12 +359,17 @@ class MediaReferenceTest(unittest.TestCase):
         self.assertIsNotNone(ref)
         assert ref is not None
         self.assertEqual(ref["owner_type"], "comment")
-        self.assertEqual(ref["owner_id"], "c1")
+        self.assertEqual(ref["owner_id"], "100000000000000001")
         self.assertEqual(ref["media_type"], "picture")
         self.assertEqual(ref["url"], "https://wx1.sinaimg.cn/comment_pic.jpg")
 
     def test_comment_without_pic_no_reference(self):
         comment = {"id": "c2", "text": "无图"}
+        dto = extract.extract_comment(comment, "5550000000000000100")
+        self.assertIsNone(extract.media_reference_from_comment(dto))
+
+    def test_comment_media_reference_requires_decimal_owner_id(self):
+        comment = {"id": "c2", "pic": {"large": {"url": "https://x/p.jpg"}}}
         dto = extract.extract_comment(comment, "5550000000000000100")
         self.assertIsNone(extract.media_reference_from_comment(dto))
 

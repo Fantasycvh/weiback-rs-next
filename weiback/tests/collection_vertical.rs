@@ -147,11 +147,21 @@ async fn collect_posts_commits_all_batches() {
     assert_eq!(users, 1);
 
     // 媒体引用落库（picture）。
-    let media: i64 = query_scalar("SELECT COUNT(*) FROM media")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let media: i64 = query_scalar(
+        "SELECT COUNT(*) FROM media WHERE url='https://wx1.sinaimg.cn/orj360/original.jpg'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(media, 1);
+    let definition: String = query_scalar(
+        "SELECT definition FROM media_references r JOIN media m ON m.id=r.media_id \
+         WHERE m.url='https://wx1.sinaimg.cn/orj360/original.jpg'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(definition, "original");
 
     // checkpoint 落库。
     let cp = get_sync_checkpoint(&pool, "user:1234567890:posts")

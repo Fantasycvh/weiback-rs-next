@@ -1,8 +1,11 @@
 mod error;
 
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use serde::{Deserialize, Serialize};
@@ -21,7 +24,8 @@ use weiback::core::{
 use weiback::media_downloader::{DownloaderStatus, MediaDownloaderStatusListener};
 use weiback::models::User;
 use weiback::storage::internal::entities::{
-    AccountDto, MonitoredUserDto, RefreshTier, SyncJobDto, SyncJobSpec, SyncRunDto,
+    AccountDto, MonitoredUserDto, OwnerMediaWire, RefreshTier, SyncJobDto, SyncJobSpec, SyncRunDto,
+    owner_media_wire,
 };
 use weiback::sync_executor::ControlStopResult;
 
@@ -32,6 +36,13 @@ const MIN_SYNC_PRIORITY: i32 = 0;
 const MAX_SYNC_PRIORITY: i32 = 1_000;
 const MAX_REFRESH_INTERVAL_SECS: i64 = 7 * 24 * 60 * 60;
 const MAX_REFRESH_JITTER_SECS: i64 = MAX_REFRESH_INTERVAL_SECS;
+const MAX_QUERY_SOURCE_LEN: usize = 128;
+const INVALID_LEGACY_INPUT: &str = "Invalid legacy import source";
+const LEGACY_IMPORT_FAILED: &str = "Legacy import failed; see the application log";
+const USER_BACKUP_FAILED: &str = "User data backup operation failed; see the application log";
+const USER_RESTORE_ACTIVE_TASK: &str = "Restore blocked: an ordinary task is still active";
+const USER_RESTORE_RESTART_REQUIRED: &str =
+    "Restore failed after the live data connection closed; restart the application";
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(tag = "status")]
@@ -87,6 +98,12 @@ impl From<WeiboId> for i64 {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct MediaBlobWire {
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct AccountWireDto {
     pub id: String,
     pub provider: String,
@@ -109,6 +126,21 @@ impl From<AccountDto> for AccountWireDto {
             has_session: !account.session_ref.is_empty(),
             created_at: account.created_at,
             updated_at: account.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UserSearchWireDto {
+    pub id: String,
+    pub screen_name: String,
+}
+
+impl From<User> for UserSearchWireDto {
+    fn from(user: User) -> Self {
+        Self {
+            id: user.id.to_string(),
+            screen_name: user.screen_name,
         }
     }
 }
@@ -334,6 +366,22 @@ fn sync_core_error(operation: &'static str, error: impl std::fmt::Display) -> Er
     stable_sync_error(SYNC_OPERATION_FAILED)
 }
 
+fn sms_auth_error(stage: &'static str) -> Error {
+    error!(stage, "SMS authentication failed");
+    stable_sync_error(SYNC_OPERATION_FAILED)
+}
+
+fn valid_phone_number(value: &str) -> bool {
+    (6..=32).contains(&value.len())
+        && value.chars().enumerate().all(|(index, character)| {
+            character.is_ascii_digit() || (index == 0 && character == '+')
+        })
+}
+
+fn valid_sms_code(value: &str) -> bool {
+    (4..=12).contains(&value.len()) && value.chars().all(|character| character.is_ascii_digit())
+}
+
 fn validate_session_ref(session_ref: &str) -> Result<()> {
     if session_ref.is_empty()
         || session_ref.contains('\0')
@@ -437,6 +485,26 @@ fn sync_control_wire(outcome: SyncJobControlOutcome) -> SyncJobControlWireOutcom
     }
 }
 
+fn validated_legacy_source(raw: &str) -> Result<PathBuf> {
+    let path = Path::new(raw);
+    if !path.is_absolute() || path.file_name().and_then(|name| name.to_str()) != Some("weiback.db")
+    {
+        return Err(stable_sync_error(INVALID_LEGACY_INPUT));
+    }
+    let source = path
+        .canonicalize()
+        .map_err(|_| stable_sync_error(INVALID_LEGACY_INPUT))?;
+    let root = source
+        .parent()
+        .ok_or_else(|| stable_sync_error(INVALID_LEGACY_INPUT))?
+        .canonicalize()
+        .map_err(|_| stable_sync_error(INVALID_LEGACY_INPUT))?;
+    if !source.is_file() || !source.starts_with(&root) {
+        return Err(stable_sync_error(INVALID_LEGACY_INPUT));
+    }
+    Ok(source)
+}
+
 #[tauri::command]
 async fn get_backend_status(state: State<'_, BackendState>) -> Result<BackendStatus> {
     Ok(state.status.lock().unwrap().clone())
@@ -459,14 +527,10 @@ async fn perform_init_backend(app_handle: &AppHandle, state: &BackendState) -> B
     }
 
     match CoreBuilder::new().build() {
-        Ok((core, mut worker)) => {
-            let listener = Box::new(TauriTaskEventListener {
+        Ok(core) => {
+            core.set_legacy_media_downloader_status_listener(Box::new(TauriTaskEventListener {
                 app_handle: app_handle.clone(),
-            });
-            worker.set_status_listener(listener);
-
-            // Spawn the downloader worker
-            tauri::async_runtime::spawn(async move { worker.run().await });
+            }));
 
             if let Err(e) = core.set_task_event_listener(Box::new(TauriTaskEventListener {
                 app_handle: app_handle.clone(),
@@ -873,20 +937,210 @@ async fn query_local_posts(
     core: State<'_, Arc<Core>>,
     query: PostQuery,
 ) -> Result<PaginatedPostInfo> {
+    validate_post_query(&query)?;
     info!("query_local_posts called with query: {query:?}");
-    Ok(core.query_posts(query).await?)
+    core.query_posts(query)
+        .await
+        .map_err(|error| sync_core_error("query_local_posts", error))
+}
+
+fn validate_post_query(query: &PostQuery) -> Result<()> {
+    if query.page == 0 || query.posts_per_page == 0 || query.posts_per_page > 100 {
+        return Err(stable_sync_error(INVALID_SYNC_INPUT));
+    }
+    if query.user_id.is_some_and(|id| id <= 0) {
+        return Err(stable_sync_error(INVALID_SYNC_INPUT));
+    }
+    if query
+        .start_date
+        .zip(query.end_date)
+        .is_some_and(|(start, end)| start > end)
+    {
+        return Err(stable_sync_error(INVALID_SYNC_INPUT));
+    }
+    if query.search_term.as_ref().is_some_and(|term| {
+        let value = match term {
+            weiback::core::task::SearchTerm::Fuzzy(value)
+            | weiback::core::task::SearchTerm::Strict(value) => value,
+        };
+        value.is_empty() || value.len() > 256 || value.contains('\0')
+    }) {
+        return Err(stable_sync_error(INVALID_SYNC_INPUT));
+    }
+    if let Some(value) = query.content_type.as_deref()
+        && !matches!(value, "all" | "picture" | "video" | "text")
+    {
+        return Err(stable_sync_error(INVALID_SYNC_INPUT));
+    }
+    if let Some(value) = query.content_status.as_deref()
+        && !matches!(value, "all" | "complete" | "partial" | "failed")
+    {
+        return Err(stable_sync_error(INVALID_SYNC_INPUT));
+    }
+    if query.source.as_deref().is_some_and(|value| {
+        value.is_empty() || value.len() > MAX_QUERY_SOURCE_LEN || value.contains('\0')
+    }) {
+        return Err(stable_sync_error(INVALID_SYNC_INPUT));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_post_detail(
+    core: State<'_, Arc<Core>>,
+    id: WeiboId,
+) -> Result<Option<weiback::core::task::PostInfo>> {
+    if id.0 <= 0 {
+        return Err(stable_sync_error(INVALID_SYNC_INPUT));
+    }
+    core.get_post_detail(id.0)
+        .await
+        .map_err(|error| sync_core_error("get_post_detail", error))
+}
+
+#[tauri::command]
+async fn get_post_comments(
+    core: State<'_, Arc<Core>>,
+    post_id: WeiboId,
+    root_id: Option<WeiboId>,
+    offset: u32,
+    limit: u32,
+) -> Result<weiback::core::task::PaginatedCommentWire> {
+    if post_id.0 <= 0 || root_id.is_some_and(|id| id.0 <= 0) || !(1..=100).contains(&limit) {
+        return Err(stable_sync_error(INVALID_SYNC_INPUT));
+    }
+    core.get_post_comments(post_id.0, root_id.map(|id| id.0), offset, limit)
+        .await
+        .map_err(|error| sync_core_error("get_post_comments", error))
+}
+
+#[tauri::command]
+async fn get_owner_media(
+    core: State<'_, Arc<Core>>,
+    owner_type: String,
+    owner_id: WeiboId,
+) -> Result<Vec<OwnerMediaWire>> {
+    if !matches!(owner_type.as_str(), "post" | "user" | "comment")
+        || owner_id.0 <= 0
+        || owner_type.len() > 16
+    {
+        return Err(stable_sync_error(INVALID_SYNC_INPUT));
+    }
+    let root = get_config()
+        .read()
+        .map_err(|error| Error(error.to_string()))?
+        .media_path
+        .clone();
+    core.get_owner_media(&owner_type, Some(owner_id.0))
+        .await
+        .map(|media| {
+            media
+                .into_iter()
+                .map(|item| owner_media_wire(item, &root))
+                .collect()
+        })
+        .map_err(|error| sync_core_error("get_owner_media", error))
+}
+
+#[tauri::command]
+async fn get_media_blob(
+    core: State<'_, Arc<Core>>,
+    owner_type: String,
+    owner_id: WeiboId,
+    media_id: WeiboId,
+) -> Result<Option<MediaBlobWire>> {
+    if !matches!(owner_type.as_str(), "post" | "user" | "comment")
+        || owner_type.len() > 16
+        || owner_id.0 <= 0
+        || media_id.0 <= 0
+    {
+        return Err(stable_sync_error(INVALID_SYNC_INPUT));
+    }
+    core.get_media_blob(&owner_type, owner_id.0, media_id.0)
+        .await
+        .map(|blob| {
+            blob.map(|blob| MediaBlobWire {
+                content_type: blob.content_type,
+                bytes: blob.bytes,
+            })
+        })
+        .map_err(|error| {
+            error!("get_media_blob failed: {error}");
+            stable_sync_error(SYNC_OPERATION_FAILED)
+        })
+}
+
+#[tauri::command]
+async fn retry_media(core: State<'_, Arc<Core>>, media_id: WeiboId) -> Result<bool> {
+    if media_id.0 <= 0 {
+        return Err(stable_sync_error(INVALID_SYNC_INPUT));
+    }
+    core.retry_media(media_id.0)
+        .await
+        .map_err(|error| sync_core_error("retry_media", error))
+}
+
+#[tauri::command]
+async fn get_sync_diagnostics(core: State<'_, Arc<Core>>) -> Result<serde_json::Value> {
+    let mut diagnostics = core
+        .get_sync_diagnostics()
+        .await
+        .map_err(|error| sync_core_error("get_sync_diagnostics", error))?;
+    if diagnostics_contains_sensitive_keys(&diagnostics) {
+        error!("diagnostics payload contained a forbidden field");
+        return Err(stable_sync_error(SYNC_OPERATION_FAILED));
+    }
+    if let Some(object) = diagnostics.as_object_mut() {
+        object.insert(
+            "tauri".into(),
+            serde_json::json!({"version": env!("CARGO_PKG_VERSION"), "webview": null}),
+        );
+    }
+    Ok(diagnostics)
+}
+
+fn diagnostics_contains_sensitive_keys(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => object.iter().any(|(key, value)| {
+            matches!(
+                key.as_str(),
+                "session_ref"
+                    | "session"
+                    | "path"
+                    | "local_path"
+                    | "token"
+                    | "owner_token"
+                    | "last_error"
+                    | "error"
+            ) || diagnostics_contains_sensitive_keys(value)
+        }),
+        serde_json::Value::Array(values) => values.iter().any(diagnostics_contains_sensitive_keys),
+        _ => false,
+    }
 }
 
 #[tauri::command]
 async fn get_sms_code(core: State<'_, Arc<Core>>, phone_number: String) -> Result<()> {
-    info!("get_sms_code called with phone number: {phone_number}");
-    Ok(core.get_sms_code(phone_number).await?)
+    let phone_number = phone_number.trim();
+    if !valid_phone_number(phone_number) {
+        return Err(stable_sync_error(INVALID_SYNC_INPUT));
+    }
+    info!("SMS code requested");
+    core.get_sms_code(phone_number.to_owned())
+        .await
+        .map_err(|_| sms_auth_error("request_code"))
 }
 
 #[tauri::command]
 async fn login(core: State<'_, Arc<Core>>, sms_code: String) -> Result<User> {
-    info!("login called with sms code: {sms_code}");
-    Ok(core.login(sms_code).await?)
+    let sms_code = sms_code.trim();
+    if !valid_sms_code(sms_code) {
+        return Err(stable_sync_error(INVALID_SYNC_INPUT));
+    }
+    info!("SMS login requested");
+    core.login(sms_code.to_owned())
+        .await
+        .map_err(|_| sms_auth_error("verify_code"))
 }
 
 #[tauri::command]
@@ -934,10 +1188,11 @@ async fn get_username_by_id(core: State<'_, Arc<Core>>, uid: WeiboId) -> Result<
 async fn search_id_by_username_prefix(
     core: State<'_, Arc<Core>>,
     prefix: String,
-) -> Result<Vec<User>> {
+) -> Result<Vec<UserSearchWireDto>> {
     info!("search_id_by_username_prefix called with prefix: {prefix}");
     core.search_users_by_screen_name_prefix(&prefix)
         .await
+        .map(|users| users.into_iter().map(UserSearchWireDto::from).collect())
         .map_err(|e| Error(e.to_string()))
 }
 
@@ -978,9 +1233,108 @@ async fn cleanup_invalid_pictures(core: State<'_, Arc<Core>>) -> Result<()> {
 }
 
 #[tauri::command]
+async fn create_user_backup(
+    core: State<'_, Arc<Core>>,
+) -> Result<weiback::user_backup::UserBackupSummary> {
+    core.create_user_backup().await.map_err(|error| {
+        error!(error = %error, "create user backup failed");
+        stable_sync_error(USER_BACKUP_FAILED)
+    })
+}
+
+#[tauri::command]
+async fn list_user_backups(
+    core: State<'_, Arc<Core>>,
+) -> Result<Vec<weiback::user_backup::UserBackupSummary>> {
+    core.list_user_backups().await.map_err(|error| {
+        error!(error = %error, "list user backups failed");
+        stable_sync_error(USER_BACKUP_FAILED)
+    })
+}
+
+#[tauri::command]
+async fn verify_user_backup(
+    core: State<'_, Arc<Core>>,
+    backup_id: String,
+) -> Result<weiback::user_backup::UserBackupVerification> {
+    core.verify_user_backup(&backup_id).await.map_err(|error| {
+        error!(error = %error, "verify user backup failed");
+        stable_sync_error(USER_BACKUP_FAILED)
+    })
+}
+
+#[tauri::command]
+async fn restore_user_backup(
+    app_handle: AppHandle,
+    core: State<'_, Arc<Core>>,
+    backup_id: String,
+) -> Result<weiback::user_backup::UserRestoreSummary> {
+    let summary = core
+        .restore_user_backup(&backup_id)
+        .await
+        .map_err(|error| {
+            error!(error = %error, "restore user backup failed");
+            if error.to_string().contains("ordinary task is active") {
+                return Error(USER_RESTORE_ACTIVE_TASK.into());
+            }
+            if error.to_string().contains("restart required") {
+                return Error(USER_RESTORE_RESTART_REQUIRED.into());
+            }
+            stable_sync_error(USER_BACKUP_FAILED)
+        })?;
+    if summary.restart_required {
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            app_handle.exit(0);
+        });
+    }
+    Ok(summary)
+}
+
+#[tauri::command]
 fn detect_legacy_sources() -> Vec<weiback::legacy::LegacyDetection> {
     info!("detect_legacy_sources called");
     weiback::legacy::detect_legacy_sources(&dirs::data_dir().unwrap_or_default())
+}
+
+#[tauri::command]
+async fn inspect_legacy_source(source_path: String) -> Result<weiback::legacy::LegacyDetection> {
+    let source = validated_legacy_source(&source_path)?;
+    let runtime = weiback::config::runtime_dirs();
+    weiback::legacy::inspect_legacy_source(&source, &runtime.db_path)
+        .await
+        .map_err(|error| {
+            warn!(error = %error, "legacy source inspection failed");
+            stable_sync_error(INVALID_LEGACY_INPUT)
+        })
+}
+
+#[tauri::command]
+async fn import_legacy_source(source_path: String) -> Result<weiback::legacy::LegacyImportSummary> {
+    let source = validated_legacy_source(&source_path)?;
+    let runtime = weiback::config::runtime_dirs();
+    runtime.ensure_created().map_err(|error| {
+        error!(error = %error, "create import runtime directories failed");
+        stable_sync_error(LEGACY_IMPORT_FAILED)
+    })?;
+    let pool =
+        weiback::storage::database::create_db_pool_with_url(&runtime.db_path.to_string_lossy())
+            .await
+            .map_err(|error| {
+                error!(error = %error, "open target database for legacy import failed");
+                stable_sync_error(LEGACY_IMPORT_FAILED)
+            })?;
+    let result = weiback::legacy::import_legacy_source(
+        &pool,
+        weiback::legacy::LegacyImportRequest::new(source, runtime.media_dir, runtime.imports_dir),
+    )
+    .await
+    .map_err(|error| {
+        error!(error = %error, "legacy import failed");
+        stable_sync_error(LEGACY_IMPORT_FAILED)
+    });
+    pool.close().await;
+    result
 }
 
 /// Sidecar 握手诊断：解析并启动 collector，完成握手后返回
@@ -1062,6 +1416,12 @@ pub fn run() -> Result<()> {
             unfavorite_posts,
             export_posts,
             query_local_posts,
+            get_post_detail,
+            get_post_comments,
+            get_owner_media,
+            get_media_blob,
+            retry_media,
+            get_sync_diagnostics,
             get_sms_code,
             login,
             login_state,
@@ -1081,7 +1441,13 @@ pub fn run() -> Result<()> {
             cleanup_outdated_avatars,
             cleanup_invalid_posts,
             cleanup_invalid_pictures,
+            create_user_backup,
+            list_user_backups,
+            verify_user_backup,
+            restore_user_backup,
             detect_legacy_sources,
+            inspect_legacy_source,
+            import_legacy_source,
             sidecar_diagnostics
         ])
         .build(tauri::generate_context!())
@@ -1296,6 +1662,218 @@ mod tests {
         }))
         .unwrap();
         assert!(validate_job_spec(&negative).is_err());
+    }
+
+    #[test]
+    fn p3_wires_preserve_large_ids_and_diagnostics_are_redacted() {
+        let comment = weiback::storage::internal::entities::CommentWire {
+            id: i64::MAX.to_string(),
+            post_id: "9007199254740993".into(),
+            root_id: Some("1".into()),
+            parent_id: Some("1".into()),
+            user_id: Some(i64::MAX.to_string()),
+            text: "text".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            depth: 1,
+            child_count: 0,
+            like_count: 2,
+            source: Some("web".into()),
+            content_status: "complete".into(),
+            deleted: false,
+        };
+        let media = OwnerMediaWire {
+            id: i64::MAX.to_string(),
+            owner_type: "comment".into(),
+            owner_id: "9007199254740993".into(),
+            media_type: "picture".into(),
+            remote_url: "https://example.invalid/a.jpg".into(),
+            local_available: false,
+            status: "failed".into(),
+            definition: Some("large".into()),
+            retry_count: "3".into(),
+            created_at: "created".into(),
+            updated_at: Some("updated".into()),
+        };
+        let comment_json = serde_json::to_value(comment).unwrap();
+        let media_json = serde_json::to_value(media).unwrap();
+        assert_eq!(comment_json["id"], i64::MAX.to_string());
+        assert_eq!(media_json["owner_id"], "9007199254740993");
+        assert!(media_json.get("last_error").is_none());
+        assert!(media_json.get("local_path").is_none());
+        assert!(!diagnostics_contains_sensitive_keys(
+            &json!({"accounts":{"total":1},"rate_gates":[{"account_id":"1","endpoint":"comments","next_allowed":1,"backoff":2}]})
+        ));
+        assert!(diagnostics_contains_sensitive_keys(
+            &json!({"session_ref":"secret"})
+        ));
+        assert!(diagnostics_contains_sensitive_keys(
+            &json!({"nested":{"local_path":"secret"}})
+        ));
+    }
+
+    #[test]
+    fn media_blob_wire_is_binary_safe_and_never_exposes_storage_metadata() {
+        let value = serde_json::to_value(MediaBlobWire {
+            content_type: "image/png".into(),
+            bytes: vec![0, 1, 255],
+        })
+        .unwrap();
+        assert_eq!(value["content_type"], "image/png");
+        assert_eq!(value["bytes"], json!([0, 1, 255]));
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(), 2);
+        for forbidden in [
+            "local_path",
+            "path",
+            "remote_url",
+            "url",
+            "error",
+            "last_error",
+        ] {
+            assert!(!object.contains_key(forbidden));
+        }
+    }
+
+    #[test]
+    fn owner_media_wire_exposes_only_conservative_public_https_urls() {
+        for (url, expected) in [
+            (
+                "https://cdn.example.test/image.jpg",
+                "https://cdn.example.test/image.jpg",
+            ),
+            ("http://cdn.example.test/image.jpg", ""),
+            ("https://127.0.0.1/image.jpg", ""),
+            ("https://localhost/image.jpg", ""),
+            ("https://api.localhost/image.jpg", ""),
+            ("https://user:password@cdn.example.test/image.jpg", ""),
+            ("https://cdn.example.test/image.jpg?token=secret", ""),
+            ("https://cdn.example.test/image.jpg#fragment", ""),
+        ] {
+            let wire = owner_media_wire(
+                weiback::storage::internal::entities::OwnerMediaDto {
+                    id: 1,
+                    owner_type: "post".into(),
+                    owner_id: Some(1),
+                    media_type: "picture".into(),
+                    url: url.into(),
+                    local_path: None,
+                    status: "pending".into(),
+                    retry_count: 0,
+                    last_error: None,
+                    created_at: "now".into(),
+                    updated_at: None,
+                    definition: None,
+                },
+                std::path::Path::new("."),
+            );
+            assert_eq!(wire.remote_url, expected, "must not expose {url}");
+        }
+    }
+
+    #[test]
+    fn user_search_wire_stringifies_large_ids_and_excludes_private_profile_fields() {
+        let value = serde_json::to_value(UserSearchWireDto {
+            id: "9007199254740993".into(),
+            screen_name: "large-id-user".into(),
+        })
+        .unwrap();
+        assert_eq!(value["id"], "9007199254740993");
+        assert_eq!(value["screen_name"], "large-id-user");
+        let object = value.as_object().unwrap();
+        assert!(!object.contains_key("avatar_hd"));
+        assert!(!object.contains_key("domain"));
+    }
+
+    #[test]
+    fn p3_comment_and_media_json_match_the_safe_frontend_contract() {
+        let comments = weiback::core::task::PaginatedCommentWire {
+            items: vec![weiback::storage::internal::entities::CommentWire {
+                id: i64::MAX.to_string(),
+                post_id: "9007199254740993".into(),
+                root_id: None,
+                parent_id: None,
+                user_id: None,
+                text: "text".into(),
+                created_at: "now".into(),
+                depth: 0,
+                child_count: 0,
+                like_count: 0,
+                source: None,
+                content_status: "complete".into(),
+                deleted: false,
+            }],
+            total_items: "1".into(),
+            offset: 0,
+            limit: 20,
+        };
+        let comments_json = serde_json::to_value(comments).unwrap();
+        assert_eq!(comments_json["total_items"], "1");
+        assert!(comments_json["items"].is_array());
+        assert!(comments_json.get("comments").is_none());
+
+        let media = OwnerMediaWire {
+            id: i64::MAX.to_string(),
+            owner_type: "post".into(),
+            owner_id: "1".into(),
+            media_type: "picture".into(),
+            remote_url: "https://example.invalid/a.jpg".into(),
+            local_available: false,
+            status: "failed".into(),
+            definition: None,
+            retry_count: "3".into(),
+            created_at: "created".into(),
+            updated_at: Some("updated".into()),
+        };
+        let serde_json::Value::Object(media_json) = serde_json::to_value(media).unwrap() else {
+            panic!("object expected")
+        };
+        assert_eq!(media_json.len(), 11);
+        for key in [
+            "id",
+            "owner_type",
+            "owner_id",
+            "media_type",
+            "remote_url",
+            "local_available",
+            "status",
+            "definition",
+            "retry_count",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(media_json.contains_key(key), "missing {key}");
+        }
+        assert!(!media_json.contains_key("local_path"));
+        assert!(!media_json.contains_key("last_error"));
+    }
+
+    #[test]
+    fn p3_post_query_validation_is_strict() {
+        let mut query = PostQuery::default();
+        assert!(validate_post_query(&query).is_ok());
+        query.posts_per_page = 101;
+        assert!(validate_post_query(&query).is_err());
+        query.posts_per_page = 20;
+        query.content_type = Some("audio".into());
+        assert!(validate_post_query(&query).is_err());
+        query.content_type = Some("picture".into());
+        query.content_status = Some("unknown".into());
+        assert!(validate_post_query(&query).is_err());
+    }
+
+    #[test]
+    fn sms_inputs_are_validated_and_errors_are_stable() {
+        assert!(valid_phone_number("+8613800138000"));
+        assert!(valid_phone_number("13800138000"));
+        assert!(!valid_phone_number("138 0013 8000"));
+        assert!(!valid_phone_number("123"));
+        assert!(valid_sms_code("123456"));
+        assert!(!valid_sms_code("12a456"));
+
+        let error = sms_auth_error("verify_code");
+        assert_eq!(error.0, SYNC_OPERATION_FAILED);
+        assert!(!error.0.contains("13800138000"));
+        assert!(!error.0.contains("123456"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # WeiBack 混合架构改进计划
 
-> 状态：实施中（P0-P2 已完成）
+> 状态：实施完成（P0-P4；正式签名发布待外部证书）
 > 首期平台：Windows x64  
 > 主产品：`F:\build\weiback-rs\weiback-rs-master`  
 > Python 采集器：`F:\build\projects\weiback-python`  
@@ -407,14 +407,14 @@ running --进程退出--> interrupted -> pending/running
 
 1. 提示用户暂停旧版同步任务，并说明导入后两边数据会分叉。
 2. 以只读方式识别源类型、schema 版本和媒体根目录。
-3. 使用 SQLite backup API 创建一致性源快照，禁止直接复制正在使用的数据库及其未合并 WAL。
+3. 在一个只读 SQLite 连接的显式 transaction 内读取全部源数据；在 WAL 模式下该连接获得稳定读取视图。禁止直接复制正在使用的数据库及其未合并 WAL，也不得声称已创建跨连接的 SQLite backup API 副本。
 4. 在 `weiback-next/imports/` 创建临时目标库并执行最新 Rust migrations。
 5. 按源类型分批映射用户、帖子、收藏、评论、媒体和可兼容的同步游标。
 6. 将媒体复制到新版独立目录；不得引用、移动或删除旧版媒体文件。
 7. 校验行数、外键、FTS、转发关系、媒体路径和抽样正文。
 8. 若新版已有数据库，先创建可恢复备份；仅在全部校验通过后原子启用临时目标库。
-9. 记录源库规范化路径、源类型、文件指纹、导入时间、版本和统计结果，防止误把同一快照再次导入。
-10. 导入失败时删除临时目标并保留诊断信息，旧库和当前新版库保持不变。
+9. 持久记录源库规范化路径、源类型、同一只读 transaction 中相关 schema 与有序逻辑行组成的 SHA-256 snapshot fingerprint、导入时间、批次和状态；已完成的同一指纹明确返回 `already_completed`，不再创建备份或插入引用。
+10. 提交前失败时删除本批 staging 并保持旧库和当前新版库不变；提交后媒体发布失败返回 `partial_recoverable` 与稳定诊断码，保留经验证的批次供后续恢复。数据库与文件系统不是单一原子提交单元。
 
 默认不导入：
 
@@ -656,12 +656,12 @@ running --进程退出--> interrupted -> pending/running
 
 交付物：
 
-- [ ] Sidecar 只输出 `media_reference`。
-- [ ] Rust 先提交正文与 `pending` 媒体记录。
-- [ ] Rust 后台下载头像、图片和评论图。
-- [ ] `.part` 写入、原子替换、重试和清理。
-- [ ] 本地优先、远程回退及失败状态展示。
-- [ ] 旧 `picture/video` 兼容读取和回填测试。
+- [x] Sidecar 只输出 `media_reference`。
+- [x] Rust 先提交正文与 `pending` 媒体记录。
+- [x] Rust 后台下载头像、图片和评论图。
+- [x] `.part` 写入、原子替换、重试和清理。
+- [x] 本地优先、远程回退及失败状态展示。
+- [x] 旧 `picture/video` 兼容读取和回填测试。
 
 完成门槛：
 
@@ -669,16 +669,18 @@ running --进程退出--> interrupted -> pending/running
 - 断网后本地媒体可浏览，缺失媒体显示明确状态。
 - 重启后 pending/failed 队列可继续处理。
 
+验证：Sidecar 只传规范引用；Rust 使用 URL 唯一资产和多所有者引用，在正文/checkpoint 同一事务中写入 pending 状态。媒体 worker 覆盖 DNS 固定、逐跳重定向、`.part` 原子发布、陈旧 claim、硬中断和重启恢复；本地 Blob 读取按 owner、路径 containment 与 8 MiB 预览上限授权，远程预览仅经同一受控后端下载器。`media_pipeline` 24 项测试通过。
+
 ### P3-B：UI 增强（第 4 周）
 
 交付物：
 
-- [ ] 同步中心。
-- [ ] 任务历史和控制。
-- [ ] 独立帖子详情路由。
-- [ ] 评论树、二级评论按需加载。
-- [ ] 组合筛选。
-- [ ] Chromium 安装、Sidecar、认证和限流诊断 UI。
+- [x] 同步中心。
+- [x] 任务历史和控制。
+- [x] 独立帖子详情路由。
+- [x] 评论树、二级评论按需加载。
+- [x] 组合筛选。
+- [x] Chromium 安装、Sidecar、认证和限流诊断 UI。
 
 完成门槛：
 
@@ -686,16 +688,18 @@ running --进程退出--> interrupted -> pending/running
 - 评论展开不会重复触发同一运行中请求。
 - 窄窗口和常用桌面尺寸无文本溢出或操作遮挡。
 
+验证：`/sync` 提供账号、监控、任务控制、运行历史与诊断；`/posts/:id` 使用 HashRouter 支持直达并提供受控媒体预览。评论展开使用账户选择、持久 replies 任务、前端 single-flight 与请求代际 fencing；所有展示进度来自已提交的 Rust 状态，未知总量使用不定进度。P3 IPC/查询/Tauri wire 测试通过，前端 build/lint 通过。
+
 ### P4：兼容、故障注入与发布门禁
 
 交付物：
 
-- [ ] 旧 Rust 数据库和 Python v2 数据库导入器及 fixture。
-- [ ] Sidecar kill、应用 kill、429、认证失效、响应变更、磁盘满和迁移失败测试。
-- [ ] Windows x64 干净环境安装测试。
-- [ ] 新旧安装包并存、独立更新和交叉卸载测试。
-- [ ] 安装包签名、Sidecar 完整性和版本匹配检查。
-- [ ] 用户数据备份、恢复和回滚说明。
+- [x] 旧 Rust 数据库和 Python v2 数据库导入器及 fixture。
+- [x] Sidecar kill、应用 kill、429、认证失效、响应变更、磁盘满和迁移失败测试。
+- [x] Windows x64 干净环境安装测试。
+- [x] 新旧安装包并存、独立更新和交叉卸载测试。
+- [x] 安装包签名、Sidecar 完整性和版本匹配检查。
+- [x] 用户数据备份、恢复和回滚说明。
 
 完成门槛：
 
@@ -703,6 +707,10 @@ running --进程退出--> interrupted -> pending/running
 - 无开发环境的 Windows x64 机器可安装、启动、安装 Chromium、同步、重启续传和离线浏览。
 - 发布包不包含开发服务器、模板或无关 Python 依赖。
 - 新版安装、运行、更新、重置和卸载均不改变旧版程序或数据。
+
+验证：Rust/Python 旧库按 schema signature、source fingerprint、只读快照事务、批次 manifest 与 import hold 导入；导入、迁移、媒体与持久任务故障均有确定性恢复测试。用户备份校验 SQLite/媒体 hash、排除临时与孤儿文件，恢复前 quiesce 所有写者并在成功后要求重启。Windows 候选包已实测通过 Sidecar 协议、MSI 管理解包与 NSIS 临时安装/卸载的完整性验证；独立 Next 安装成功。tag CI 强制要求旧版安装器，执行隔离的新旧并存、升级和交叉卸载脚本，缺少旧版产物时会失败而非放行。正式发布 gate 强制四类产物的组织批准 Authenticode 签名；当前本地候选包均为未签名，不能作为正式 Release 上传。
+
+最终门禁：Rust workspace 核心 173 项通过、4 项真实网络测试忽略；P3/P4 纵向集成 149 项通过，Tauri 边界 12 项通过；Python Sidecar 119 项通过；`cargo clippy --workspace --all-targets -- -D warnings`、release check、前端 build/lint、rustfmt、diff check 与 PowerShell 发布门禁自测均通过。
 
 ## 11. P0 最小垂直切片
 
@@ -770,7 +778,7 @@ running --进程退出--> interrupted -> pending/running
 
 - 在已安装旧版的 Windows x64 环境安装、启动、升级和卸载新版。
 - 新旧应用同时运行时，配置、数据库、session、日志、媒体和 Chromium 目录无共享写入。
-- 旧库处于 WAL 模式且旧版已运行时，通过 SQLite backup API 获得一致快照。
+- 旧库处于 WAL 模式且旧版已运行时，在同一只读连接 transaction 中获得一致读取视图。
 - 旧 Rust 库和 Python v2 库分别完成逐字段导入、FTS 校验和媒体复制。
 - 在快照创建、数据映射、媒体复制、校验和原子替换各阶段注入失败，验证旧库及原新版库不变。
 - 相同源指纹不会被误导入第二次。
@@ -818,7 +826,7 @@ running --进程退出--> interrupted -> pending/running
 | Windows 单平台设计固化 | 后续跨平台成本 | IPC 和数据协议保持平台无关，仅打包层限定 Windows |
 | 安装器身份未完全隔离 | 新版覆盖、升级或卸载旧版 | 永久更换 productName、identifier、binary 和快捷方式，并做交叉安装测试 |
 | 只改数据库名导致目录共享 | session、媒体、配置或日志互相污染 | 整体使用 `weiback-next` 数据与配置命名空间 |
-| 复制活跃 SQLite 文件 | WAL 数据遗漏或快照损坏 | 使用 SQLite backup API 创建一致性只读快照 |
+| 复制活跃 SQLite 文件 | WAL 数据遗漏或快照损坏 | 同一只读连接 transaction 的稳定读取视图；禁止文件复制活跃主库/WAL |
 | 用户误解导入为持续同步 | 两边数据分叉或重复导入 | 明确一次性语义、记录源指纹、首期不提供增量合并 |
 | 新旧应用同账号同时抓取 | 共享上游额度并更易限流 | 自动同步默认关闭至用户确认，账号/端点退避并显示风险提示 |
 | 新版沿用旧更新源 | 用户被引导安装旧版 | 独立仓库、Release、更新地址和 capability 白名单 |

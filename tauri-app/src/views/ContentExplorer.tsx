@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { open } from '@tauri-apps/plugin-dialog'
 import { useSnackbar } from 'notistack'
 import {
@@ -35,7 +36,6 @@ import {
   AttachedImage,
   PostFilter,
 } from '../types'
-import PostPreviewModal from '../components/PostPreviewModal'
 import { useTaskStore } from '../stores/taskStore'
 import UserSelector from '../components/UserSelector'
 import { queryLocalPosts, exportPosts, rebackupPosts, rebackupMissingImages } from '../lib/api'
@@ -43,13 +43,13 @@ import { deepEqual } from '../utils'
 
 const POSTS_PER_PAGE = 12
 
-const getUserId = (input: User | string | null): number | undefined => {
+const getUserId = (input: User | string | null): string | undefined => {
   if (!input) return undefined
   if (typeof input === 'object' && input.id) {
     return input.id
   }
   if (typeof input === 'string' && /^\d+$/.test(input)) {
-    return parseInt(input, 10)
+    return input
   }
   return undefined
 }
@@ -84,6 +84,9 @@ const buildQueryFromFilters = (
         ? { Fuzzy: currentFilters.searchTerm }
         : { Strict: currentFilters.searchTerm }
       : undefined,
+    content_type: currentFilters.contentType || undefined,
+    content_status: currentFilters.contentStatus || undefined,
+    source: currentFilters.source.trim() || undefined,
   }
 }
 
@@ -91,6 +94,7 @@ const buildQueryFromFilters = (
 
 const ContentExplorerPage: React.FC = () => {
   const { enqueueSnackbar } = useSnackbar()
+  const navigate = useNavigate()
   const isTaskRunning = useTaskStore(state => state.currentTask?.status === TaskStatus.InProgress)
   const fetchCurrentTask = useTaskStore(state => state.fetchCurrentTask)
 
@@ -103,6 +107,9 @@ const ContentExplorerPage: React.FC = () => {
     reverseOrder: false,
     searchTerm: '',
     searchMode: 'fuzzy' as 'fuzzy' | 'strict',
+    contentType: '',
+    contentStatus: '',
+    source: '',
   })
   // State to hold the filters that are actually applied
   const [appliedFilters, setAppliedFilters] = useState({ ...filters, userInput })
@@ -113,8 +120,6 @@ const ContentExplorerPage: React.FC = () => {
   const [totalPages, setTotalPages] = useState(0)
   const [jumpPage, setJumpPage] = useState('')
   const [lightboxImage, setLightboxImage] = useState<AttachedImage | null>(null)
-  const [hoveredPostInfo, setHoveredPostInfo] = useState<PostInfo | null>(null)
-  const [showPreviewModal, setShowPreviewModal] = useState(false)
 
   // State for loading indicators
   const [loading, setLoading] = useState(false)
@@ -138,14 +143,8 @@ const ContentExplorerPage: React.FC = () => {
   }
 
   const handlePostClick = useCallback((postInfo: PostInfo) => {
-    setHoveredPostInfo(postInfo)
-    setShowPreviewModal(true)
-  }, [])
-
-  const handleClosePreviewModal = useCallback(() => {
-    setShowPreviewModal(false)
-    setHoveredPostInfo(null)
-  }, [])
+    navigate(`/posts/${postInfo.post.idstr}`)
+  }, [navigate])
 
   const fetchPosts = useCallback(
     async (currentPage: number, currentFilters: PostFilter) => {
@@ -189,6 +188,9 @@ const ContentExplorerPage: React.FC = () => {
       reverseOrder: false,
       searchTerm: '',
       searchMode: 'fuzzy' as 'fuzzy' | 'strict',
+      contentType: '',
+      contentStatus: '',
+      source: '',
     }
     const clearedUserInput = null
 
@@ -325,6 +327,42 @@ const ContentExplorerPage: React.FC = () => {
                       value={filters.startDate}
                       onChange={date => setFilters(f => ({ ...f, startDate: date }))}
                       sx={{ width: '100%' }}
+                    />
+                  </Grid>
+                  <Grid size={{ xs: 12, md: 4 }}>
+                    <TextField
+                      select
+                      fullWidth
+                      label="内容类型"
+                      value={filters.contentType}
+                      onChange={e => setFilters(f => ({ ...f, contentType: e.target.value }))}
+                    >
+                      <MenuItem value="">全部</MenuItem>
+                      <MenuItem value="text">文本</MenuItem>
+                      <MenuItem value="picture">图片</MenuItem>
+                      <MenuItem value="video">视频</MenuItem>
+                    </TextField>
+                  </Grid>
+                  <Grid size={{ xs: 12, md: 4 }}>
+                    <TextField
+                      select
+                      fullWidth
+                      label="内容状态"
+                      value={filters.contentStatus}
+                      onChange={e => setFilters(f => ({ ...f, contentStatus: e.target.value }))}
+                    >
+                      <MenuItem value="">全部</MenuItem>
+                      <MenuItem value="complete">完整</MenuItem>
+                      <MenuItem value="partial">部分</MenuItem>
+                      <MenuItem value="failed">失败</MenuItem>
+                    </TextField>
+                  </Grid>
+                  <Grid size={{ xs: 12, md: 4 }}>
+                    <TextField
+                      fullWidth
+                      label="来源"
+                      value={filters.source}
+                      onChange={e => setFilters(f => ({ ...f, source: e.target.value }))}
                     />
                   </Grid>
                   <Grid size={{ xs: 12, md: 6 }}>
@@ -514,12 +552,6 @@ const ContentExplorerPage: React.FC = () => {
           </Box>
         </Modal>
 
-        <PostPreviewModal
-          postInfo={hoveredPostInfo}
-          open={showPreviewModal}
-          onClose={handleClosePreviewModal}
-          onImageClick={handleOpenLightbox}
-        />
       </Box>
     </LocalizationProvider>
   )

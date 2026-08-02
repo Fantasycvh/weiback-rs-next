@@ -367,4 +367,121 @@ mod local_tests {
         assert_eq!(backup_count, 0);
         backup_pool.close().await;
     }
+
+    /// P4 迁移中 DDL 成功、后续 SQL 失败时，原库、迁移记录和备份均须保持一致。
+    #[tokio::test]
+    async fn test_failed_migration_rolls_back_ddl_and_allows_retry() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("p4_failure.sqlite");
+        let db_url = db_path.to_str().unwrap();
+        const VERSION: i64 = 20_260_802_150_001;
+
+        Sqlite::create_database(db_url).await.unwrap();
+        let pool = SqlitePool::connect(db_url).await.unwrap();
+        sqlx::query("CREATE TABLE legacy_business (id INTEGER PRIMARY KEY, name TEXT NOT NULL);")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO legacy_business (id, name) VALUES (1, 'must survive');")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let bad_dir = dir.path().join("bad_p4_migrations");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        std::fs::write(
+            bad_dir.join("20260802150001_p4_probe.sql"),
+            "ALTER TABLE legacy_business ADD COLUMN p4_probe TEXT;\nINSERT INTO missing_table VALUES (1);",
+        )
+        .unwrap();
+        let bad_migrator = sqlx::migrate::Migrator::new(bad_dir).await.unwrap();
+
+        let backup = backup_before_migration(&pool, &db_path).await.unwrap();
+        assert!(run_migrations(&pool, bad_migrator).await.is_err());
+        pool.close().await;
+
+        let reopened = SqlitePool::connect(db_url).await.unwrap();
+        let business_data: String =
+            sqlx::query_scalar("SELECT name FROM legacy_business WHERE id = 1")
+                .fetch_one(&reopened)
+                .await
+                .unwrap();
+        assert_eq!(business_data, "must survive");
+        let probe_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('legacy_business') WHERE name = 'p4_probe')",
+        )
+        .fetch_one(&reopened)
+        .await
+        .unwrap();
+        assert!(!probe_exists, "failed migration must roll back its DDL");
+        let failed_migration_record_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = ?")
+                .bind(VERSION)
+                .fetch_one(&reopened)
+                .await
+                .unwrap();
+        assert_eq!(failed_migration_record_count, 0);
+
+        let backup_pool = SqlitePool::connect(backup.to_str().unwrap()).await.unwrap();
+        let backup_data: String =
+            sqlx::query_scalar("SELECT name FROM legacy_business WHERE id = 1")
+                .fetch_one(&backup_pool)
+                .await
+                .unwrap();
+        assert_eq!(backup_data, "must survive");
+        let backup_probe_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('legacy_business') WHERE name = 'p4_probe')",
+        )
+        .fetch_one(&backup_pool)
+        .await
+        .unwrap();
+        assert!(
+            !backup_probe_exists,
+            "backup must represent the pre-migration database"
+        );
+        let backup_migration_table_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations')",
+        )
+        .fetch_one(&backup_pool)
+        .await
+        .unwrap();
+        assert!(
+            !backup_migration_table_exists,
+            "backup must not contain migration metadata created after the snapshot"
+        );
+        backup_pool.close().await;
+
+        let retry_dir = dir.path().join("retry_p4_migrations");
+        std::fs::create_dir_all(&retry_dir).unwrap();
+        std::fs::write(
+            retry_dir.join("20260802150001_p4_probe.sql"),
+            "ALTER TABLE legacy_business ADD COLUMN p4_probe TEXT;",
+        )
+        .unwrap();
+        let retry_migrator = sqlx::migrate::Migrator::new(retry_dir).await.unwrap();
+        run_migrations(&reopened, retry_migrator).await.unwrap();
+
+        let retried_probe_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('legacy_business') WHERE name = 'p4_probe')",
+        )
+        .fetch_one(&reopened)
+        .await
+        .unwrap();
+        assert!(retried_probe_exists);
+        let retried_data: String =
+            sqlx::query_scalar("SELECT name FROM legacy_business WHERE id = 1")
+                .fetch_one(&reopened)
+                .await
+                .unwrap();
+        assert_eq!(retried_data, "must survive");
+        let successful_migration_record_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = ? AND success = 1",
+        )
+        .bind(VERSION)
+        .fetch_one(&reopened)
+        .await
+        .unwrap();
+        assert_eq!(successful_migration_record_count, 1);
+        reopened.close().await;
+    }
 }

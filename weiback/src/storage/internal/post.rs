@@ -783,6 +783,43 @@ fn build_common_query(query: &PostQuery) -> Result<sea_query::SelectStatement> {
         );
     }
 
+    if let Some(content_type) = query.content_type.as_deref()
+        && content_type != "all"
+    {
+        match content_type {
+            "picture" => {
+                posts_query
+                    .and_where(Expr::col((PostIden::Table, PostIden::PicNum)).gt(0))
+                    .and_where(Expr::col((PostIden::Table, PostIden::VideoUrl)).is_null());
+            }
+            "video" => {
+                posts_query
+                    .and_where(Expr::col((PostIden::Table, PostIden::VideoUrl)).is_not_null());
+            }
+            "text" => {
+                posts_query
+                    .and_where(Expr::col((PostIden::Table, PostIden::PicNum)).eq(0))
+                    .and_where(Expr::col((PostIden::Table, PostIden::VideoUrl)).is_null());
+            }
+            _ => return Err(Error::FormatError("invalid content_type".into())),
+        }
+    }
+    if let Some(content_status) = query.content_status.as_deref()
+        && content_status != "all"
+    {
+        if !matches!(content_status, "complete" | "partial" | "failed") {
+            return Err(Error::FormatError("invalid content_status".into()));
+        }
+        posts_query
+            .and_where(Expr::col((PostIden::Table, PostIden::ContentStatus)).eq(content_status));
+    }
+    if let Some(source) = query.source.as_deref() {
+        if source.len() > 128 || source.contains('\0') {
+            return Err(Error::FormatError("invalid source".into()));
+        }
+        posts_query.and_where(Expr::col((PostIden::Table, PostIden::Source)).eq(source));
+    }
+
     Ok(posts_query)
 }
 
@@ -828,7 +865,9 @@ where
         .column((PostIden::Table, Asterisk))
         .order_by((PostIden::Table, PostIden::Id), order)
         .limit(query.posts_per_page as u64)
-        .offset((query.page.saturating_sub(1) * query.posts_per_page) as u64);
+        .offset(
+            u64::from(query.page.saturating_sub(1)).saturating_mul(u64::from(query.posts_per_page)),
+        );
 
     let (sql, values) = posts_query.build_sqlx(SqliteQueryBuilder);
     let posts = sqlx::query_as_with::<Sqlite, PostInternal, _>(&sql, values)
@@ -978,6 +1017,9 @@ mod local_tests {
             reverse_order: false,
             page: 1,
             posts_per_page: 2,
+            content_type: None,
+            content_status: None,
+            source: None,
         };
         let (posts, _sum) = query_posts(&db, query.clone()).await.unwrap();
         assert_eq!(posts.len(), 2);
@@ -1027,6 +1069,9 @@ mod local_tests {
             reverse_order: false,
             page: 1,
             posts_per_page: 2,
+            content_type: None,
+            content_status: None,
+            source: None,
         };
         let (_, sum) = query_posts(&db, query).await.unwrap();
         assert_eq!(sum, favorited_set.len() as u64);
@@ -1071,6 +1116,9 @@ mod local_tests {
             reverse_order: false,
             page: 1,
             posts_per_page: 5,
+            content_type: None,
+            content_status: None,
+            source: None,
         };
         let (fetched_posts, _sum) = query_posts(&db, query.clone()).await.unwrap();
         assert_eq!(fetched_posts.len(), 5);
@@ -1085,6 +1133,46 @@ mod local_tests {
         assert_eq!(
             fetched_posts_rev[0].id,
             posts.iter().map(|p| p.id).min().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn p3_filters_compose_identically_for_count_and_list() {
+        let db = setup_db().await;
+        let mut posts = create_test_posts().await;
+        let template = posts.pop().unwrap();
+        for (id, pic_num, video_url, status, source) in [
+            (8_001_i64, 1_i64, None, "complete", "web"),
+            (8_002, 1, None, "partial", "web"),
+            (
+                8_003,
+                0,
+                Some("https://example.invalid/v.mp4"),
+                "complete",
+                "ios",
+            ),
+        ] {
+            let mut post: PostInternal = template.clone().try_into().unwrap();
+            post.id = id;
+            post.mblogid = id.to_string();
+            post.pic_num = Some(pic_num);
+            post.video_url = video_url.map(str::to_string);
+            post.content_status = status.into();
+            post.source = Some(source.into());
+            save_post(&db, &post).await.unwrap();
+        }
+        let query = PostQuery {
+            content_type: Some("picture".into()),
+            content_status: Some("complete".into()),
+            source: Some("web".into()),
+            posts_per_page: 100,
+            ..PostQuery::default()
+        };
+        let (posts, total) = query_posts(&db, query).await.unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(
+            posts.iter().map(|post| post.id).collect::<Vec<_>>(),
+            vec![8_001]
         );
     }
 
@@ -1122,6 +1210,9 @@ mod local_tests {
             reverse_order: true,
             page: 1,
             posts_per_page: ones_post_ids.len() as u32,
+            content_type: None,
+            content_status: None,
+            source: None,
         };
         let (fetched_posts, sum) = query_posts(&db, query.clone()).await.unwrap();
         let fetched_ids = fetched_posts.into_iter().map(|p| p.id).collect::<Vec<_>>();
@@ -1285,6 +1376,9 @@ mod local_tests {
             reverse_order: false,
             page: 1,
             posts_per_page: 10,
+            content_type: None,
+            content_status: None,
+            source: None,
         };
 
         // Fuzzy search "hello"

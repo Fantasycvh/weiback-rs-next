@@ -12,6 +12,7 @@ use sea_query::{Expr, Iden, OnConflict, Query, SqliteQueryBuilder};
 use sea_query_binder::SqlxBinder;
 use serde::{Deserialize, Serialize};
 use sqlx::{Acquire, Executor, FromRow, Sqlite};
+use std::path::{Component, Path};
 use tracing::warn;
 
 use crate::error::Result;
@@ -63,6 +64,7 @@ impl MediaType {
 #[serde(rename_all = "snake_case")]
 pub enum MediaStatus {
     Pending,
+    Downloading,
     Downloaded,
     Failed,
 }
@@ -72,6 +74,7 @@ impl MediaStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             MediaStatus::Pending => "pending",
+            MediaStatus::Downloading => "downloading",
             MediaStatus::Downloaded => "downloaded",
             MediaStatus::Failed => "failed",
         }
@@ -235,6 +238,43 @@ pub struct CommentDto {
     pub last_refreshed_at: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CommentWire {
+    pub id: String,
+    pub post_id: String,
+    pub root_id: Option<String>,
+    pub parent_id: Option<String>,
+    pub user_id: Option<String>,
+    pub text: String,
+    pub created_at: String,
+    pub depth: i64,
+    pub child_count: i64,
+    pub like_count: i64,
+    pub source: Option<String>,
+    pub content_status: String,
+    pub deleted: bool,
+}
+
+impl From<CommentDto> for CommentWire {
+    fn from(comment: CommentDto) -> Self {
+        Self {
+            id: comment.id.to_string(),
+            post_id: comment.post_id.to_string(),
+            root_id: comment.root_id.map(|id| id.to_string()),
+            parent_id: comment.parent_id.map(|id| id.to_string()),
+            user_id: comment.user_id.map(|id| id.to_string()),
+            text: comment.text,
+            created_at: comment.created_at,
+            depth: comment.depth,
+            child_count: comment.child_count,
+            like_count: comment.like_count,
+            source: comment.source,
+            content_status: comment.content_status,
+            deleted: comment.deleted,
+        }
+    }
+}
+
 /// 媒体队列 DTO。
 #[derive(Debug, Clone, PartialEq, FromRow, Serialize, Deserialize)]
 pub struct MediaDto {
@@ -249,6 +289,371 @@ pub struct MediaDto {
     pub last_error: Option<String>,
     pub created_at: String,
     pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MediaSource {
+    Local(std::path::PathBuf),
+    Remote(String),
+}
+
+impl MediaDto {
+    /// Consumers prefer a committed local file and otherwise retain the remote URL.
+    pub fn preferred_source(&self) -> MediaSource {
+        self.local_path
+            .as_ref()
+            .filter(|_| self.status == MediaStatus::Downloaded.as_str())
+            .map(std::path::PathBuf::from)
+            .map(MediaSource::Local)
+            .unwrap_or_else(|| MediaSource::Remote(self.url.clone()))
+    }
+}
+
+/// Owner-facing media DTO. Definition belongs to this reference, not the asset.
+#[derive(Debug, Clone, PartialEq, FromRow, Serialize, Deserialize)]
+pub struct OwnerMediaDto {
+    pub id: i64,
+    pub owner_type: String,
+    pub owner_id: Option<i64>,
+    pub media_type: String,
+    pub url: String,
+    pub local_path: Option<String>,
+    pub status: String,
+    pub retry_count: i64,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: Option<String>,
+    pub definition: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OwnerMediaWire {
+    pub id: String,
+    pub owner_type: String,
+    pub owner_id: String,
+    pub media_type: String,
+    pub remote_url: String,
+    pub local_available: bool,
+    pub status: String,
+    pub definition: Option<String>,
+    pub retry_count: String,
+    pub created_at: String,
+    pub updated_at: Option<String>,
+}
+
+/// Bytes returned by the local-only media read boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaBlob {
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+}
+
+/// JSON serializes bytes as an array, so local previews need a smaller cap than downloads.
+pub const IMAGE_PREVIEW_MAX_BYTES: u64 = 8 * 1024 * 1024;
+pub const VIDEO_PREVIEW_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// Maximum downloaded media size. Kept separate from the JSON preview limit.
+pub const MEDIA_MAX_BYTES: u64 = 100 * 1024 * 1024;
+
+pub fn owner_media_wire(media: OwnerMediaDto, root: &std::path::Path) -> OwnerMediaWire {
+    let local_available = matches!(
+        media.resolve_local_source(root),
+        crate::media_pipeline::ResolvedMediaSource::Local(_)
+    );
+    OwnerMediaWire {
+        id: media.id.to_string(),
+        owner_type: media.owner_type,
+        owner_id: media.owner_id.unwrap_or_default().to_string(),
+        media_type: media.media_type,
+        remote_url: public_media_url(&media.url),
+        local_available,
+        status: media.status,
+        definition: media.definition,
+        retry_count: media.retry_count.to_string(),
+        created_at: media.created_at,
+        updated_at: media.updated_at,
+    }
+}
+
+fn public_media_url(raw_url: &str) -> String {
+    let Ok(url) = url::Url::parse(raw_url) else {
+        return String::new();
+    };
+    let host = url.host_str().unwrap_or_default();
+    if url.scheme() != "https"
+        || !matches!(url.host(), Some(url::Host::Domain(_)))
+        || host.eq_ignore_ascii_case("localhost")
+        || host.to_ascii_lowercase().ends_with(".localhost")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return String::new();
+    }
+    url.to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaginatedComments {
+    pub comments: Vec<CommentDto>,
+    pub total_items: u64,
+}
+
+impl OwnerMediaDto {
+    /// Without a trusted root this method cannot safely use a database path.
+    pub fn preferred_source(&self) -> MediaSource {
+        MediaSource::Remote(self.url.clone())
+    }
+
+    /// Resolves a persisted local path only when it names an existing file below `root`.
+    pub fn resolve_local_source(
+        &self,
+        root: &std::path::Path,
+    ) -> crate::media_pipeline::ResolvedMediaSource {
+        use std::path::Component;
+
+        if self.status != MediaStatus::Downloaded.as_str() {
+            return remote_media_source(&self.url);
+        }
+        let Some(local_path) = self.local_path.as_deref().map(std::path::Path::new) else {
+            return remote_media_source(&self.url);
+        };
+        if local_path.is_absolute()
+            || local_path.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            return remote_media_source(&self.url);
+        }
+        let Ok(root) = root.canonicalize() else {
+            return remote_media_source(&self.url);
+        };
+        let Ok(candidate) = root.join(local_path).canonicalize() else {
+            return remote_media_source(&self.url);
+        };
+        if candidate.is_file() && candidate.starts_with(&root) {
+            crate::media_pipeline::ResolvedMediaSource::Local(candidate)
+        } else {
+            remote_media_source(&self.url)
+        }
+    }
+}
+
+/// Reads a downloaded media asset only when its persisted relative path remains
+/// a regular, non-symlinked file beneath the trusted media root.
+pub async fn get_media_blob(
+    pool: &sqlx::SqlitePool,
+    root: &Path,
+    owner_type: &str,
+    owner_id: i64,
+    id: i64,
+) -> Result<Option<MediaBlob>> {
+    if id <= 0 || owner_id <= 0 || !matches!(owner_type, "post" | "user" | "comment") {
+        return Ok(None);
+    }
+    let Some(media) = owner_media_blob_row(pool, owner_type, owner_id, id).await? else {
+        return Ok(None);
+    };
+    local_media_blob(&media, root, pool).await
+}
+
+/// Reads a safe local preview first, then fetches a bounded remote preview only
+/// for the exact owner reference while the media row remains queued or failed.
+pub async fn get_media_blob_with_preview(
+    pool: &sqlx::SqlitePool,
+    root: &Path,
+    pipeline: &crate::media_pipeline::MediaPipeline,
+    owner_type: &str,
+    owner_id: i64,
+    id: i64,
+) -> Result<Option<MediaBlob>> {
+    if id <= 0 || owner_id <= 0 || !matches!(owner_type, "post" | "user" | "comment") {
+        return Ok(None);
+    }
+    let Some(media) = owner_media_blob_row(pool, owner_type, owner_id, id).await? else {
+        return Ok(None);
+    };
+    if let Some(blob) = local_media_blob(&media, root, pool).await? {
+        return Ok(Some(blob));
+    }
+    if !matches!(media.status.as_str(), "pending" | "downloading" | "failed")
+        || media.url.is_empty()
+    {
+        return Ok(None);
+    }
+    Ok(pipeline
+        .fetch_preview(&media.url, &media.media_type)
+        .await
+        .ok()
+        .map(|preview| MediaBlob {
+            content_type: preview.content_type,
+            bytes: preview.bytes,
+        }))
+}
+
+async fn owner_media_blob_row(
+    pool: &sqlx::SqlitePool,
+    owner_type: &str,
+    owner_id: i64,
+    id: i64,
+) -> Result<Option<OwnerMediaDto>> {
+    if id <= 0 || owner_id <= 0 || !matches!(owner_type, "post" | "user" | "comment") {
+        return Ok(None);
+    }
+    sqlx::query_as::<_, OwnerMediaDto>(
+        "SELECT m.id,r.owner_type,r.owner_id,m.media_type,m.url,m.local_path,m.status,m.retry_count, \
+          m.last_error,m.created_at,m.updated_at,NULLIF(r.definition,'') definition FROM media_references r \
+          JOIN media m ON m.id=r.media_id \
+          WHERE r.owner_type=? AND r.owner_id=? AND r.media_id=?",
+    )
+    .bind(owner_type)
+    .bind(owner_id)
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(Into::into)
+}
+
+async fn local_media_blob(
+    media: &OwnerMediaDto,
+    root: &Path,
+    pool: &sqlx::SqlitePool,
+) -> Result<Option<MediaBlob>> {
+    if media.status != MediaStatus::Downloaded.as_str() {
+        return Ok(None);
+    }
+    let max_bytes = preview_max_bytes(&media.media_type);
+    let crate::media_pipeline::ResolvedMediaSource::Local(path) = media.resolve_local_source(root)
+    else {
+        return Ok(None);
+    };
+    if path_contains_symlink(root, media.local_path.as_deref()) {
+        return Ok(None);
+    }
+    let metadata = match tokio::fs::metadata(&path).await {
+        Ok(metadata) if metadata.is_file() && metadata.len() <= max_bytes => metadata,
+        _ => return Ok(None),
+    };
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) if bytes.len() as u64 == metadata.len() && bytes.len() as u64 <= max_bytes => {
+            bytes
+        }
+        _ => return Ok(None),
+    };
+    let stored_content_type: Option<String> =
+        sqlx::query_scalar("SELECT content_type FROM media WHERE id=?")
+            .bind(media.id)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+    Ok(Some(MediaBlob {
+        content_type: stored_content_type
+            .filter(|content_type| is_safe_content_type(content_type))
+            .unwrap_or_else(|| content_type_for_local_path(&path, &media.media_type)),
+        bytes,
+    }))
+}
+
+fn preview_max_bytes(media_type: &str) -> u64 {
+    if media_type == "video" {
+        VIDEO_PREVIEW_MAX_BYTES
+    } else {
+        IMAGE_PREVIEW_MAX_BYTES
+    }
+}
+
+fn path_contains_symlink(root: &Path, local_path: Option<&str>) -> bool {
+    let Some(local_path) = local_path.map(Path::new) else {
+        return true;
+    };
+    let mut current = root.to_path_buf();
+    for component in local_path.components() {
+        let Component::Normal(component) = component else {
+            return true;
+        };
+        current.push(component);
+        if match current.symlink_metadata() {
+            Ok(metadata) => metadata.file_type().is_symlink(),
+            Err(_) => true,
+        } {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_safe_content_type(content_type: &str) -> bool {
+    !content_type.is_empty()
+        && content_type.len() <= 128
+        && content_type.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'/' | b'+' | b'-' | b'.' | b';' | b'=' | b' ')
+        })
+}
+
+fn content_type_for_local_path(path: &Path, media_type: &str) -> String {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "avif" => "image/avif",
+        "gif" => "image/gif",
+        "jpeg" | "jpg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        _ if media_type == "video" => "application/octet-stream",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+fn remote_media_source(url: &str) -> crate::media_pipeline::ResolvedMediaSource {
+    if url.is_empty() {
+        crate::media_pipeline::ResolvedMediaSource::Unavailable
+    } else {
+        crate::media_pipeline::ResolvedMediaSource::Remote(url.to_string())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaReferenceDto {
+    pub owner_type: String,
+    pub owner_id: Option<i64>,
+    pub media_type: String,
+    pub url: String,
+    pub definition: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FromRow, Serialize, Deserialize)]
+pub struct MediaClaimDto {
+    pub id: i64,
+    pub url: String,
+    pub media_type: String,
+    pub retry_count: i64,
+    pub claim_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaClaimRequest {
+    pub token: String,
+    pub now_epoch: i64,
+    pub claimed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaDownloadCompletion {
+    pub local_path: String,
+    pub content_type: Option<String>,
+    pub content_length: i64,
+    pub updated_at: String,
 }
 
 /// 监控用户 DTO。
@@ -349,6 +754,14 @@ where
     )
     .fetch_all(executor)
     .await?)
+}
+
+pub async fn get_rate_limit_gates<'e, E>(executor: E) -> Result<Vec<RateLimitGateDto>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    Ok(sqlx::query_as("SELECT account_id,endpoint_key,next_allowed_epoch,backoff_level,retry_after_epoch,updated_at,updated_at_epoch,revision FROM rate_limit_gates ORDER BY account_id,endpoint_key")
+        .fetch_all(executor).await?)
 }
 
 pub async fn delete_account<'c, A>(acquirer: A, id: i64) -> Result<bool>
@@ -749,54 +1162,76 @@ where
         .await?)
 }
 
+pub async fn get_comments(
+    pool: &sqlx::SqlitePool,
+    post_id: i64,
+    root_id: Option<i64>,
+    offset: u32,
+    limit: u32,
+) -> Result<crate::core::task::PaginatedCommentWire> {
+    if post_id <= 0 || root_id.is_some_and(|id| id <= 0) || !(1..=100).contains(&limit) {
+        return Err(crate::error::Error::FormatError(
+            "invalid comment query".into(),
+        ));
+    }
+    let predicate = if root_id.is_some() {
+        "post_id=? AND root_id=? AND depth=1"
+    } else {
+        "post_id=? AND depth=0 AND (root_id IS NULL OR root_id=id)"
+    };
+    let total_sql = format!("SELECT COUNT(*) FROM comments WHERE {predicate}");
+    let mut total_query = sqlx::query_scalar::<_, i64>(&total_sql).bind(post_id);
+    if let Some(root_id) = root_id {
+        total_query = total_query.bind(root_id);
+    }
+    let total = total_query.fetch_one(pool).await? as u64;
+    let list_sql = format!(
+        "SELECT id,post_id,root_id,parent_id,user_id,text,created_at,depth,child_count,like_count,source,media_json,raw_data,content_status,deleted,first_fetched_at,last_refreshed_at FROM comments WHERE {predicate} ORDER BY created_at ASC,id ASC LIMIT ? OFFSET ?"
+    );
+    let mut list_query = sqlx::query_as::<_, CommentDto>(&list_sql).bind(post_id);
+    if let Some(root_id) = root_id {
+        list_query = list_query.bind(root_id);
+    }
+    let comments = list_query.bind(limit).bind(offset).fetch_all(pool).await?;
+    Ok(crate::core::task::PaginatedCommentWire {
+        items: comments.into_iter().map(Into::into).collect(),
+        total_items: total.to_string(),
+        offset,
+        limit,
+    })
+}
+
 /// 保存媒体队列项（按 url 幂等 upsert）。
 pub async fn save_media<'c, A>(acquirer: A, media: &MediaDto) -> Result<()>
 where
     A: Acquire<'c, Database = Sqlite>,
 {
     let mut conn = acquirer.acquire().await?;
-    let (sql, values) = Query::insert()
-        .into_table(MediaIden::Table)
-        .columns([
-            MediaIden::OwnerType,
-            MediaIden::OwnerId,
-            MediaIden::MediaType,
-            MediaIden::Url,
-            MediaIden::LocalPath,
-            MediaIden::Status,
-            MediaIden::RetryCount,
-            MediaIden::LastError,
-            MediaIden::CreatedAt,
-            MediaIden::UpdatedAt,
-        ])
-        .values([
-            media.owner_type.clone().into(),
-            media.owner_id.into(),
-            media.media_type.clone().into(),
-            media.url.clone().into(),
-            media.local_path.clone().into(),
-            media.status.clone().into(),
-            media.retry_count.into(),
-            media.last_error.clone().into(),
-            media.created_at.clone().into(),
-            media.updated_at.clone().into(),
-        ])?
-        .on_conflict(
-            OnConflict::column(MediaIden::Url)
-                .update_columns([
-                    MediaIden::OwnerType,
-                    MediaIden::OwnerId,
-                    MediaIden::MediaType,
-                    MediaIden::LocalPath,
-                    MediaIden::Status,
-                    MediaIden::RetryCount,
-                    MediaIden::LastError,
-                    MediaIden::UpdatedAt,
-                ])
-                .to_owned(),
-        )
-        .build_sqlx(SqliteQueryBuilder);
-    sqlx::query_with(&sql, values).execute(&mut *conn).await?;
+    let content_length = (media.status == MediaStatus::Downloaded.as_str()).then_some(0_i64);
+    sqlx::query(
+        "INSERT INTO media(url,media_type,local_path,status,retry_count,last_error,created_at,updated_at,content_length) \
+         VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(url) DO UPDATE SET \
+         media_type=CASE WHEN media.media_type='video' OR excluded.media_type!='video' THEN media.media_type ELSE 'video' END, \
+         local_path=CASE WHEN media.media_type='video' AND excluded.media_type!='video' THEN media.local_path ELSE excluded.local_path END, \
+         status=CASE WHEN media.media_type='video' AND excluded.media_type!='video' THEN media.status ELSE excluded.status END, \
+         retry_count=CASE WHEN media.media_type='video' AND excluded.media_type!='video' THEN media.retry_count ELSE excluded.retry_count END, \
+         last_error=CASE WHEN media.media_type='video' AND excluded.media_type!='video' THEN media.last_error ELSE excluded.last_error END, \
+         updated_at=CASE WHEN media.media_type='video' AND excluded.media_type!='video' THEN media.updated_at ELSE excluded.updated_at END, \
+         content_length=CASE WHEN media.media_type='video' AND excluded.media_type!='video' THEN media.content_length ELSE excluded.content_length END",
+    )
+    .bind(&media.url).bind(&media.media_type).bind(&media.local_path).bind(&media.status)
+    .bind(media.retry_count).bind(&media.last_error).bind(&media.created_at)
+    .bind(&media.updated_at).bind(content_length).execute(&mut *conn).await?;
+    let media_id: i64 = sqlx::query_scalar("SELECT id FROM media WHERE url=?")
+        .bind(&media.url)
+        .fetch_one(&mut *conn)
+        .await?;
+    if let Some(owner_id) = media.owner_id {
+        sqlx::query("INSERT OR IGNORE INTO media_references(media_id,owner_type,owner_id,definition,created_at) VALUES(?,?,?,?,?)")
+            .bind(media_id).bind(&media.owner_type).bind(owner_id)
+            .bind("").bind(&media.created_at)
+            .execute(&mut *conn).await?;
+    }
     Ok(())
 }
 
@@ -805,36 +1240,48 @@ pub async fn save_media_reference<'c, A>(acquirer: A, media: &MediaDto) -> Resul
 where
     A: Acquire<'c, Database = Sqlite>,
 {
+    save_media_reference_with_definition(
+        acquirer,
+        &MediaReferenceDto {
+            owner_type: media.owner_type.clone(),
+            owner_id: media.owner_id,
+            media_type: media.media_type.clone(),
+            url: media.url.clone(),
+            definition: None,
+            created_at: media.created_at.clone(),
+        },
+    )
+    .await
+}
+
+pub async fn save_media_reference_with_definition<'c, A>(
+    acquirer: A,
+    media: &MediaReferenceDto,
+) -> Result<()>
+where
+    A: Acquire<'c, Database = Sqlite>,
+{
     let mut conn = acquirer.acquire().await?;
-    let (sql, values) = Query::insert()
-        .into_table(MediaIden::Table)
-        .columns([
-            MediaIden::OwnerType,
-            MediaIden::OwnerId,
-            MediaIden::MediaType,
-            MediaIden::Url,
-            MediaIden::LocalPath,
-            MediaIden::Status,
-            MediaIden::RetryCount,
-            MediaIden::LastError,
-            MediaIden::CreatedAt,
-            MediaIden::UpdatedAt,
-        ])
-        .values([
-            media.owner_type.clone().into(),
-            media.owner_id.into(),
-            media.media_type.clone().into(),
-            media.url.clone().into(),
-            media.local_path.clone().into(),
-            media.status.clone().into(),
-            media.retry_count.into(),
-            media.last_error.clone().into(),
-            media.created_at.clone().into(),
-            media.updated_at.clone().into(),
-        ])?
-        .on_conflict(OnConflict::column(MediaIden::Url).do_nothing().to_owned())
-        .build_sqlx(SqliteQueryBuilder);
-    sqlx::query_with(&sql, values).execute(&mut *conn).await?;
+    sqlx::query("INSERT INTO media(url,media_type,status,retry_count,created_at) VALUES(?,?,'pending',0,?) \
+        ON CONFLICT(url) DO UPDATE SET \
+        media_type=CASE WHEN media.media_type='video' OR excluded.media_type!='video' THEN media.media_type ELSE 'video' END, \
+        local_path=CASE WHEN media.media_type!='video' AND excluded.media_type='video' THEN NULL ELSE media.local_path END, \
+        status=CASE WHEN media.media_type!='video' AND excluded.media_type='video' THEN 'pending' ELSE media.status END, \
+        content_length=CASE WHEN media.media_type!='video' AND excluded.media_type='video' THEN NULL ELSE media.content_length END, \
+        claim_token=CASE WHEN media.media_type!='video' AND excluded.media_type='video' THEN NULL ELSE media.claim_token END, \
+        claimed_at=CASE WHEN media.media_type!='video' AND excluded.media_type='video' THEN NULL ELSE media.claimed_at END")
+        .bind(&media.url).bind(&media.media_type).bind(&media.created_at)
+        .execute(&mut *conn).await?;
+    let media_id: i64 = sqlx::query_scalar("SELECT id FROM media WHERE url=?")
+        .bind(&media.url)
+        .fetch_one(&mut *conn)
+        .await?;
+    if let Some(owner_id) = media.owner_id {
+        sqlx::query("INSERT OR IGNORE INTO media_references(media_id,owner_type,owner_id,definition,created_at) VALUES(?,?,?,?,?)")
+            .bind(media_id).bind(&media.owner_type).bind(owner_id)
+            .bind(media.definition.as_deref().unwrap_or("")).bind(&media.created_at)
+            .execute(&mut *conn).await?;
+    }
     Ok(())
 }
 
@@ -843,26 +1290,203 @@ pub async fn get_media_by_url<'e, E>(executor: E, url: &str) -> Result<Option<Me
 where
     E: Executor<'e, Database = Sqlite>,
 {
-    let (sql, values) = Query::select()
-        .columns([
-            MediaIden::Id,
-            MediaIden::OwnerType,
-            MediaIden::OwnerId,
-            MediaIden::MediaType,
-            MediaIden::Url,
-            MediaIden::LocalPath,
-            MediaIden::Status,
-            MediaIden::RetryCount,
-            MediaIden::LastError,
-            MediaIden::CreatedAt,
-            MediaIden::UpdatedAt,
-        ])
-        .from(MediaIden::Table)
-        .and_where(Expr::col(MediaIden::Url).eq(url))
-        .build_sqlx(SqliteQueryBuilder);
-    Ok(sqlx::query_as_with::<Sqlite, MediaDto, _>(&sql, values)
-        .fetch_optional(executor)
-        .await?)
+    Ok(sqlx::query_as(
+        "SELECT m.id,COALESCE(r.owner_type,'') owner_type,r.owner_id,m.media_type,m.url,m.local_path, \
+         m.status,m.retry_count,m.last_error,m.created_at,m.updated_at \
+         FROM media m LEFT JOIN media_references r ON r.media_id=m.id WHERE m.url=? \
+         ORDER BY r.owner_type,r.owner_id,r.definition LIMIT 1",
+    ).bind(url).fetch_optional(executor).await?)
+}
+
+pub async fn get_owner_media<'e, E>(
+    executor: E,
+    owner_type: &str,
+    owner_id: Option<i64>,
+) -> Result<Vec<OwnerMediaDto>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    Ok(sqlx::query_as(
+        "SELECT m.id,r.owner_type,r.owner_id,m.media_type,m.url,m.local_path,m.status,m.retry_count, \
+         m.last_error,m.created_at,m.updated_at,NULLIF(r.definition,'') definition FROM media_references r \
+         JOIN media m ON m.id=r.media_id WHERE r.owner_type=? AND r.owner_id=? ORDER BY m.id,r.definition",
+    ).bind(owner_type).bind(owner_id).fetch_all(executor).await?)
+}
+
+/// Atomically claims one pending or due failed asset not held by an import.
+pub async fn claim_next_media(
+    pool: &sqlx::SqlitePool,
+    request: &MediaClaimRequest,
+) -> Result<Option<MediaClaimDto>> {
+    if request.token.is_empty() || request.now_epoch < 0 {
+        return Err(crate::error::Error::FormatError(
+            "invalid media claim".into(),
+        ));
+    }
+    let request = request.clone();
+    crate::sqlite_write::with_immediate_transaction(pool, |conn| Box::pin(async move {
+        let id: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM media WHERE import_hold=0 AND (status='pending' OR \
+              (status='failed' AND retry_count<5 AND next_retry_at_epoch<=?)) ORDER BY id LIMIT 1",
+        ).bind(request.now_epoch).fetch_optional(&mut *conn).await?;
+        let Some(id) = id else { return Ok(None); };
+        Ok(sqlx::query_as(
+            "UPDATE media SET status='downloading',claim_token=?,claimed_at=?,updated_at=? \
+              WHERE id=? AND import_hold=0 AND (status='pending' OR (status='failed' AND retry_count<5 AND next_retry_at_epoch<=?)) \
+             RETURNING id,url,media_type,retry_count,claim_token",
+        ).bind(&request.token).bind(&request.claimed_at).bind(&request.claimed_at)
+        .bind(id).bind(request.now_epoch).fetch_optional(&mut *conn).await?)
+    })).await
+}
+
+pub async fn complete_media_download<'c, A>(
+    acquirer: A,
+    id: i64,
+    token: &str,
+    completion: &MediaDownloadCompletion,
+) -> Result<bool>
+where
+    A: Acquire<'c, Database = Sqlite>,
+{
+    let mut conn = acquirer.acquire().await?;
+    Ok(sqlx::query(
+        "UPDATE media SET status='downloaded',local_path=?,content_type=?,content_length=?, \
+         claim_token=NULL,claimed_at=NULL,last_error=NULL,next_retry_at_epoch=NULL,updated_at=? \
+         WHERE id=? AND status='downloading' AND claim_token=?",
+    )
+    .bind(&completion.local_path)
+    .bind(&completion.content_type)
+    .bind(completion.content_length)
+    .bind(&completion.updated_at)
+    .bind(id)
+    .bind(token)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected()
+        == 1)
+}
+
+pub async fn fail_media_download<'c, A>(
+    acquirer: A,
+    id: i64,
+    token: &str,
+    now_epoch: i64,
+    error: &str,
+    updated_at: &str,
+) -> Result<bool>
+where
+    A: Acquire<'c, Database = Sqlite>,
+{
+    let mut conn = acquirer.acquire().await?;
+    let delay = 30_i64
+        .saturating_mul(
+            1_i64
+                << 5.min(
+                    sqlx::query_scalar::<_, i64>("SELECT retry_count FROM media WHERE id=?")
+                        .bind(id)
+                        .fetch_optional(&mut *conn)
+                        .await?
+                        .unwrap_or(0) as u32,
+                ),
+        )
+        .min(3600);
+    Ok(sqlx::query(
+        "UPDATE media SET status='failed',retry_count=MIN(retry_count+1,5),next_retry_at_epoch=?, \
+         claim_token=NULL,claimed_at=NULL,last_error=?,updated_at=? \
+         WHERE id=? AND status='downloading' AND claim_token=?",
+    )
+    .bind(now_epoch.saturating_add(delay))
+    .bind(error)
+    .bind(updated_at)
+    .bind(id)
+    .bind(token)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected()
+        == 1)
+}
+
+pub async fn recover_downloading_media<'c, A>(acquirer: A, updated_at: &str) -> Result<u64>
+where
+    A: Acquire<'c, Database = Sqlite>,
+{
+    let mut conn = acquirer.acquire().await?;
+    Ok(sqlx::query(
+        "UPDATE media SET status='pending',claim_token=NULL,claimed_at=NULL,updated_at=? WHERE status='downloading'",
+    ).bind(updated_at).execute(&mut *conn).await?.rows_affected())
+}
+
+pub async fn retry_media<'c, A>(acquirer: A, id: i64, updated_at: &str) -> Result<bool>
+where
+    A: Acquire<'c, Database = Sqlite>,
+{
+    let mut conn = acquirer.acquire().await?;
+    Ok(sqlx::query(
+        "UPDATE media SET status='pending',next_retry_at_epoch=NULL,last_error=NULL,updated_at=? WHERE id=? AND status='failed'",
+    ).bind(updated_at).bind(id).execute(&mut *conn).await?.rows_affected() == 1)
+}
+
+#[cfg(test)]
+mod p3_b_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn comments_are_root_scoped_paginated_and_stably_sorted() {
+        let db = sqlx::SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&db).await.unwrap();
+        for (id, root_id, parent_id, depth, created_at) in [
+            (1_i64, Some(1), None, 0_i64, "2026-01-01T00:00:00Z"),
+            (2, Some(1), Some(1), 1, "2026-01-01T00:00:01Z"),
+            (3, Some(1), Some(2), 2, "2026-01-01T00:00:01Z"),
+            (4, None, None, 0, "2026-01-01T00:00:02Z"),
+        ] {
+            sqlx::query("INSERT INTO comments(id,post_id,root_id,parent_id,user_id,text,created_at,depth) VALUES(?,?,?,?,?,?,?,?)")
+                .bind(id).bind(99_i64).bind(root_id).bind(parent_id).bind(7_i64)
+                .bind(format!("comment-{id}" )).bind(created_at).bind(depth)
+                .execute(&db).await.unwrap();
+        }
+        let page = get_comments(&db, 99, None, 0, 2).await.unwrap();
+        assert_eq!(page.total_items, "2");
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|comment| comment.id.clone())
+                .collect::<Vec<_>>(),
+            vec!["1".to_string(), "4".to_string()]
+        );
+        let replies = get_comments(&db, 99, Some(1), 0, 100).await.unwrap();
+        assert_eq!(
+            replies
+                .items
+                .iter()
+                .map(|comment| comment.id.clone())
+                .collect::<Vec<_>>(),
+            vec!["2".to_string()]
+        );
+    }
+
+    #[test]
+    fn owner_media_wire_never_serializes_private_fields() {
+        let media = OwnerMediaDto {
+            id: 9,
+            owner_type: "post".into(),
+            owner_id: Some(1),
+            media_type: "picture".into(),
+            url: "https://example.invalid/a.jpg".into(),
+            local_path: Some("pictures/a.jpg".into()),
+            status: "downloaded".into(),
+            retry_count: 2,
+            last_error: Some("secret path".into()),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: None,
+            definition: Some("large".into()),
+        };
+        let wire = owner_media_wire(media, std::path::Path::new("."));
+        let json = serde_json::to_string(&wire).unwrap();
+        assert!(json.contains("local_available"));
+        assert!(!json.contains("secret path"));
+        assert!(!json.contains("local_path"));
+    }
 }
 
 /// 保存监控用户（按 uid 幂等 upsert）。
@@ -2554,7 +3178,7 @@ pub mod transactional {
         /// 本事件携带的评论。
         pub comments: Vec<CommentDto>,
         /// 本事件携带的媒体引用。
-        pub media: Vec<MediaDto>,
+        pub media: Vec<MediaReferenceDto>,
         /// 提交后要写入的 checkpoint。
         pub checkpoint: SyncCheckpointDto,
         /// 已处理时间（RFC3339）。
@@ -2612,7 +3236,7 @@ pub mod transactional {
                 save_comment(&mut *tx, comment).await?;
             }
             for media in &self.media {
-                save_media_reference(&mut *tx, media).await?;
+                save_media_reference_with_definition(&mut *tx, media).await?;
             }
             if !save_sync_checkpoint_at(&mut *tx, &self.checkpoint, now_epoch).await? {
                 return Err(crate::error::Error::InconsistentTask(

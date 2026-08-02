@@ -26,6 +26,9 @@ export interface Config {
   static_html: boolean
   picture_path: string
   video_path: string
+  media_path: string
+  media_max_bytes: number
+  media_poll_interval: number
   sdk_config: SdkConfig
   dev_mode_out_dir?: string
 }

@@ -9,7 +9,13 @@ import {
   Button,
   Alert,
   AlertTitle,
+  AppBar,
+  Toolbar,
+  IconButton,
+  useMediaQuery,
+  useTheme,
 } from '@mui/material'
+import MenuIcon from '@mui/icons-material/Menu'
 import { useSnackbar } from 'notistack'
 import { MainListItems } from './listItems'
 import AppRouter from './router'
@@ -42,6 +48,9 @@ const App: React.FC = () => {
   const userConfirmedCloseRef = useRef(false)
   const [legacyDetections, setLegacyDetections] = useState<LegacyDetection[]>([])
   const [legacyDialogOpen, setLegacyDialogOpen] = useState(false)
+  const [mobileDrawerOpen, setMobileDrawerOpen] = useState(false)
+  const theme = useTheme()
+  const desktop = useMediaQuery(theme.breakpoints.up('md'))
 
   const checkAndInitBackend = useCallback(async () => {
     setLoading(true)
@@ -168,10 +177,30 @@ const App: React.FC = () => {
   }
 
   return (
-    <Box sx={{ display: 'flex' }}>
+    <Box sx={{ display: 'flex', minHeight: '100vh', minWidth: 0 }}>
       <CssBaseline />
+      {!desktop && (
+        <AppBar position="fixed" sx={{ zIndex: theme.zIndex.drawer + 1 }}>
+          <Toolbar>
+            <IconButton
+              color="inherit"
+              edge="start"
+              aria-label="打开导航"
+              onClick={() => setMobileDrawerOpen(true)}
+            >
+              <MenuIcon />
+            </IconButton>
+            <Typography variant="h6" sx={{ ml: 1 }}>
+              WeiBack
+            </Typography>
+          </Toolbar>
+        </AppBar>
+      )}
       <Drawer
-        variant="permanent"
+        variant={desktop ? 'permanent' : 'temporary'}
+        open={desktop || mobileDrawerOpen}
+        onClose={() => setMobileDrawerOpen(false)}
+        ModalProps={{ keepMounted: true }}
         sx={{
           width: drawerWidth,
           flexShrink: 0,
@@ -179,7 +208,9 @@ const App: React.FC = () => {
         }}
       >
         <Box sx={{ overflow: 'auto', display: 'flex', flexDirection: 'column', height: '100%' }}>
-          <MainListItems />
+          <Box onClick={() => !desktop && setMobileDrawerOpen(false)}>
+            <MainListItems />
+          </Box>
           <Box sx={{ mt: 'auto' }}>
             <MediaDownloaderStatus />
           </Box>
@@ -189,9 +220,12 @@ const App: React.FC = () => {
         component="main"
         sx={{
           flexGrow: 1,
-          p: 3,
+          p: { xs: 2, md: 3 },
+          pt: { xs: 10, md: 3 },
           pb: isTaskRunning ? `${3 * 8 + taskProgressHeight}px` : 3,
-          width: `calc(100% - ${drawerWidth}px)`,
+          width: desktop ? `calc(100% - ${drawerWidth}px)` : '100%',
+          minWidth: 0,
+          overflowX: 'hidden',
         }}
       >
         <AppRouter />
@@ -206,9 +240,14 @@ const App: React.FC = () => {
       <LegacyImportDialog
         open={legacyDialogOpen}
         detections={legacyDetections}
-        onClose={() => {
+        onCancel={() => {
           dismissLegacyPrompt()
           setLegacyDialogOpen(false)
+        }}
+        onCompleted={() => {
+          dismissLegacyPrompt()
+          setLegacyDialogOpen(false)
+          void checkAndInitBackend()
         }}
       />
     </Box>

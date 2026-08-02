@@ -184,6 +184,62 @@ class ContractValidatorTest(unittest.TestCase):
         }
         self.assertTrue(any("owner_type" in e for e in contract.validate_event(event)))
 
+    def test_media_reference_owner_id_must_be_decimal_i64(self):
+        payload = {
+            "owner_type": "post",
+            "owner_id": "post-1",
+            "media_type": "picture",
+            "url": "https://x/y.png",
+        }
+        errors = contract.validate_payload("media_reference", payload)
+        self.assertTrue(any("owner_id" in e for e in errors))
+
+    def test_media_reference_definition_is_canonical(self):
+        payload = {
+            "owner_type": "post",
+            "owner_id": "1",
+            "media_type": "picture",
+            "url": "https://x/y.png",
+            "definition": "RealOriginal",
+        }
+        errors = contract.validate_payload("media_reference", payload)
+        self.assertTrue(any("definition" in e for e in errors))
+
+    def test_media_reference_rejects_sensitive_url(self):
+        payload = {
+            "owner_type": "user",
+            "owner_id": "1",
+            "media_type": "avatar",
+            "url": "https://x/avatar.jpg?token=secret",
+        }
+        errors = contract.validate_payload("media_reference", payload)
+        self.assertTrue(any("url" in e for e in errors))
+
+        for url in (
+            "https://x/avatar.jpg?access-token=secret",
+            "https://x/avatar.jpg?authorization=secret",
+            "https://x/avatar.jpg?session_id=secret",
+            "https://x/avatar.jpg?x-signature=secret",
+            "https://x/avatar.jpg#access_token=secret",
+            "https://x/avatar.jpg?token=",
+        ):
+            with self.subTest(url=url):
+                payload["url"] = url
+                self.assertTrue(any(
+                    "url" in error
+                    for error in contract.validate_payload("media_reference", payload)
+                ))
+
+    def test_media_reference_requires_https_url(self):
+        payload = {
+            "owner_type": "post",
+            "owner_id": "1",
+            "media_type": "picture",
+            "url": "http://x/y.png",
+        }
+        errors = contract.validate_payload("media_reference", payload)
+        self.assertTrue(any("HTTPS" in e for e in errors))
+
     def test_done_status_enum(self):
         event = {
             "protocol_version": 1,

@@ -25,8 +25,8 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
-use serde::Serialize;
-use tokio::sync::mpsc;
+use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info};
 use url::Url;
 
@@ -117,6 +117,22 @@ pub struct DownloaderWorker {
     client: Client,
     status_listener: Arc<Mutex<Option<Box<dyn MediaDownloaderStatusListener>>>>,
     status: Arc<DownloaderStatusState>,
+}
+
+/// Outcome of stopping the legacy in-memory downloader worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DownloaderWorkerSummary {
+    pub stopped: bool,
+    pub join_failed: Option<String>,
+}
+
+/// A spawned downloader worker owned by [`crate::core::Core`].
+///
+/// The sender remains in `TaskHandler`, so shutdown must explicitly cancel the
+/// receiver instead of waiting for all sender clones to be dropped.
+pub struct DownloaderWorkerTask {
+    cancelled: watch::Sender<bool>,
+    handle: JoinHandle<()>,
 }
 
 /// A thread-safe handle for communicating with the [`DownloaderWorker`].
@@ -213,13 +229,27 @@ impl DownloaderWorker {
     ///
     /// This method will run indefinitely until the handle is dropped or the channel
     /// is closed. It should be spawned onto a background executor.
-    pub async fn run(mut self) {
+    pub async fn run(self) {
+        let (cancelled, receiver) = watch::channel(false);
+        self.run_until_cancelled(receiver).await;
+        drop(cancelled);
+    }
+
+    async fn run_until_cancelled(mut self, mut cancelled: watch::Receiver<bool>) {
         info!("Media downloader actor started.");
         let mut workers: FuturesUnordered<JoinHandle<(String, Result<()>)>> =
             FuturesUnordered::new();
 
         loop {
             tokio::select! {
+                changed = cancelled.changed() => {
+                    if changed.is_ok() && *cancelled.borrow() {
+                        self.receiver.close();
+                        // Dropping the futures cancels in-flight HTTP requests before Core joins.
+                        drop(workers);
+                        break;
+                    }
+                }
                 // 只有当 workers 数量小于上限时，才去 poll receiver
                 opt = self.receiver.recv(), if workers.len() < MAX_CONCURRENT_DOWNLOADS => {
                     match opt {
@@ -309,6 +339,48 @@ impl DownloaderWorker {
         })?;
         debug!("Successfully downloaded media file from {url}");
         (callback)(ctx, body).await
+    }
+}
+
+impl DownloaderWorkerTask {
+    pub fn spawn(worker: DownloaderWorker) -> Self {
+        let (cancelled, receiver) = watch::channel(false);
+        let handle = tokio::spawn(worker.run_until_cancelled(receiver));
+        Self { cancelled, handle }
+    }
+
+    pub fn cancel(&self) {
+        let _ = self.cancelled.send(true);
+    }
+
+    pub async fn shutdown(&mut self, timeout: std::time::Duration) -> DownloaderWorkerSummary {
+        self.cancel();
+        if self.handle.is_finished() {
+            return match (&mut self.handle).await {
+                Ok(()) => DownloaderWorkerSummary {
+                    stopped: true,
+                    join_failed: None,
+                },
+                Err(error) => DownloaderWorkerSummary {
+                    stopped: false,
+                    join_failed: Some(error.to_string()),
+                },
+            };
+        }
+        match tokio::time::timeout(timeout, &mut self.handle).await {
+            Ok(Ok(())) => DownloaderWorkerSummary {
+                stopped: true,
+                join_failed: None,
+            },
+            Ok(Err(error)) => DownloaderWorkerSummary {
+                stopped: false,
+                join_failed: Some(error.to_string()),
+            },
+            Err(_) => DownloaderWorkerSummary {
+                stopped: false,
+                join_failed: Some("legacy downloader worker did not stop before timeout".into()),
+            },
+        }
     }
 }
 
@@ -474,5 +546,17 @@ mod local_tests {
             }
         }
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn worker_task_cancels_and_joins_with_live_sender() {
+        let (handle, worker) = create_downloader(1, Client::new());
+        let mut worker = DownloaderWorkerTask::spawn(worker);
+
+        let summary = worker.shutdown(std::time::Duration::from_secs(1)).await;
+
+        assert!(summary.stopped);
+        assert!(summary.join_failed.is_none());
+        drop(handle);
     }
 }

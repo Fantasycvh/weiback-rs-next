@@ -18,9 +18,33 @@ import {
   SyncJobControlOutcome,
   SyncJobSpec,
   SyncRun,
+  PostInfo,
+  PaginatedComments,
+  OwnerMedia,
+  MediaBlob,
+  SyncDiagnostics,
 } from '../types'
 import { Config } from '../types/config'
-import { LegacyDetection } from '../types/legacy'
+import { LegacyDetection, LegacyImportSummary } from '../types/legacy'
+
+export type UserBackup = {
+  id: string
+  relative_path: string
+  created_at: string
+  file_count: number
+}
+
+export type UserBackupVerification = {
+  id: string
+  valid: boolean
+  file_count: number
+}
+
+export type UserRestoreSummary = {
+  id: string
+  rollback_created: boolean
+  restart_required: boolean
+}
 
 // Backend
 export type BackendStatus =
@@ -60,6 +84,7 @@ export const resumeSyncJob = (jobId: string) => invoke<SyncJob>('resume_sync_job
 export const cancelSyncJob = (jobId: string) =>
   invoke<SyncJobControlOutcome>('cancel_sync_job', { jobId })
 export const retrySyncJob = (jobId: string) => invoke<SyncJob>('retry_sync_job', { jobId })
+export const getSyncDiagnostics = () => invoke<SyncDiagnostics>('get_sync_diagnostics')
 
 // Backup
 export const backupUser = (uid: string, numPages: number, backupType: BackupType) =>
@@ -73,6 +98,18 @@ export const rebackupMissingImages = (query: PostQuery) =>
 // Posts
 export const queryLocalPosts = (query: PostQuery) =>
   invoke<PaginatedPostInfo>('query_local_posts', { query })
+export const getPostDetail = (id: string) => invoke<PostInfo | null>('get_post_detail', { id })
+export const getPostComments = (
+  postId: string,
+  rootId: string | null,
+  offset: number,
+  limit: number
+) => invoke<PaginatedComments>('get_post_comments', { postId, rootId, offset, limit })
+export const getOwnerMedia = (ownerType: string, ownerId: string) =>
+  invoke<OwnerMedia[]>('get_owner_media', { ownerType, ownerId })
+export const getMediaBlob = (ownerType: string, ownerId: string, mediaId: string) =>
+  invoke<MediaBlob | null>('get_media_blob', { ownerType, ownerId, mediaId })
+export const retryMedia = (mediaId: string) => invoke<boolean>('retry_media', { mediaId })
 export const deletePost = (options: DeletePostOptions) => invoke('delete_post', { options })
 export const rebackupPost = (id: string) => invoke('rebackup_post', { id })
 
@@ -100,3 +137,15 @@ export const setConfig = (config: Config) => invoke('set_config_command', { conf
 
 // Legacy
 export const detectLegacySources = () => invoke<LegacyDetection[]>('detect_legacy_sources')
+export const inspectLegacySource = (sourcePath: string) =>
+  invoke<LegacyDetection>('inspect_legacy_source', { sourcePath })
+export const importLegacySource = (sourcePath: string) =>
+  invoke<LegacyImportSummary>('import_legacy_source', { sourcePath })
+
+// User data snapshots intentionally contain only SQLite data and downloaded media, never sessions.
+export const createUserBackup = () => invoke<UserBackup>('create_user_backup')
+export const listUserBackups = () => invoke<UserBackup[]>('list_user_backups')
+export const verifyUserBackup = (backupId: string) =>
+  invoke<UserBackupVerification>('verify_user_backup', { backupId })
+export const restoreUserBackup = (backupId: string) =>
+  invoke<UserRestoreSummary>('restore_user_backup', { backupId })

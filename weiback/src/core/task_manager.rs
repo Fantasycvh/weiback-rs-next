@@ -317,6 +317,15 @@ impl TaskManager {
         Ok(self.current_task.lock()?.clone())
     }
 
+    /// Returns whether the user-visible task slot is still capable of writing data.
+    pub fn has_active_task(&self) -> Result<bool> {
+        Ok(self
+            .current_task
+            .lock()?
+            .as_ref()
+            .is_some_and(|task| matches!(task.status, TaskStatus::InProgress | TaskStatus::Paused)))
+    }
+
     /// 暂停当前任务（仅 `InProgress` → `Paused`）。
     pub fn pause_current(&self) -> Result<()> {
         self.transition_if(
@@ -648,6 +657,18 @@ mod local_tests {
     }
 
     #[test]
+    fn active_task_detection_blocks_restore_until_task_is_terminal() {
+        let manager = TaskManager::new();
+        manager
+            .start_task(1, TaskType::BackupUser, "writer".into(), 1)
+            .unwrap();
+        assert!(manager.has_active_task().unwrap());
+
+        manager.cancel_current().unwrap();
+        assert!(!manager.has_active_task().unwrap());
+    }
+
+    #[test]
     fn stale_task_id_cannot_mutate_replacement_task() {
         let manager = TaskManager::new();
         manager
@@ -667,5 +688,20 @@ mod local_tests {
         assert_eq!(current.status, TaskStatus::InProgress);
         assert_eq!(current.progress, 0);
         assert!(current.error.is_none());
+    }
+
+    #[test]
+    fn unknown_total_remains_zero_while_committed_progress_advances() {
+        let manager = TaskManager::new();
+        manager
+            .start_task(7, TaskType::CollectComments, "Unknown total".into(), 0)
+            .unwrap();
+
+        manager.update_progress_for(7, 20, 0).unwrap();
+
+        let current = manager.get_current().unwrap().unwrap();
+        assert_eq!(current.progress, 20);
+        assert_eq!(current.total, 0);
+        assert_eq!(current.status, TaskStatus::InProgress);
     }
 }

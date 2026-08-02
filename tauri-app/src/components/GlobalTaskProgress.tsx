@@ -1,25 +1,28 @@
 import React from 'react'
-import { Box, LinearProgress, Typography } from '@mui/material'
+import { Box, LinearProgress, Typography, useMediaQuery, useTheme } from '@mui/material'
 import { useTaskStore } from '../stores/taskStore'
 
 const drawerWidth = 200
 
 const GlobalTaskProgress: React.FC = () => {
   const task = useTaskStore(state => state.currentTask)
+  const theme = useTheme()
+  const desktop = useMediaQuery(theme.breakpoints.up('md'))
 
   if (!task || task.status !== 'InProgress') {
     return null
   }
 
-  const progress = task.total > 0 ? (task.progress / task.total) * 100 : 0
+  const hasKnownTotal = task.total > 0
+  const progress = hasKnownTotal ? (task.progress / task.total) * 100 : undefined
 
   return (
     <Box
       sx={{
         position: 'fixed',
         bottom: 0,
-        left: drawerWidth,
-        width: `calc(100% - ${drawerWidth}px)`,
+        left: desktop ? drawerWidth : 0,
+        width: desktop ? `calc(100% - ${drawerWidth}px)` : '100%',
         p: 2,
         bgcolor: 'background.paper',
         zIndex: theme => theme.zIndex.drawer + 1,
@@ -30,9 +33,12 @@ const GlobalTaskProgress: React.FC = () => {
       <Typography variant="body2" gutterBottom>
         {task.description}
       </Typography>
-      <LinearProgress variant="determinate" value={progress} />
+      <LinearProgress
+        variant={hasKnownTotal ? 'determinate' : 'indeterminate'}
+        value={progress}
+      />
       <Typography variant="caption" color="text.secondary">
-        {`${task.progress} / ${task.total}`}
+        {hasKnownTotal ? `${task.progress} / ${task.total}` : `已处理 ${task.progress}`}
       </Typography>
     </Box>
   )

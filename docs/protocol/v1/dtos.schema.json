@@ -153,12 +153,12 @@
       "properties": {
         "id": { "type": ["string", "null"] },
         "owner_type": { "type": "string", "enum": ["post", "user", "comment"] },
-        "owner_id": { "type": ["string", "integer"] },
+        "owner_id": { "type": "string", "pattern": "^(0|[1-9][0-9]{0,18})$", "description": "Rust i64 可解析的规范十进制字符串" },
         "post_id": { "type": ["string", "integer", "null"] },
         "user_id": { "type": ["string", "integer", "null"] },
         "media_type": { "type": "string", "enum": ["picture", "video", "avatar", "emoji"] },
-        "url": { "type": "string" },
-        "definition": { "type": ["string", "null"], "description": "图片清晰度等级" }
+        "url": { "type": "string", "pattern": "^https://[^\\s]+$", "description": "仅允许 HTTPS 媒体地址" },
+        "definition": { "type": ["string", "null"], "enum": ["original", "large", "bmiddle", null], "description": "规范媒体清晰度等级" }
       }
     },
     "checkpoint_payload": {

@@ -18,6 +18,7 @@ use weibosdk_rs::config::Config as SdkConfig;
 
 use crate::error::Result;
 use crate::models::PictureDefinition;
+use crate::storage::internal::entities::MEDIA_MAX_BYTES;
 
 /// Global, lazily initialized instance of the application configuration.
 ///
@@ -150,6 +151,14 @@ pub struct Config {
     pub picture_path: PathBuf,
     /// Base path for storing downloaded videos.
     pub video_path: PathBuf,
+    /// Unified root for the durable media pipeline.
+    #[serde(default = "default_media_path")]
+    pub media_path: PathBuf,
+    /// Maximum accepted size for one durable media asset.
+    pub media_max_bytes: u64,
+    /// Idle polling interval for the durable media worker.
+    #[serde(with = "duration_as_secs")]
+    pub media_poll_interval: Duration,
     /// Configuration settings for the Weibo SDK.
     pub sdk_config: SdkConfig,
     /// Output directory for dev mode, if enabled.
@@ -170,6 +179,10 @@ impl Default for Config {
     }
 }
 
+fn default_media_path() -> PathBuf {
+    runtime_dirs().media_dir
+}
+
 impl Config {
     fn from_roots(config_root: &std::path::Path, data_root: &std::path::Path) -> Self {
         let config_dir = config_root.join(APP_NAMESPACE);
@@ -186,6 +199,9 @@ impl Config {
             static_html: false,
             picture_path: runtime.pictures_dir,
             video_path: runtime.videos_dir,
+            media_path: runtime.media_dir,
+            media_max_bytes: MEDIA_MAX_BYTES,
+            media_poll_interval: Duration::from_secs(1),
             sdk_config: Default::default(),
             #[cfg(feature = "dev-mode")]
             dev_mode_out_dir: dirs::download_dir().map(|dir| dir.join("weiback-next-records")),
@@ -416,6 +432,37 @@ mod local_tests {
             config.video_path,
             Path::new("data-root/weiback-next/media/videos")
         );
+        assert_eq!(config.media_path, Path::new("data-root/weiback-next/media"));
+    }
+
+    #[test]
+    fn config_roundtrip_preserves_unified_and_legacy_media_paths() {
+        let mut config = Config::from_roots(Path::new("config-root"), Path::new("data-root"));
+        config.media_path = PathBuf::from("custom/unified-media");
+        config.picture_path = PathBuf::from("custom/legacy-pictures");
+        config.video_path = PathBuf::from("custom/legacy-videos");
+
+        let encoded = toml::to_string(&config).unwrap();
+        let restored: Config = toml::from_str(&encoded).unwrap();
+
+        assert_eq!(restored.media_path, Path::new("custom/unified-media"));
+        assert_eq!(restored.picture_path, Path::new("custom/legacy-pictures"));
+        assert_eq!(restored.video_path, Path::new("custom/legacy-videos"));
+    }
+
+    #[test]
+    fn old_config_without_media_path_uses_current_namespace_media_root() {
+        let mut config = Config::from_roots(Path::new("config-root"), Path::new("data-root"));
+        config.picture_path = PathBuf::from("custom/pictures-only");
+        config.video_path = PathBuf::from("custom/videos-only");
+        let mut value = toml::Value::try_from(&config).unwrap();
+        value.as_table_mut().unwrap().remove("media_path");
+
+        let restored: Config = value.try_into().unwrap();
+
+        assert_eq!(restored.media_path, runtime_dirs().media_dir);
+        assert_eq!(restored.picture_path, Path::new("custom/pictures-only"));
+        assert_eq!(restored.video_path, Path::new("custom/videos-only"));
     }
 
     #[test]

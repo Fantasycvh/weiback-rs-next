@@ -419,6 +419,9 @@ def _append_user_event(
         return
     emitted_users.add(str(user_id))
     events.append(("user", user))
+    avatar_ref = extract.media_reference_from_user(user)
+    if avatar_ref is not None:
+        events.append(("media_reference", avatar_ref))
 
 
 def _finish(emitter: Emitter, stream: str, result: CollectResult) -> None:

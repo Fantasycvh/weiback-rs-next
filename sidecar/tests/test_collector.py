@@ -372,7 +372,7 @@ class PostsAndCommentsExtractTest(unittest.TestCase):
         body = {
             "data": [
                 {
-                    "id": "c100000000000000001",
+                    "id": "100000000000000001",
                     "text": "一级评论",
                     "created_at": "Sat Aug 01 13:00:00 +0800 2026",
                     "user": {"id": "2000000021", "screen_name": "评论者"},

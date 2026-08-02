@@ -1,6 +1,6 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
-import { BrowserRouter } from 'react-router-dom'
+import { HashRouter } from 'react-router-dom'
 import { SnackbarProvider } from 'notistack'
 import CssBaseline from '@mui/material/CssBaseline'
 import { AppThemeProvider } from './AppThemeProvider'
@@ -21,9 +21,9 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
         anchorOrigin={{ vertical: 'top', horizontal: 'right' }}
         action={snackbarId => <SnackbarAction id={snackbarId} />}
       >
-        <BrowserRouter>
+        <HashRouter>
           <App />
-        </BrowserRouter>
+        </HashRouter>
       </SnackbarProvider>
     </AppThemeProvider>
   </React.StrictMode>

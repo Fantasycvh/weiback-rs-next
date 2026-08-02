@@ -31,12 +31,23 @@ def _replay(category, stream, *, checkpoint=None, request_id=NEW_REQUEST_ID):
 
 class FixtureReplayTest(unittest.TestCase):
     def test_posts_fixture_replays_complete_stream(self):
-        count, lines = _replay("posts", "user:1234567890:posts")
+        with patch.dict(
+            os.environ,
+            {"WEIBACK_COLLECTOR_FIXTURE": "posts/long_text_full.jsonl"},
+        ):
+            count, lines = _replay("posts", "user:1234567890:posts")
         self.assertGreater(count, 0)
         self.assertEqual(lines[0]["type"], "started")
         self.assertEqual(lines[0]["stream"], "user:1234567890:posts")
         types = [line["type"] for line in lines]
         self.assertIn("post", types)
+        avatar_refs = [
+            line for line in lines
+            if line["type"] == "media_reference"
+            and line["payload"]["media_type"] == "avatar"
+        ]
+        self.assertEqual(len(avatar_refs), 1)
+        self.assertTrue(avatar_refs[0]["payload"]["url"].startswith("https://"))
         self.assertEqual(lines[-1]["type"], "done")
 
     def test_envelope_is_rewritten_for_current_request(self):

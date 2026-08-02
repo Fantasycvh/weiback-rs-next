@@ -819,6 +819,86 @@ async fn real_sidecar_exit_at_recovery_limit_fails_exactly_once() {
 }
 
 #[tokio::test]
+async fn exit_after_post_before_checkpoint_rolls_back_then_successful_replacement_completes() {
+    let Some(py) = python() else {
+        eprintln!("python not found, skipping");
+        return;
+    };
+    let db = create_db_pool_with_url(":memory:").await.unwrap();
+    let stream = "user:post-before-checkpoint:posts";
+    let job_id = enqueue_sync_job(&db, &job(stream)).await.unwrap();
+    let crash_script = concat!(
+        "import json,sys\n",
+        "print('{\"protocol_version\":1,\"request_id\":null,\"event_id\":\"019fbbd7-ea26-7b7c-b113-c89ac2790501\",\"type\":\"ready\",\"occurred_at\":\"2026-08-01T00:00:00Z\",\"payload\":{\"sidecar_name\":\"x\",\"sidecar_version\":\"1\",\"protocol_version\":1}}')\n",
+        "print('{\"protocol_version\":1,\"request_id\":null,\"event_id\":\"019fbbd7-ea26-7b7c-b113-c89ac2790502\",\"type\":\"capabilities\",\"occurred_at\":\"2026-08-01T00:00:00Z\",\"payload\":{\"protocol_versions\":[1],\"commands\":[\"hello\",\"collect_user_posts\"]}}')\n",
+        "sys.stdout.flush();sys.stdin.readline();cmd=json.loads(sys.stdin.readline());rid=cmd['request_id'];base={'protocol_version':1,'request_id':rid,'stream':'user:post-before-checkpoint:posts','occurred_at':'2026-08-01T00:00:01Z'}\n",
+        "print(json.dumps({**base,'event_id':'019fbbd7-ea26-7b7c-b113-c89ac2790503','type':'started','sequence':1,'payload':{}}))\n",
+        "print(json.dumps({**base,'event_id':'019fbbd7-ea26-7b7c-b113-c89ac2790504','type':'post','sequence':2,'payload':{'id':'92001','uid':'1','text':'must not commit'}}));sys.stdout.flush();sys.exit(8)\n",
+    );
+    let first = JobExecutor::with_spawn_options(
+        db.clone(),
+        Arc::new(WorkerRegistry::new()),
+        scripted_options(py.clone(), crash_script),
+    )
+    .run_next()
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(first.status, "pending");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM posts WHERE id=92001")
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(get_sync_checkpoint(&db, stream).await.unwrap().is_none());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM processed_events WHERE event_id='019fbbd7-ea26-7b7c-b113-c89ac2790504'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap(),
+        0
+    );
+    let recovered = get_sync_job(&db, job_id).await.unwrap().unwrap();
+    assert_eq!(
+        (recovered.status.as_str(), recovered.recovery_count),
+        ("pending", 1)
+    );
+
+    let success_script = concat!(
+        "import json,sys\n",
+        "print('{\"protocol_version\":1,\"request_id\":null,\"event_id\":\"019fbbd7-ea26-7b7c-b113-c89ac2790511\",\"type\":\"ready\",\"occurred_at\":\"2026-08-01T00:00:00Z\",\"payload\":{\"sidecar_name\":\"x\",\"sidecar_version\":\"1\",\"protocol_version\":1}}')\n",
+        "print('{\"protocol_version\":1,\"request_id\":null,\"event_id\":\"019fbbd7-ea26-7b7c-b113-c89ac2790512\",\"type\":\"capabilities\",\"occurred_at\":\"2026-08-01T00:00:00Z\",\"payload\":{\"protocol_versions\":[1],\"commands\":[\"hello\",\"collect_user_posts\"]}}')\n",
+        "sys.stdout.flush();sys.stdin.readline();cmd=json.loads(sys.stdin.readline());rid=cmd['request_id'];base={'protocol_version':1,'request_id':rid,'stream':'user:post-before-checkpoint:posts','occurred_at':'2026-08-01T00:00:02Z'}\n",
+        "print(json.dumps({**base,'event_id':'019fbbd7-ea26-7b7c-b113-c89ac2790513','type':'started','sequence':1,'payload':{}}))\n",
+        "print(json.dumps({**base,'event_id':'019fbbd7-ea26-7b7c-b113-c89ac2790514','type':'post','sequence':2,'payload':{'id':'92001','uid':'1','text':'committed retry'}}))\n",
+        "print(json.dumps({**base,'event_id':'019fbbd7-ea26-7b7c-b113-c89ac2790515','type':'checkpoint','sequence':3,'payload':{'cursor':{'max_id':'done','max_id_type':0},'fetched_count':1}}))\n",
+        "print(json.dumps({**base,'event_id':'019fbbd7-ea26-7b7c-b113-c89ac2790516','type':'done','sequence':4,'payload':{'status':'completed','fetched_count':1}}));sys.stdout.flush()\n",
+    );
+    let second = JobExecutor::with_spawn_options(
+        db.clone(),
+        Arc::new(WorkerRegistry::new()),
+        scripted_options(py, success_script),
+    )
+    .run_next()
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(second.status, "completed");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM posts WHERE id=92001")
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(get_sync_checkpoint(&db, stream).await.unwrap().is_some());
+}
+
+#[tokio::test]
 async fn pause_wins_done_to_finish_window_without_worker_lost_ownership_error() {
     let Some(py) = python() else {
         eprintln!("python not found, skipping");
@@ -879,4 +959,96 @@ async fn pause_wins_done_to_finish_window_without_worker_lost_ownership_error() 
         get_sync_job(&db, job_id).await.unwrap().unwrap().status,
         "paused"
     );
+}
+
+fn checkpoint_then_failure_script(stream: &str, event_type: &str, code: &str) -> String {
+    format!(
+        r#"import json,sys
+print('{{"protocol_version":1,"request_id":null,"event_id":"019fbbd7-ea26-7b7c-b113-c89ac2790601","type":"ready","occurred_at":"2026-08-01T00:00:00Z","payload":{{"sidecar_name":"x","sidecar_version":"1","protocol_version":1}}}}')
+print('{{"protocol_version":1,"request_id":null,"event_id":"019fbbd7-ea26-7b7c-b113-c89ac2790602","type":"capabilities","occurred_at":"2026-08-01T00:00:00Z","payload":{{"protocol_versions":[1],"commands":["hello","collect_user_posts"]}}}}')
+sys.stdout.flush();sys.stdin.readline();cmd=json.loads(sys.stdin.readline());rid=cmd['request_id'];base={{'protocol_version':1,'request_id':rid,'stream':'{stream}','occurred_at':'2026-08-01T00:00:01Z'}}
+print(json.dumps({{**base,'event_id':'019fbbd7-ea26-7b7c-b113-c89ac2790603','type':'started','sequence':1,'payload':{{}}}}))
+print(json.dumps({{**base,'event_id':'019fbbd7-ea26-7b7c-b113-c89ac2790604','type':'post','sequence':2,'payload':{{'id':'94001','uid':'1','text':'committed page'}}}}))
+print(json.dumps({{**base,'event_id':'019fbbd7-ea26-7b7c-b113-c89ac2790605','type':'checkpoint','sequence':3,'payload':{{'cursor':{{'max_id':'committed-page','max_id_type':0}},'fetched_count':1}}}}))
+print(json.dumps({{**base,'event_id':'019fbbd7-ea26-7b7c-b113-c89ac2790606','type':'post','sequence':4,'payload':{{'id':'94002','uid':'1','text':'must roll back'}}}}))
+print(json.dumps({{**base,'event_id':'019fbbd7-ea26-7b7c-b113-c89ac2790607','type':'{event_type}','sequence':5,'payload':{{'code':'{code}','message':'collector rejected C:\\private\\session.json','retryable':False}}}}));sys.stdout.flush()
+"#
+    )
+}
+
+#[tokio::test]
+async fn auth_and_schema_failures_keep_committed_page_without_leaking_rate_or_session_state() {
+    let Some(py) = python() else {
+        eprintln!("python not found, skipping");
+        return;
+    };
+    for (event_type, code) in [
+        ("auth_required", "AUTH_REQUIRED"),
+        ("error", "RESPONSE_SCHEMA_CHANGED"),
+    ] {
+        let db = create_db_pool_with_url(":memory:").await.unwrap();
+        let stream = format!("user:{code}:posts");
+        let job_id = enqueue_sync_job(&db, &job(&stream)).await.unwrap();
+        let result = JobExecutor::with_spawn_options(
+            db.clone(),
+            Arc::new(WorkerRegistry::new()),
+            scripted_options(
+                py.clone(),
+                &checkpoint_then_failure_script(&stream, event_type, code),
+            ),
+        )
+        .run_next()
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(result.status, "failed", "{code}");
+        let stored = get_sync_job(&db, job_id).await.unwrap().unwrap();
+        assert_eq!(stored.status, "failed", "{code}");
+        let last_error = stored.last_error.unwrap();
+        assert_eq!(last_error, code);
+        let run = get_sync_run_history(&db, job_id, 1)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(run.status, "failed", "{code}");
+        assert_eq!(run.error.as_deref(), Some(code));
+
+        let checkpoint = get_sync_checkpoint(&db, &stream).await.unwrap().unwrap();
+        assert_eq!(checkpoint.fetched_count, 1, "{code}");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM posts WHERE id=94001")
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            1,
+            "{code}"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM posts WHERE id=94002")
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            0,
+            "{code}"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM processed_events WHERE event_id='019fbbd7-ea26-7b7c-b113-c89ac2790605'",
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+            1,
+            "{code}"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM rate_limit_gates")
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            0,
+            "{code}"
+        );
+    }
 }

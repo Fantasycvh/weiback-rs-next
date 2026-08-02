@@ -11,6 +11,7 @@ P1-A 交付物：
 from __future__ import annotations
 
 import re
+from urllib.parse import parse_qsl, urlsplit
 
 from . import extract
 from .protocol import PROTOCOL_VERSION, is_uuid_v7
@@ -63,6 +64,17 @@ _REQUIRED_PAYLOAD = {
 _CONTENT_STATUS = {"partial", "complete"}
 _MEDIA_OWNER_TYPES = {"post", "user", "comment"}
 _MEDIA_TYPES = {"picture", "video", "avatar", "emoji"}
+_MEDIA_DEFINITIONS = {"original", "large", "bmiddle"}
+_I64_MAX = 9_223_372_036_854_775_807
+_DECIMAL_ID_RE = re.compile(r"^(?:0|[1-9][0-9]*)$")
+_SENSITIVE_URL_KEYS = {
+    "access_token", "auth", "authorization", "cookie", "gsid", "passport",
+    "password", "secret", "session", "sub", "token", "xsrf",
+}
+_SENSITIVE_URL_KEY_PARTS = (
+    "auth", "cookie", "credential", "gsid", "passport", "password", "secret",
+    "session", "signature", "token", "xsrf",
+)
 _DONE_STATUS = {"completed", "stopped"}
 _ERROR_SCOPE = {"request", "stream", "sidecar"}
 _RATE_LIMITED_SCOPE = {"account", "endpoint", "request"}
@@ -182,8 +194,21 @@ def _validate_payload(event_type: str, payload: dict, errors: list[str]) -> None
         media_type = payload.get("media_type")
         if media_type not in _MEDIA_TYPES:
             errors.append(f"media_reference.media_type must be one of {sorted(_MEDIA_TYPES)}")
-        if not isinstance(payload.get("url"), str) or not payload.get("url"):
-            errors.append("media_reference.url must be a non-empty string")
+        owner_id = payload.get("owner_id")
+        if (
+            not isinstance(owner_id, str)
+            or not _DECIMAL_ID_RE.fullmatch(owner_id)
+            or int(owner_id) > _I64_MAX
+        ):
+            errors.append("media_reference.owner_id must be a canonical decimal i64 string")
+        definition = payload.get("definition")
+        if definition is not None and definition not in _MEDIA_DEFINITIONS:
+            errors.append(
+                f"media_reference.definition must be one of {sorted(_MEDIA_DEFINITIONS)} or null"
+            )
+        url = payload.get("url")
+        if not _is_safe_media_url(url):
+            errors.append("media_reference.url must be a non-sensitive HTTPS URL")
 
     elif event_type == "checkpoint":
         cursor = payload.get("cursor")
@@ -231,6 +256,33 @@ def _validate_payload(event_type: str, payload: dict, errors: list[str]) -> None
     elif event_type == "cancelled":
         if not isinstance(payload.get("request_id"), str):
             errors.append("cancelled.request_id must be a string")
+
+
+def _is_safe_media_url(value) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        parsed = urlsplit(value)
+        query_keys = {
+            key.lower() for key, _value in parse_qsl(parsed.query, keep_blank_values=True)
+        }
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "https"
+        and bool(parsed.netloc)
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.fragment
+        and not any(_is_sensitive_url_key(key) for key in query_keys)
+    )
+
+
+def _is_sensitive_url_key(key: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", key.lower())
+    return key.lower() in _SENSITIVE_URL_KEYS or any(
+        part in normalized for part in _SENSITIVE_URL_KEY_PARTS
+    )
 
 
 def validate_fixture_events(events: list[dict]) -> list[str]:

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
 
 use super::task_manager::TaskManager;
@@ -161,6 +161,7 @@ pub enum SearchTerm {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostQuery {
+    #[serde(default, deserialize_with = "deserialize_optional_i64")]
     pub user_id: Option<i64>,
     pub start_date: Option<i64>, // Unix timestamp
     pub end_date: Option<i64>,   // Unix timestamp
@@ -170,6 +171,50 @@ pub struct PostQuery {
     // for pagination
     pub page: u32,
     pub posts_per_page: u32,
+    #[serde(default)]
+    pub content_type: Option<String>,
+    #[serde(default)]
+    pub content_status: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+fn deserialize_optional_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum WireI64 {
+        Number(i64),
+        String(String),
+    }
+
+    Option::<WireI64>::deserialize(deserializer)?.map_or(Ok(None), |value| {
+        let parsed = match value {
+            WireI64::Number(value) => value,
+            WireI64::String(value) => value.parse().map_err(serde::de::Error::custom)?,
+        };
+        Ok(Some(parsed))
+    })
+}
+
+impl Default for PostQuery {
+    fn default() -> Self {
+        Self {
+            user_id: None,
+            start_date: None,
+            end_date: None,
+            search_term: None,
+            is_favorited: false,
+            reverse_order: false,
+            page: 1,
+            posts_per_page: 20,
+            content_type: None,
+            content_status: None,
+            source: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,4 +253,12 @@ pub struct PostInfo {
 pub struct PaginatedPostInfo {
     pub posts: Vec<PostInfo>,
     pub total_items: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaginatedCommentWire {
+    pub items: Vec<crate::storage::internal::entities::CommentWire>,
+    pub total_items: String,
+    pub offset: u32,
+    pub limit: u32,
 }

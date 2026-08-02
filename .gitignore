@@ -15,6 +15,9 @@ target/
 
 # Ignore hidden directories
 /.*
+!/.github/
+!/.github/workflows/
+!/.github/workflows/release-integrity.yml
 
 # Python (sidecar)
 __pycache__/

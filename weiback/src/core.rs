@@ -33,7 +33,13 @@ use crate::api::DevApiClient;
 use crate::config::get_config;
 use crate::error::Result;
 use crate::exporter::ExporterImpl;
-use crate::media_downloader::MediaDownloaderHandle;
+use crate::media_downloader::{
+    DownloaderWorkerSummary, DownloaderWorkerTask, MediaDownloaderHandle,
+    MediaDownloaderStatusListener,
+};
+use crate::media_pipeline::{
+    MediaPipeline, MediaPipelineConfig, MediaWorkerSummary, MediaWorkerTask,
+};
 use crate::models::User;
 use crate::refresh_scheduler::{PersistentScheduler, RefreshScheduleConfig};
 use crate::sidecar::{
@@ -42,22 +48,27 @@ use crate::sidecar::{
 };
 use crate::storage::StorageImpl;
 use crate::storage::internal::entities::{
-    AccountDto, JobControlResult, MonitoredUserDto, SyncJobDto, SyncJobSpec, SyncRunDto,
-    delete_account, delete_monitored_user, enqueue_sync_job_spec, get_accounts,
-    get_monitored_users, get_sync_job, get_sync_jobs, get_sync_run_history,
-    recover_interrupted_sync_jobs, resume_sync_job, retry_sync_job, save_account,
-    save_monitored_user,
+    AccountDto, JobControlResult, MonitoredUserDto, OwnerMediaDto, SyncJobDto, SyncJobSpec,
+    SyncRunDto, delete_account, delete_monitored_user, enqueue_sync_job_spec, get_accounts,
+    get_comments, get_monitored_users, get_owner_media, get_rate_limit_gates, get_sync_job,
+    get_sync_jobs, get_sync_run_history, recover_interrupted_sync_jobs, resume_sync_job,
+    retry_media, retry_sync_job, save_account, save_monitored_user,
 };
 use crate::sync_executor::{
     ControlStopResult, JobExecutor, WorkerRegistry, WorkerShutdownSummary,
     account_session_resolver, validate_account_session,
+};
+use crate::user_backup::{
+    UserBackupPaths, UserBackupSummary, UserBackupVerification, UserRestoreSummary,
+    create_user_backup, list_user_backups, preflight_restore_user_backup, restore_user_backup,
+    verify_user_backup,
 };
 pub use task::{
     BackupFavoritesOptions, BackupUserPostsOptions, CleanupInvalidPostsOptions, DeletePostOptions,
     ExportJobOptions, PaginatedPostInfo, PostQuery, TaskContext, TaskRequest, UserPostFilter,
 };
 pub use task_handler::TaskHandler;
-pub use task_manager::{Task, TaskError, TaskEventListener, TaskManager, TaskType};
+pub use task_manager::{Task, TaskError, TaskEventListener, TaskManager, TaskStatus, TaskType};
 
 /// Runs a short-lived task and logs the error if it fails.
 ///
@@ -100,12 +111,30 @@ pub struct Core {
     shutdown_admission: ShutdownAdmission,
     persistent_scheduler: Mutex<PersistentSchedulerLifecycle>,
     ad_hoc_collection: Mutex<Option<AdHocCollectionTask>>,
+    media_pipeline: MediaPipeline,
+    media_worker: Mutex<Option<MediaWorkerTask>>,
+    legacy_media_downloader: MediaDownloaderHandle,
+    legacy_media_worker: Mutex<Option<DownloaderWorkerTask>>,
+    long_task: Mutex<Option<LongTask>>,
 }
 
 #[derive(Default)]
 struct ShutdownAdmission {
     shutting_down: AtomicBool,
+    active_writers: AtomicU64,
     gate: Mutex<()>,
+}
+
+struct WriteAdmission<'a> {
+    admission: &'a ShutdownAdmission,
+}
+
+impl Drop for WriteAdmission<'_> {
+    fn drop(&mut self) {
+        self.admission
+            .active_writers
+            .fetch_sub(1, Ordering::Release);
+    }
 }
 
 impl ShutdownAdmission {
@@ -128,6 +157,26 @@ impl ShutdownAdmission {
         let _gate = self.gate.lock().unwrap_or_else(|error| error.into_inner());
         self.shutting_down.store(true, Ordering::Release);
     }
+
+    fn begin_write(&self) -> Result<WriteAdmission<'_>> {
+        let _gate = self.gate.lock()?;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(crate::error::Error::InconsistentTask(
+                "core is shutting down".to_string(),
+            ));
+        }
+        self.active_writers.fetch_add(1, Ordering::AcqRel);
+        Ok(WriteAdmission { admission: self })
+    }
+
+    fn has_active_writers(&self) -> bool {
+        self.active_writers.load(Ordering::Acquire) != 0
+    }
+
+    fn end_shutdown(&self) {
+        let _gate = self.gate.lock().unwrap_or_else(|error| error.into_inner());
+        self.shutting_down.store(false, Ordering::Release);
+    }
 }
 
 #[derive(Default)]
@@ -143,6 +192,11 @@ struct PersistentSchedulerTask {
 
 struct AdHocCollectionTask {
     cancelled: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+}
+
+struct LongTask {
+    task_id: u64,
     handle: JoinHandle<()>,
 }
 
@@ -173,6 +227,9 @@ pub struct PersistentShutdownSummary {
     pub ad_hoc: SchedulerShutdownStatus,
     pub workers: WorkerShutdownSummary,
     pub database_failures: Vec<PersistentShutdownFailure>,
+    pub media: MediaWorkerSummary,
+    pub legacy_media: DownloaderWorkerSummary,
+    pub long_task: SchedulerShutdownStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,6 +249,12 @@ impl PersistentShutdownSummary {
                 SchedulerShutdownStatus::TimedOut | SchedulerShutdownStatus::JoinFailed
             )
             || !self.database_failures.is_empty()
+            || !self.media.stopped
+            || !self.legacy_media.stopped
+            || matches!(
+                self.long_task,
+                SchedulerShutdownStatus::TimedOut | SchedulerShutdownStatus::JoinFailed
+            )
     }
 }
 
@@ -203,17 +266,36 @@ impl Core {
         task_handler: TH,
         sdk_api_client: Arc<CurrentSdkApiClient>,
         db_pool: SqlitePool,
+        legacy_media_downloader: MediaDownloaderHandle,
+        legacy_media_worker: DownloaderWorkerTask,
     ) -> Result<Self> {
+        let config = get_config().read()?.clone();
         Ok(Self {
             next_task_id: AtomicU64::new(1),
             task_handler: Arc::new(task_handler),
             task_manager: Arc::new(TaskManager::new()),
             sdk_api_client,
-            db_pool,
+            db_pool: db_pool.clone(),
             persistent_workers: Arc::new(WorkerRegistry::new()),
             shutdown_admission: ShutdownAdmission::default(),
             persistent_scheduler: Mutex::new(PersistentSchedulerLifecycle::default()),
             ad_hoc_collection: Mutex::new(None),
+            media_pipeline: MediaPipeline::new(
+                db_pool.clone(),
+                reqwest::Client::new(),
+                MediaPipelineConfig {
+                    media_root: config.media_path,
+                    max_bytes: config.media_max_bytes,
+                    poll_interval: config.media_poll_interval,
+                    allow_http: false,
+                    allow_private_network: false,
+                    max_redirects: 5,
+                },
+            ),
+            media_worker: Mutex::new(None),
+            legacy_media_downloader,
+            legacy_media_worker: Mutex::new(Some(legacy_media_worker)),
+            long_task: Mutex::new(None),
         })
     }
 
@@ -236,6 +318,22 @@ impl Core {
             Err(crate::error::Error::InconsistentTask(_)) => return Ok(false),
             Err(error) => return Err(error),
         };
+        let mut media_worker = self.media_worker.lock()?;
+        if media_worker
+            .as_ref()
+            .is_some_and(MediaWorkerTask::is_finished)
+        {
+            media_worker.take();
+        }
+        if media_worker.is_none() {
+            tokio::runtime::Handle::try_current().map_err(|error| {
+                crate::error::Error::Tokio(format!(
+                    "media worker requires an active Tokio runtime: {error}"
+                ))
+            })?;
+            *media_worker = Some(MediaWorkerTask::spawn(self.media_pipeline.clone()));
+        }
+        drop(media_worker);
         let mut lifecycle = self.persistent_scheduler.lock()?;
         if lifecycle.task.is_some() {
             return Ok(false);
@@ -274,6 +372,7 @@ impl Core {
         let wait_timeout =
             timeout.max(DEFAULT_HANDSHAKE_TIMEOUT + std::time::Duration::from_secs(3));
         let deadline = tokio::time::Instant::now() + wait_timeout;
+        let legacy_media_deadline = tokio::time::Instant::now() + timeout;
         let scheduler_task = match self.persistent_scheduler.lock() {
             Ok(mut lifecycle) => lifecycle.task.take(),
             Err(_) => None,
@@ -292,6 +391,24 @@ impl Core {
         }
 
         self.persistent_workers.begin_shutdown();
+        let media_task = self
+            .media_worker
+            .lock()
+            .ok()
+            .and_then(|mut task| task.take());
+        let legacy_media_task = self
+            .legacy_media_worker
+            .lock()
+            .ok()
+            .and_then(|mut task| task.take());
+        let long_task = self.long_task.lock().ok().and_then(|mut task| task.take());
+        if let Some(task) = &legacy_media_task {
+            task.cancel();
+        }
+        if let Some(task) = &long_task {
+            task.handle.abort();
+            let _ = self.task_manager.cancel_for(task.task_id);
+        }
         let database_failures = Vec::new();
         let registry = self.persistent_workers.clone();
         let worker_task = tokio::task::spawn_blocking(move || registry.shutdown_all(wait_timeout));
@@ -330,12 +447,59 @@ impl Core {
                 }
             },
         };
+        let media = match media_task {
+            Some(task) => task.shutdown(wait_timeout).await,
+            None => MediaWorkerSummary {
+                stopped: true,
+                join_failed: None,
+            },
+        };
+        let legacy_media = match legacy_media_task {
+            Some(mut task) => {
+                let remaining = legacy_media_deadline
+                    .checked_duration_since(tokio::time::Instant::now())
+                    .unwrap_or_default();
+                let summary = task.shutdown(remaining).await;
+                if !summary.stopped
+                    && let Ok(mut lifecycle) = self.legacy_media_worker.lock()
+                {
+                    *lifecycle = Some(task);
+                }
+                summary
+            }
+            None => DownloaderWorkerSummary {
+                stopped: true,
+                join_failed: None,
+            },
+        };
+        let long_task = match long_task {
+            None => SchedulerShutdownStatus::NotRunning,
+            Some(mut task) => match tokio::time::timeout_at(deadline, &mut task.handle).await {
+                Ok(Ok(())) | Ok(Err(_)) => SchedulerShutdownStatus::Stopped,
+                Err(_) => {
+                    if let Ok(mut lifecycle) = self.long_task.lock() {
+                        *lifecycle = Some(task);
+                    }
+                    SchedulerShutdownStatus::TimedOut
+                }
+            },
+        };
         PersistentShutdownSummary {
             scheduler,
             ad_hoc,
             workers,
             database_failures,
+            media,
+            legacy_media,
+            long_task,
         }
+    }
+
+    pub fn set_legacy_media_downloader_status_listener(
+        &self,
+        listener: Box<dyn MediaDownloaderStatusListener>,
+    ) {
+        self.legacy_media_downloader.set_status_listener(listener);
     }
 
     pub async fn recover_persistent_tasks(&self) -> Result<()> {
@@ -353,11 +517,70 @@ impl Core {
         Ok(())
     }
 
+    fn user_backup_paths(&self) -> Result<UserBackupPaths> {
+        let config = get_config().read()?.clone();
+        let imports_dir = config
+            .db_path
+            .parent()
+            .ok_or_else(|| {
+                crate::error::Error::FormatError("configured data root is invalid".into())
+            })?
+            .join("imports");
+        Ok(
+            UserBackupPaths::new(config.db_path, config.media_path, imports_dir)
+                .with_legacy_media_roots(config.picture_path, config.video_path),
+        )
+    }
+
+    pub async fn create_user_backup(&self) -> Result<UserBackupSummary> {
+        let _admission = self.shutdown_admission.begin_write()?;
+        create_user_backup(&self.db_pool, &self.user_backup_paths()?).await
+    }
+
+    pub async fn list_user_backups(&self) -> Result<Vec<UserBackupSummary>> {
+        list_user_backups(&self.user_backup_paths()?).await
+    }
+
+    pub async fn verify_user_backup(&self, id: &str) -> Result<UserBackupVerification> {
+        verify_user_backup(&self.user_backup_paths()?, id).await
+    }
+
+    /// Stops all writers before swapping on-disk user data. A successful restore requires
+    /// process restart because this Core intentionally retains no reopenable pool.
+    pub async fn restore_user_backup(&self, id: &str) -> Result<UserRestoreSummary> {
+        // Reject bad input before stopping workers or closing the live connection pool.
+        verify_user_backup(&self.user_backup_paths()?, id).await?;
+        preflight_restore_user_backup(&self.user_backup_paths()?, id).await?;
+        self.shutdown_admission.begin_shutdown();
+        if self.shutdown_admission.has_active_writers() || self.task_manager.has_active_task()? {
+            self.shutdown_admission.end_shutdown();
+            return Err(crate::error::Error::InconsistentTask(
+                "cannot restore while an ordinary task or writer is active; cancel it and wait for completion".into(),
+            ));
+        }
+        let shutdown = self
+            .shutdown_persistent_tasks(std::time::Duration::from_secs(5))
+            .await;
+        if shutdown.degraded() {
+            self.shutdown_admission.end_shutdown();
+            return Err(crate::error::Error::InconsistentTask(
+                "cannot restore while persistent workers are still stopping".into(),
+            ));
+        }
+        self.db_pool.close().await;
+        restore_user_backup(&self.user_backup_paths()?, id).await.map_err(|error| {
+            crate::error::Error::InconsistentTask(format!(
+                "restore failed after the live database pool was closed; restart required: {error}"
+            ))
+        })
+    }
+
     pub async fn get_accounts(&self) -> Result<Vec<AccountDto>> {
         get_accounts(&self.db_pool).await
     }
 
     pub async fn save_account(&self, mut account: AccountDto) -> Result<i64> {
+        let _admission = self.shutdown_admission.begin_write()?;
         let session_root = get_config()
             .read()?
             .session_path
@@ -396,6 +619,7 @@ impl Core {
     }
 
     pub async fn delete_account(&self, id: i64) -> Result<bool> {
+        let _admission = self.shutdown_admission.begin_write()?;
         delete_account(&self.db_pool, id).await
     }
 
@@ -403,7 +627,144 @@ impl Core {
         get_monitored_users(&self.db_pool).await
     }
 
+    pub async fn get_owner_media(
+        &self,
+        owner_type: &str,
+        owner_id: Option<i64>,
+    ) -> Result<Vec<OwnerMediaDto>> {
+        get_owner_media(&self.db_pool, owner_type, owner_id).await
+    }
+
+    /// Returns approved local bytes, or a bounded remote preview for an owned queued row.
+    pub async fn get_media_blob(
+        &self,
+        owner_type: &str,
+        owner_id: i64,
+        media_id: i64,
+    ) -> Result<Option<crate::storage::internal::entities::MediaBlob>> {
+        if media_id <= 0 || owner_id <= 0 || !matches!(owner_type, "post" | "user" | "comment") {
+            return Ok(None);
+        }
+        let config = get_config().read()?.clone();
+        crate::storage::internal::entities::get_media_blob_with_preview(
+            &self.db_pool,
+            &config.media_path,
+            &self.media_pipeline,
+            owner_type,
+            owner_id,
+            media_id,
+        )
+        .await
+    }
+
+    pub async fn retry_media(&self, media_id: i64) -> Result<bool> {
+        let _admission = self.shutdown_admission.begin_write()?;
+        retry_media(&self.db_pool, media_id, &chrono::Utc::now().to_rfc3339()).await
+    }
+
+    pub async fn get_post_detail(&self, id: i64) -> Result<Option<task::PostInfo>> {
+        self.task_handler.get_post_detail(id).await
+    }
+
+    pub async fn get_post_comments(
+        &self,
+        post_id: i64,
+        root_id: Option<i64>,
+        offset: u32,
+        limit: u32,
+    ) -> Result<task::PaginatedCommentWire> {
+        get_comments(&self.db_pool, post_id, root_id, offset, limit).await
+    }
+
+    pub async fn get_sync_diagnostics(&self) -> Result<serde_json::Value> {
+        let accounts = get_accounts(&self.db_pool).await?;
+        let session_root = get_config()
+            .read()?
+            .session_path
+            .parent()
+            .map(std::path::Path::to_path_buf);
+        let session_ready = session_root
+            .as_deref()
+            .map(|root| {
+                accounts
+                    .iter()
+                    .filter(|account| {
+                        account.enabled && validate_account_session(account, root).is_ok()
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        let media_counts =
+            sqlx::query_as::<_, (String, i64)>("SELECT status,COUNT(*) FROM media GROUP BY status")
+                .fetch_all(&self.db_pool)
+                .await?;
+        let mut media = serde_json::Map::new();
+        for status in ["pending", "downloading", "failed", "downloaded"] {
+            media.insert(
+                status.into(),
+                serde_json::json!(
+                    media_counts
+                        .iter()
+                        .find(|(key, _)| key == status)
+                        .map(|(_, count)| *count)
+                        .unwrap_or(0)
+                ),
+            );
+        }
+        let gates = get_rate_limit_gates(&self.db_pool)
+            .await?
+            .into_iter()
+            .map(|gate| {
+                serde_json::json!({
+                    "account_id": gate.account_id.to_string(), "endpoint": gate.endpoint_key,
+                    "next_allowed": gate.next_allowed_epoch, "backoff": gate.backoff_level
+                })
+            })
+            .collect::<Vec<_>>();
+        let sidecar = tokio::task::spawn_blocking(|| {
+            let Some(program) = crate::sidecar::supervisor::resolve_sidecar_command() else {
+                return (
+                    serde_json::json!({"healthy": false, "status": "missing", "version": null, "protocol_version": null}),
+                    serde_json::json!({"installed": false, "version": null, "status": "unavailable"}),
+                );
+            };
+            let options = crate::sidecar::SpawnOptions { program, handshake_timeout: std::time::Duration::from_secs(3), ..Default::default() };
+            match crate::sidecar::Sidecar::spawn_with_handshake(&options) {
+                Ok((mut sidecar, ready, capabilities)) => {
+                    let shutdown = sidecar.shutdown(std::time::Duration::from_millis(500)).is_ok();
+                    let installed = capabilities.get("browser_installed").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                    (
+                    serde_json::json!({"healthy": shutdown, "status": if shutdown { "ok" } else { "degraded" },
+                        "version": ready.get("sidecar_version").cloned().or_else(|| capabilities.get("sidecar_version").cloned()).unwrap_or(serde_json::Value::Null),
+                        "protocol_version": ready.get("protocol_version").cloned().or_else(|| capabilities.get("protocol_version").cloned()).unwrap_or(serde_json::Value::Null)}),
+                    serde_json::json!({"installed": installed,
+                        "version": capabilities.get("browser_version").cloned().unwrap_or(serde_json::Value::Null),
+                        "status": if installed { "ok" } else { "missing" }}))
+                }
+                Err(_) => (
+                    serde_json::json!({"healthy": false, "status": "unhealthy", "version": null, "protocol_version": null}),
+                    serde_json::json!({"installed": false, "version": null, "status": "unknown"}),
+                ),
+            }
+        }).await.map_err(|error| crate::error::Error::Tokio(error.to_string()))?;
+        Ok(serde_json::json!({
+            "app": {"version": env!("CARGO_PKG_VERSION"), "health": "ok"},
+            "sidecar": sidecar.0,
+            "chromium": sidecar.1,
+            "browser": sidecar.1,
+            "accounts": {"total": accounts.len(), "enabled": accounts.iter().filter(|a| a.enabled).count(), "session_ready": session_ready},
+            "media": media,
+            "rate_gates": gates,
+            "auth": if self.sdk_api_client.session().is_ok() {
+                serde_json::json!({"ready": 1, "not_ready": 0})
+            } else {
+                serde_json::json!({"ready": 0, "not_ready": 1})
+            }
+        }))
+    }
+
     pub async fn save_monitored_user(&self, mut user: MonitoredUserDto) -> Result<()> {
+        let _admission = self.shutdown_admission.begin_write()?;
         let now = chrono::Utc::now().to_rfc3339();
         if user.created_at.is_empty() {
             user.created_at = now.clone();
@@ -413,10 +774,12 @@ impl Core {
     }
 
     pub async fn delete_monitored_user(&self, account_id: i64, uid: i64) -> Result<bool> {
+        let _admission = self.shutdown_admission.begin_write()?;
         delete_monitored_user(&self.db_pool, account_id, uid).await
     }
 
     pub async fn enqueue_sync_job(&self, spec: SyncJobSpec) -> Result<i64> {
+        let _admission = self.shutdown_admission.begin_write()?;
         let now = chrono::Utc::now();
         enqueue_sync_job_spec(&self.db_pool, &spec, now.timestamp(), &now.to_rfc3339()).await
     }
@@ -430,6 +793,7 @@ impl Core {
     }
 
     pub async fn pause_sync_job(&self, job_id: i64) -> Result<SyncJobControlOutcome> {
+        let _admission = self.shutdown_admission.begin_write()?;
         let worker_stop = JobExecutor::new(self.db_pool.clone(), self.persistent_workers.clone())
             .pause(job_id, std::time::Duration::from_secs(5))
             .await?;
@@ -440,6 +804,7 @@ impl Core {
     }
 
     pub async fn cancel_sync_job(&self, job_id: i64) -> Result<SyncJobControlOutcome> {
+        let _admission = self.shutdown_admission.begin_write()?;
         let worker_stop = JobExecutor::new(self.db_pool.clone(), self.persistent_workers.clone())
             .cancel(job_id, std::time::Duration::from_secs(5))
             .await?;
@@ -450,12 +815,14 @@ impl Core {
     }
 
     pub async fn resume_sync_job(&self, job_id: i64) -> Result<SyncJobDto> {
+        let _admission = self.shutdown_admission.begin_write()?;
         let now = chrono::Utc::now().to_rfc3339();
         let _: JobControlResult = resume_sync_job(&self.db_pool, job_id, &now).await?;
         self.require_sync_job(job_id).await
     }
 
     pub async fn retry_sync_job(&self, job_id: i64) -> Result<SyncJobDto> {
+        let _admission = self.shutdown_admission.begin_write()?;
         let now = chrono::Utc::now().to_rfc3339();
         let _: JobControlResult = retry_sync_job(&self.db_pool, job_id, &now).await?;
         self.require_sync_job(job_id).await
@@ -523,11 +890,11 @@ impl Core {
     /// # Arguments
     /// * `phone_number` - The phone number to send the code to (e.g., "13800138000").
     pub async fn get_sms_code(&self, phone_number: String) -> Result<()> {
-        info!("send_code called for phone number: {phone_number}");
+        info!("SMS code requested");
         self.sdk_api_client
             .get_sms_code(phone_number)
             .await
-            .inspect_err(|e| error!("get_sms_code failed: {e}"))?;
+            .inspect_err(|_| error!("SMS code request failed"))?;
         Ok(())
     }
 
@@ -542,6 +909,7 @@ impl Core {
     /// # Errors
     /// Returns an error if the login fails or if the system is not in the `WaitingForCode` state.
     pub async fn login(&self, sms_code: String) -> Result<User> {
+        let _admission = self.shutdown_admission.begin_write()?;
         info!("login called with a sms_code");
         match self.sdk_api_client.login_state() {
             LoginState::WaitingForCode { .. } => {
@@ -549,7 +917,7 @@ impl Core {
                 self.sdk_api_client
                     .login(&sms_code)
                     .await
-                    .inspect_err(|e| error!("SDK login failed: {e}"))?;
+                    .inspect_err(|_| error!("SDK login failed"))?;
                 info!("Login successful.");
                 let session_path = get_config()
                     .read()
@@ -557,25 +925,22 @@ impl Core {
                     .session_path
                     .clone();
                 let session = self.sdk_api_client.session().inspect_err(|e| {
-                    error!("get session after login failed: {e}");
+                    let _ = e;
+                    error!("SMS login session retrieval failed");
                 })?;
                 session.save(session_path).inspect_err(|e| {
-                    error!("save session to disk failed: {e}");
+                    let _ = e;
+                    error!("SMS login session persistence failed");
                 })?;
 
                 let user: User = serde_json::from_value(session.user.clone()).inspect_err(|e| {
-                    error!("parse user from session failed: {e}");
+                    let _ = e;
+                    error!("SMS login user parsing failed");
                 })?;
                 let user_id = user.id;
 
-                let th = self.task_handler.clone();
                 let ctx = self.create_short_task_context();
-                let user_clone = user.clone();
-                spawn(async move {
-                    if let Err(e) = th.save_user_info(ctx, &user_clone).await {
-                        error!("Save user info failed: {e}");
-                    }
-                });
+                self.task_handler.save_user_info(ctx, &user).await?;
                 info!("Logged in user {} saved.", user_id);
 
                 Ok(user)
@@ -583,10 +948,12 @@ impl Core {
             LoginState::LoggedIn { .. } => {
                 warn!("Already logged in, skipping login.");
                 let session = self.sdk_api_client.session().inspect_err(|e| {
-                    error!("get session in AlreadyLoggedIn branch failed: {e}");
+                    let _ = e;
+                    error!("Existing login session retrieval failed");
                 })?;
                 let user: User = serde_json::from_value(session.user).inspect_err(|e| {
-                    error!("parse user from session in AlreadyLoggedIn branch failed: {e}");
+                    let _ = e;
+                    error!("Existing login user parsing failed");
                 })?;
                 Ok(user)
             }
@@ -608,7 +975,8 @@ impl Core {
             .ok()
             .map(|s| {
                 serde_json::from_value(s.user.clone()).inspect_err(|e| {
-                    error!("parse user from session failed: {e}");
+                    let _ = e;
+                    error!("Login state user parsing failed");
                 })
             })
             .transpose()?)
@@ -653,6 +1021,7 @@ impl Core {
 
     /// Deletes a post from local storage.
     pub async fn delete_post(&self, options: DeletePostOptions) -> Result<()> {
+        let _admission = self.shutdown_admission.begin_write()?;
         let ctx = self.create_short_task_context();
         run_short_task!(
             self,
@@ -663,6 +1032,7 @@ impl Core {
 
     /// Re-fetches a single post from the Weibo API and updates local storage.
     pub async fn rebackup_post(&self, id: i64) -> Result<()> {
+        let _admission = self.shutdown_admission.begin_write()?;
         let ctx = self.create_short_task_context();
         run_short_task!(
             self,
@@ -673,6 +1043,7 @@ impl Core {
 
     /// Retrieves the raw image data (blob) for a given picture ID.
     pub async fn get_picture_blob(&self, id: &str) -> Result<Option<Bytes>> {
+        let _admission = self.shutdown_admission.begin_write()?;
         let ctx = self.create_short_task_context();
         run_short_task!(
             self,
@@ -683,6 +1054,7 @@ impl Core {
 
     /// Retrieves the raw video data (blob) for a given video URL.
     pub async fn get_video_blob(&self, url: &str) -> Result<Option<Bytes>> {
+        let _admission = self.shutdown_admission.begin_write()?;
         let ctx = self.create_short_task_context();
         run_short_task!(
             self,
@@ -801,10 +1173,11 @@ impl Core {
                     &request,
                     &worker_cancelled,
                     |progress, total| {
-                        if let Err(e) = blocking_task_manager.update_progress_for(
+                        if let Err(e) = publish_collection_progress(
+                            &blocking_task_manager,
                             task_id,
                             progress,
-                            total.max(progress),
+                            total,
                         ) {
                             warn!("failed to publish collection progress: {e}");
                         }
@@ -830,17 +1203,13 @@ impl Core {
 
     /// Export local posts to another format (e.g., HTML).
     pub async fn export_posts(&self, request: TaskRequest) -> Result<()> {
-        let ctx = self.create_long_task_context();
-        let id = ctx.task_id.unwrap();
         if let TaskRequest::Export(options) = request {
-            self.task_manager
-                .start_task(id, TaskType::Export, "导出帖子".into(), 0)?;
-            spawn(handle_task_request(
-                self.task_handler.clone(),
-                ctx,
+            self.start_long_task(
+                TaskType::Export,
+                "导出帖子",
+                0,
                 TaskRequest::Export(options),
-            ));
-            Ok(())
+            )
         } else {
             Err(crate::error::Error::InconsistentTask(
                 "Invalid task request for export_posts".into(),
@@ -850,21 +1219,13 @@ impl Core {
 
     /// Clean up redundant or low-resolution images.
     pub async fn cleanup_pictures(&self, request: TaskRequest) -> Result<()> {
-        let ctx = self.create_long_task_context();
-        let id = ctx.task_id.unwrap();
         if let TaskRequest::CleanupPictures(options) = request {
-            self.task_manager.start_task(
-                id,
+            self.start_long_task(
                 TaskType::CleanupPictures,
-                "清理重复图片".into(),
+                "清理重复图片",
                 0,
-            )?;
-            spawn(handle_task_request(
-                self.task_handler.clone(),
-                ctx,
                 TaskRequest::CleanupPictures(options),
-            ));
-            Ok(())
+            )
         } else {
             Err(crate::error::Error::InconsistentTask(
                 "Invalid task request for cleanup_pictures".into(),
@@ -874,35 +1235,23 @@ impl Core {
 
     /// Clean up invalid or outdated avatars.
     pub async fn cleanup_outdated_avatars(&self) -> Result<()> {
-        let ctx = self.create_long_task_context();
-        let id = ctx.task_id.unwrap();
-        self.task_manager
-            .start_task(id, TaskType::CleanupAvatars, "清理失效头像".into(), 0)?;
-        spawn(handle_task_request(
-            self.task_handler.clone(),
-            ctx,
+        self.start_long_task(
+            TaskType::CleanupAvatars,
+            "清理失效头像",
+            0,
             TaskRequest::CleanupOutdatedAvatars,
-        ));
-        Ok(())
+        )
     }
 
     /// Clean up invalid posts.
     pub async fn cleanup_invalid_posts(&self, request: TaskRequest) -> Result<()> {
-        let ctx = self.create_long_task_context();
-        let id = ctx.task_id.unwrap();
         if let TaskRequest::CleanupInvalidPosts(options) = request {
-            self.task_manager.start_task(
-                id,
+            self.start_long_task(
                 TaskType::CleanupInvalidPosts,
-                "清理失效帖子".into(),
+                "清理失效帖子",
                 0,
-            )?;
-            spawn(handle_task_request(
-                self.task_handler.clone(),
-                ctx,
                 TaskRequest::CleanupInvalidPosts(options),
-            ));
-            Ok(())
+            )
         } else {
             Err(crate::error::Error::InconsistentTask(
                 "Invalid task request for cleanup_invalid_posts".into(),
@@ -912,79 +1261,70 @@ impl Core {
 
     /// Starts a long-running task to backup a user's posts.
     pub async fn backup_user(&self, request: TaskRequest) -> Result<()> {
-        let ctx = self.create_long_task_context();
-        let id = ctx.task_id.unwrap();
         let total = request.total() as u64;
-        self.task_manager
-            .start_task(id, TaskType::BackupUser, "备份用户微博".into(), total)?;
-        spawn(handle_task_request(self.task_handler.clone(), ctx, request));
-        Ok(())
+        self.start_long_task(TaskType::BackupUser, "备份用户微博", total, request)
     }
 
     /// Starts a long-running task to backup the current user's favorites.
     pub async fn backup_favorites(&self, request: TaskRequest) -> Result<()> {
-        let ctx = self.create_long_task_context();
-        let id = ctx.task_id.unwrap();
         let total = request.total() as u64;
-        self.task_manager
-            .start_task(id, TaskType::BackupFavorites, "备份收藏".into(), total)?;
-        spawn(handle_task_request(self.task_handler.clone(), ctx, request));
-        Ok(())
+        self.start_long_task(TaskType::BackupFavorites, "备份收藏", total, request)
     }
 
     /// Starts a long-running task to unfavorite posts that are in the local database.
     pub async fn unfavorite_posts(&self) -> Result<()> {
-        let ctx = self.create_long_task_context();
-        let id = ctx.task_id.unwrap();
-        let total = 0; // Will be updated later in task_handler
-        self.task_manager
-            .start_task(id, TaskType::UnfavoritePosts, "取消收藏".into(), total)?;
-        spawn(handle_task_request(
-            self.task_handler.clone(),
-            ctx,
+        self.start_long_task(
+            TaskType::UnfavoritePosts,
+            "取消收藏",
+            0,
             TaskRequest::UnfavoritePosts,
-        ));
-        Ok(())
+        )
     }
 
     /// Starts a long-running task to re-backup posts.
     pub async fn rebackup_posts(&self, request: TaskRequest) -> Result<()> {
-        let ctx = self.create_long_task_context();
-        let id = ctx.task_id.unwrap();
-        let total = 0; // Will be updated in task_handler
-        self.task_manager
-            .start_task(id, TaskType::RebackupPosts, "批量重新备份".into(), total)?;
-        spawn(handle_task_request(self.task_handler.clone(), ctx, request));
-        Ok(())
+        self.start_long_task(TaskType::RebackupPosts, "批量重新备份", 0, request)
     }
 
     /// Starts a long-running task to re-backup posts with missing images.
     pub async fn rebackup_missing_images(&self, request: TaskRequest) -> Result<()> {
-        let ctx = self.create_long_task_context();
-        let id = ctx.task_id.unwrap();
-        let total = 0; // Will be updated in task_handler
-        self.task_manager.start_task(
-            id,
+        self.start_long_task(
             TaskType::RebackupMissingImages,
-            "重新备份缺失图片".into(),
-            total,
-        )?;
-        spawn(handle_task_request(self.task_handler.clone(), ctx, request));
-        Ok(())
+            "重新备份缺失图片",
+            0,
+            request,
+        )
     }
 
     /// Starts a long-running task to clean up invalid pictures.
     pub async fn cleanup_invalid_pictures(&self, request: TaskRequest) -> Result<()> {
+        self.start_long_task(TaskType::CleanupInvalidPictures, "清理失效图片", 0, request)
+    }
+
+    fn start_long_task(
+        &self,
+        task_type: TaskType,
+        description: &str,
+        total: u64,
+        request: TaskRequest,
+    ) -> Result<()> {
+        let _admission = self.shutdown_admission.enter()?;
+        let mut lifecycle = self.long_task.lock()?;
+        if lifecycle
+            .as_ref()
+            .is_some_and(|task| !task.handle.is_finished())
+        {
+            return Err(crate::error::Error::InconsistentTask(
+                "a long-running task is already running".into(),
+            ));
+        }
+        lifecycle.take();
         let ctx = self.create_long_task_context();
-        let id = ctx.task_id.unwrap();
-        let total = 0; // Will be updated in task_handler
-        self.task_manager.start_task(
-            id,
-            TaskType::CleanupInvalidPictures,
-            "清理失效图片".into(),
-            total,
-        )?;
-        spawn(handle_task_request(self.task_handler.clone(), ctx, request));
+        let task_id = ctx.task_id.expect("long task context must have an id");
+        self.task_manager
+            .start_task(task_id, task_type, description.into(), total)?;
+        let handle = spawn(handle_task_request(self.task_handler.clone(), ctx, request));
+        *lifecycle = Some(LongTask { task_id, handle });
         Ok(())
     }
 
@@ -1008,6 +1348,15 @@ impl Core {
             task_manager: self.task_manager.clone(),
         })
     }
+}
+
+fn publish_collection_progress(
+    task_manager: &TaskManager,
+    task_id: u64,
+    committed: u64,
+    total: u64,
+) -> Result<()> {
+    task_manager.update_progress_for(task_id, committed, total)
 }
 
 fn bounded_max_pages(max_pages: u32) -> u32 {
@@ -1093,7 +1442,14 @@ async fn handle_task_request(task_handler: Arc<TH>, ctx: Arc<TaskContext>, reque
 
 #[cfg(test)]
 mod shutdown_admission_tests {
-    use super::ShutdownAdmission;
+    use super::{
+        PersistentShutdownSummary, SchedulerShutdownStatus, ShutdownAdmission,
+        publish_collection_progress,
+    };
+    use crate::core::{TaskManager, TaskType, task_manager::TaskStatus};
+    use crate::media_downloader::DownloaderWorkerSummary;
+    use crate::media_pipeline::MediaWorkerSummary;
+    use crate::sync_executor::WorkerShutdownSummary;
     use std::{
         sync::{Arc, mpsc},
         time::Duration,
@@ -1122,5 +1478,45 @@ mod shutdown_admission_tests {
         done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         shutdown.join().unwrap();
         assert!(admission.enter().is_err());
+    }
+
+    #[test]
+    fn collection_progress_preserves_unknown_total_until_sidecar_knows_it() {
+        let manager = TaskManager::new();
+        manager
+            .start_task(7, TaskType::CollectComments, "comments".into(), 0)
+            .unwrap();
+
+        publish_collection_progress(&manager, 7, 20, 0).unwrap();
+        let task = manager.get_current().unwrap().unwrap();
+        assert_eq!(task.progress, 20);
+        assert_eq!(task.total, 0);
+        assert_eq!(task.status, TaskStatus::InProgress);
+
+        publish_collection_progress(&manager, 7, 25, 40).unwrap();
+        let task = manager.get_current().unwrap().unwrap();
+        assert_eq!(task.progress, 25);
+        assert_eq!(task.total, 40);
+    }
+
+    #[test]
+    fn shutdown_is_degraded_when_legacy_downloader_does_not_stop() {
+        let summary = PersistentShutdownSummary {
+            scheduler: SchedulerShutdownStatus::NotRunning,
+            ad_hoc: SchedulerShutdownStatus::NotRunning,
+            workers: WorkerShutdownSummary::default(),
+            database_failures: Vec::new(),
+            media: MediaWorkerSummary {
+                stopped: true,
+                join_failed: None,
+            },
+            legacy_media: DownloaderWorkerSummary {
+                stopped: false,
+                join_failed: Some("timed out".into()),
+            },
+            long_task: SchedulerShutdownStatus::NotRunning,
+        };
+
+        assert!(summary.degraded());
     }
 }

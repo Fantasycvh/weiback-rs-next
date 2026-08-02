@@ -16,7 +16,7 @@ use crate::{
     core::{Core, task_handler::TaskHandler},
     error::Result,
     exporter::ExporterImpl,
-    media_downloader::{DownloaderWorker, create_downloader},
+    media_downloader::{DownloaderWorkerTask, create_downloader},
     storage::{StorageImpl, database},
 };
 use tokio::runtime::Runtime;
@@ -46,17 +46,16 @@ impl CoreBuilder {
     /// 1. Reads the global configuration.
     /// 2. Initializes the database pool and [`StorageImpl`].
     /// 3. Sets up the [`ExporterImpl`].
-    /// 4. Configures the [`HttpClient`] and returns the downloader worker (caller must spawn it).
+    /// 4. Configures the [`HttpClient`] and starts the downloader worker under `Core` ownership.
     /// 5. Initializes the appropriate API client (Standard or DevMode).
     /// 6. Assembles the [`TaskHandler`] and finally the [`Core`] service.
     ///
     /// # Returns
-    /// A tuple of `(Arc<Core>, DownloaderWorker)`. The worker **must** be spawned
-    /// into a task (e.g., using `tokio::spawn(worker.run())`) to function.
+    /// An initialized [`Core`]. Its legacy downloader worker is started and shut down by `Core`.
     ///
     /// # Errors
     /// Returns a [`Result`] if any component fails to initialize (e.g., database connection error).
-    pub fn build(self) -> Result<(Arc<Core>, DownloaderWorker)> {
+    pub fn build(self) -> Result<Arc<Core>> {
         info!("CoreBuilder: Building Core service...");
         let main_config = get_config();
         let main_config_read_guard = main_config.read()?;
@@ -83,7 +82,8 @@ impl CoreBuilder {
 
         let (handle, worker) =
             create_downloader(DOWNLOADER_BUFFER_SIZE, http_client.main_client().clone());
-        info!("MediaDownloader created (worker must be spawned by caller)");
+        let worker = DownloaderWorkerTask::spawn(worker);
+        info!("MediaDownloader created under Core lifecycle management");
 
         #[cfg(feature = "dev-mode")]
         let (sdk_api_client, api_client) = {
@@ -101,13 +101,19 @@ impl CoreBuilder {
         };
         info!("ApiClient and SdkApiClient initialized");
 
-        let task_handler = TaskHandler::new(api_client, storage, exporter, handle)?;
+        let task_handler = TaskHandler::new(api_client, storage, exporter, handle.clone())?;
         info!("TaskHandler initialized");
 
-        let core = Arc::new(Core::new(task_handler, sdk_api_client, db_pool)?);
+        let core = Arc::new(Core::new(
+            task_handler,
+            sdk_api_client,
+            db_pool,
+            handle,
+            worker,
+        )?);
         info!("Core service built successfully.");
 
-        Ok((core, worker))
+        Ok(core)
     }
 }
 

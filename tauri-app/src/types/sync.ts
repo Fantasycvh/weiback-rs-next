@@ -95,3 +95,27 @@ export interface SaveMonitoredUserInput {
   interval_secs: number
   jitter_secs: number
 }
+
+export interface SyncDiagnostics {
+  chromium?: {
+    installed?: boolean
+    version?: string | null
+    executable?: string | null
+    status?: string
+  }
+  tauri?: {
+    webview?: string | null
+    version?: string | null
+  }
+  sidecar?: {
+    healthy?: boolean
+    version?: string | null
+    protocol_version?: string | number | null
+    status?: string
+    error?: string | null
+  }
+  auth?: Record<string, string | number | boolean | null>
+  rate_gates?: Array<Record<string, string | number | boolean | null>>
+  media?: Record<string, string | number | boolean | null>
+  [key: string]: unknown
+}

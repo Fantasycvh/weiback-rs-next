@@ -1,0 +1,144 @@
+name: Release
+
+permissions:
+  contents: write
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Validate version tag before release work
+        run: |
+          $tag = '${{ github.ref_name }}'
+          if ($tag -notmatch '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$') {
+            throw "Release requires a semantic version tag, received '$tag'."
+          }
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: yarn
+          cache-dependency-path: tauri-app/yarn.lock
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Install frontend dependencies
+        run: corepack enable; yarn install --immutable
+        working-directory: tauri-app
+      - name: Test Rust workspace
+        working-directory: .
+        run: |
+          $env:CARGO_BUILD_JOBS = '1'
+          cargo test --workspace
+      - name: Lint Rust workspace
+        working-directory: .
+        run: |
+          $env:CARGO_BUILD_JOBS = '1'
+          cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test collector sidecar
+        working-directory: sidecar
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip
+          python -m pip install --disable-pip-version-check -e .
+          $env:PYTHONPATH = (Get-Location).Path
+          python -m unittest discover -s tests -t . -v
+      - name: Validate frontend
+        working-directory: tauri-app
+        run: |
+          yarn build
+          yarn lint
+      - name: Build collector sidecar
+        working-directory: sidecar
+        run: |
+          python -m pip install --disable-pip-version-check pyinstaller
+          pyinstaller --noconfirm weiback-collector.spec
+          Copy-Item dist/weiback-collector.exe ../tauri-app/src-tauri/binaries/weiback-collector-x86_64-pc-windows-msvc.exe -Force
+      # Do not pass tagName/releaseId here: tauri-action is build-only, so no
+      # installer can reach a GitHub Release before signing and verification.
+      - name: Build Windows installers without uploading
+        uses: tauri-apps/tauri-action@v1
+        with:
+          projectPath: ./tauri-app
+      - name: Sign final Windows artifacts
+        env:
+          WEIBACK_SIGN_RELEASE_COMMAND: ${{ secrets.WEIBACK_SIGN_RELEASE_COMMAND }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WEIBACK_SIGN_RELEASE_COMMAND)) {
+            throw 'A tag release requires the protected WEIBACK_SIGN_RELEASE_COMMAND signing environment.'
+          }
+          Invoke-Expression $env:WEIBACK_SIGN_RELEASE_COMMAND
+      - name: Verify signed release gate before upload
+        run: .\scripts\verify-release.ps1 -Mode release -ReleaseDir .\tauri-app\src-tauri\target\release -WorkDir "$env:RUNNER_TEMP\weiback-release-integrity"
+      - name: Download required legacy NSIS installer
+        env:
+          WEIBACK_LEGACY_INSTALLER_URL: ${{ vars.WEIBACK_LEGACY_INSTALLER_URL }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WEIBACK_LEGACY_INSTALLER_URL)) {
+            throw 'A tag release requires repository variable WEIBACK_LEGACY_INSTALLER_URL for the legacy NSIS artifact.'
+          }
+          $legacyDir = Join-Path $env:RUNNER_TEMP 'weiback-legacy-installer'
+          New-Item -ItemType Directory -Force -Path $legacyDir | Out-Null
+          Invoke-WebRequest -Uri $env:WEIBACK_LEGACY_INSTALLER_URL -OutFile (Join-Path $legacyDir 'legacy-setup.exe')
+          if (-not (Test-Path -LiteralPath (Join-Path $legacyDir 'legacy-setup.exe') -PathType Leaf)) {
+            throw 'The required legacy NSIS artifact was not downloaded.'
+          }
+      - name: Verify Next and Legacy install lifecycle before upload
+        run: |
+          $nextInstallers = @(Get-ChildItem -LiteralPath .\tauri-app\src-tauri\target\release\bundle -Recurse -File -Include *-setup.exe,*_x64-setup.exe | Select-Object -ExpandProperty FullName -Unique)
+          if ($nextInstallers.Count -ne 1) { throw "Expected exactly one Next NSIS installer; found $($nextInstallers.Count)." }
+          .\scripts\test-windows-install-lifecycle.ps1 -NextInstaller $nextInstallers[0] -LegacyInstaller "$env:RUNNER_TEMP\weiback-legacy-installer\legacy-setup.exe" -WorkDir "$env:RUNNER_TEMP\weiback-install-lifecycle"
+      - name: Create draft release and upload verified Windows installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ github.ref_name }}'
+          if ($tag -notmatch '^v[0-9]+\..+$') {
+            throw "Release upload requires a version tag, received '$tag'."
+          }
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --draft --title $tag --notes-file CHANGELOG.md
+          }
+          $releaseDir = Resolve-Path .\tauri-app\src-tauri\target\release
+          $assets = @(
+            (Join-Path $releaseDir 'weiback-next.exe'),
+            (Get-ChildItem -LiteralPath (Join-Path $releaseDir 'bundle') -Recurse -File -Include *.msi,*-setup.exe,*_x64-setup.exe | ForEach-Object FullName)
+          )
+          gh release upload $tag @assets --clobber
+      - name: Upload verification manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-integrity-report
+          path: ${{ runner.temp }}\weiback-release-integrity\*.json
+          if-no-files-found: warn
+
+  upload-db-upgrade-tool:
+    needs: publish-windows
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Upload db-upgrade-tool
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: db-upgrade-tool
+          archive: db-upgrade-tool-$tag-$target
+          tar: unix
+          zip: windows
+          token: ${{ secrets.GITHUB_TOKEN }}

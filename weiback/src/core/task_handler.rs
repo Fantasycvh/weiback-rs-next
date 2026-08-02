@@ -439,6 +439,13 @@ impl<A: ApiClient, S: Storage, E: Exporter, D: MediaDownloader> TaskHandler<A, S
         })
     }
 
+    pub async fn get_post_detail(&self, id: i64) -> Result<Option<crate::core::task::PostInfo>> {
+        let Some(post) = self.storage.get_post(id).await? else {
+            return Ok(None);
+        };
+        Ok(Some(self.processer.build_post_info(post).await?))
+    }
+
     /// Deletes a post from local storage.
     ///
     /// # Arguments
@@ -911,6 +918,9 @@ mod local_tests {
                 reverse_order: false,
                 page: 1,
                 posts_per_page: 20,
+                content_type: None,
+                content_status: None,
+                source: None,
             },
             output: ExportOutputConfig {
                 task_name,

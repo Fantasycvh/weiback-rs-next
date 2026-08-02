@@ -9,6 +9,7 @@ import SettingsOutlined from '@mui/icons-material/SettingsOutlined'
 import PersonOutlined from '@mui/icons-material/PersonOutlined'
 import StorageOutlined from '@mui/icons-material/StorageOutlined'
 import InfoOutlined from '@mui/icons-material/InfoOutlined'
+import SyncOutlined from '@mui/icons-material/SyncOutlined'
 
 const menuItems = [
   {
@@ -18,6 +19,7 @@ const menuItems = [
     path: '/online-backup',
   },
   { key: '/explorer', label: '内容浏览', icon: <ArchiveOutlined />, path: '/explorer' },
+  { key: '/sync', label: '同步中心', icon: <SyncOutlined />, path: '/sync' },
   { key: '/manage', label: '数据维护', icon: <StorageOutlined />, path: '/manage' },
   { key: '/user', label: '用 户', icon: <PersonOutlined />, path: '/user' },
   { key: '/settings', label: '设 置', icon: <SettingsOutlined />, path: '/settings' },
