@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 - **采集器接口迁移**: 从被风控的 `m.weibo.cn` 迁移到 `weibo.com/ajax/statuses/mymblog` 与 `buildComments`，消除 live 采集 `RESPONSE_SCHEMA_CHANGED` / `AUTH_REQUIRED`
-- **Cookie 去重**: 按 cookie 名去重保留最后一条，消除多个过期 SUB 导致的 `ok=-100` 需登录误判
+- **Cookie 选择**: 同名 cookie 按 `expires` 取最新，消除多个不同过期时间的 SUB 导致的 `ok=-100` 需登录误判
 - **认证同步链路**: 登录后自动创建可用同步账号；同步中心对禁用/会话失效账号做预检；在线备份要求先登录；消除启动时前端读取登录态早于后端会话恢复的竞态
 
 ## [v0.3.1] - 2026-04-06
