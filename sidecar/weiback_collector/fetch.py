@@ -223,30 +223,70 @@ def _load_auth(session_path: str | None) -> tuple[str | None, str | None]:
         return cookie, gsid
     gsid = gsid or _string(session.get("gsid"))
     if not cookie:
-        pairs: list[str] = []
-        _collect_cookie_pairs(session.get("cookie_store"), pairs)
-        # 同名 cookie 只保留最后一条（浏览器语义：同名由更新者覆盖，重复的
-        # SUB 会让服务器按过期的第一条解析导致 401）。
-        dedup: dict[str, str] = {}
-        for pair in pairs:
-            name, sep, value = pair.partition("=")
-            if sep:
-                dedup[name] = value
-        cookie = "; ".join(f"{name}={value}" for name, value in dedup.items()) or None
+        entries: list[tuple[str, str, datetime | None]] = []
+        _collect_cookie_pairs(session.get("cookie_store"), entries)
+        # 同名 cookie 优先取 expires 最晚（最新）的一条；均无 expires 时保留
+        # 最后一条（浏览器顺序语义：更新者覆盖旧值）。多个不同过期时间的 SUB
+        # 会让服务器按过期的第一条解析导致 401（ok=-100）。
+        best: dict[str, tuple[str, datetime | None]] = {}
+        for name, value, expires in entries:
+            current = best.get(name)
+            replace = current is None
+            if not replace and current is not None:
+                current_expires = current[1]
+                if expires is None and current_expires is None:
+                    replace = True
+                elif expires is not None and (
+                    current_expires is None or expires > current_expires
+                ):
+                    replace = True
+            if replace:
+                best[name] = (value, expires)
+        cookie = (
+            "; ".join(f"{name}={value}" for name, (value, _) in best.items()) or None
+        )
     return cookie, gsid
 
 
-def _collect_cookie_pairs(value: Any, output: list[str]) -> None:
+def _parse_expires_utc(value: Any) -> datetime | None:
+    if isinstance(value, dict):
+        value = value.get("AtUtc")
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = parsedate_to_datetime(value)
+    except (ValueError, TypeError):
+        parsed = None
+    if parsed is not None:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        return datetime.fromisoformat(normalized)
+    except (ValueError, TypeError):
+        return None
+
+
+def _collect_cookie_pairs(
+    value: Any, output: list[tuple[str, str, datetime | None]]
+) -> None:
     if isinstance(value, dict):
         name = value.get("name")
         cookie_value = value.get("value")
         if isinstance(name, str) and isinstance(cookie_value, str):
-            output.append(f"{name}={cookie_value}")
+            output.append(
+                (name, cookie_value, _parse_expires_utc(value.get("expires")))
+            )
         raw_cookie = value.get("raw_cookie")
         if isinstance(raw_cookie, str):
+            entry_expires = _parse_expires_utc(value.get("expires"))
             parsed = SimpleCookie()
             parsed.load(raw_cookie)
-            output.extend(f"{key}={morsel.value}" for key, morsel in parsed.items())
+            for key, morsel in parsed.items():
+                raw_expires = morsel.get("expires") or morsel.get("max-age")
+                expires = _parse_expires_utc(raw_expires) or entry_expires
+                output.append((key, morsel.value, expires))
         for nested in value.values():
             _collect_cookie_pairs(nested, output)
     elif isinstance(value, list):

@@ -224,6 +224,64 @@ class FetcherTest(unittest.TestCase):
             self.assertIn("SUB=fresh-sub", cookie)
             self.assertNotIn("stale-sub", cookie)
 
+    def test_duplicate_cookie_names_prefer_latest_expiry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session_path = os.path.join(directory, "session.json")
+            with open(session_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "cookie_store": [
+                            {
+                                "raw_cookie": "SUB=fresh-sub; Path=/; Secure",
+                                "expires": {"AtUtc": "2026-08-27T00:00:00Z"},
+                            },
+                            {
+                                "raw_cookie": "SUB=stale-sub; Path=/; Secure",
+                                "expires": {"AtUtc": "2026-08-01T00:00:00Z"},
+                            },
+                        ]
+                    },
+                    handle,
+                )
+            captured = {}
+
+            def open_url(request, timeout):
+                captured["cookie"] = request.headers.get("Cookie")
+                return 200, b'{"data": {"list": []}}'
+
+            fetcher = WeiboHttpFetcher(session_path=session_path, open_url=open_url)
+            fetcher(KIND_USER_POSTS, {"uid": 1})
+            cookie = captured["cookie"]
+            self.assertEqual(cookie.count("SUB="), 1)
+            self.assertIn("SUB=fresh-sub", cookie)
+            self.assertNotIn("stale-sub", cookie)
+
+    def test_duplicate_cookie_names_expires_fallback_to_last(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session_path = os.path.join(directory, "session.json")
+            with open(session_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "cookie_store": [
+                            {"raw_cookie": "SUB=first-sub; Path=/; Secure"},
+                            {"raw_cookie": "SUB=last-sub; Path=/; Secure"},
+                        ]
+                    },
+                    handle,
+                )
+            captured = {}
+
+            def open_url(request, timeout):
+                captured["cookie"] = request.headers.get("Cookie")
+                return 200, b'{"data": {"list": []}}'
+
+            fetcher = WeiboHttpFetcher(session_path=session_path, open_url=open_url)
+            fetcher(KIND_USER_POSTS, {"uid": 1})
+            cookie = captured["cookie"]
+            self.assertEqual(cookie.count("SUB="), 1)
+            self.assertIn("SUB=last-sub", cookie)
+            self.assertNotIn("first-sub", cookie)
+
 
 if __name__ == "__main__":
     unittest.main()
