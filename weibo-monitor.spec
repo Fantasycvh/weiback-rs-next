@@ -62,6 +62,9 @@ hiddenimports = list(crawl4weibo_mods) + [
     'weiback.collector',
     'weiback.scheduler',
     'weiback.models',
+    'weiback.weibo_adapter',
+    'weiback.task_manager',
+    'weiback.config',
     'web.main',
 ]
 
