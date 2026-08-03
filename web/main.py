@@ -116,6 +116,9 @@ def create_app(
 
         page = max(1, page)
         limit = min(max(1, limit), 200)
+
+        total_pages = max(1, (total + limit - 1) // limit)
+        page = max(1, min(page, total_pages))
         offset = (page - 1) * limit
         rows = conn.execute(
             f"""SELECT p.id, p.uid, p.text, p.created_at, p.attitudes_count,
@@ -126,7 +129,6 @@ def create_app(
             params + [limit, offset],
         ).fetchall()
 
-        total_pages = max(1, (total + limit - 1) // limit)
         conn.close()
         return templates.TemplateResponse(
             request,
