@@ -24,7 +24,7 @@ def create_app(
     download_dir: str | None = None,
     client_factory=None,
 ) -> FastAPI:
-    app = FastAPI(title="WeiBack", version="0.4.0")
+    app = FastAPI(title="WeiBack", version="0.5.0")
 
     static_dir = STATIC_DIR
     static_dir.mkdir(parents=True, exist_ok=True)
