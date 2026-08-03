@@ -1,9 +1,40 @@
 import html
 import re
+from datetime import datetime
 from types import SimpleNamespace
 
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+_WEIBO_TIME_FORMATS = (
+    "%a %b %d %H:%M:%S %z %Y",  # "Sat Aug 01 03:10:00 +0800 2026"
+    "%a %b %d %H:%M:%S %Y",
+    "%Y-%m-%d %H:%M:%S",
+)
+
+
+def parse_weibo_datetime(value) -> datetime | None:
+    """Convert Weibo time strings to a timezone-aware datetime.
+
+    Accepts the classic ``Sat Aug 01 03:10:00 +0800 2026`` format,
+    a few common ISO-8601 variants, and passes ``datetime`` through.
+    """
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str) or not value:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    for fmt in _WEIBO_TIME_FORMATS:
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
 
 
 def parse_child_comment(raw: dict) -> SimpleNamespace:
@@ -30,7 +61,7 @@ def parse_child_comment(raw: dict) -> SimpleNamespace:
         ),
         user_verified=bool(user.get("verified", False)),
         text=clean_text,
-        created_at=None,
+        created_at=parse_weibo_datetime(raw.get("created_at")),
         source=raw.get("source"),
         like_counts=raw.get("like_counts") or raw.get("like_count") or 0,
         liked=bool(raw.get("liked", False)),

@@ -319,3 +319,88 @@ class TestCreateApp:
             assert second.json()["errors"] == expected
         finally:
             task_manager.get_and_clear_errors()
+
+
+class TestCommentTreeRendering:
+    def _save_tree(self, conn):
+        from weiback.writer import save_comments
+
+        _save_post(conn, id=41, uid=100, text="带评论树的微博")
+        save_comments(conn, [
+            {
+                "id": "root-1",
+                "post_id": 41,
+                "user_screen_name": "根评论者",
+                "text": "根评论",
+                "root_id": "root-1",
+                "parent_id": None,
+                "depth": 0,
+            },
+            {
+                "id": "child-1",
+                "post_id": 41,
+                "user_screen_name": "子回复者",
+                "text": "子回复",
+                "root_id": "root-1",
+                "parent_id": "root-1",
+                "depth": 1,
+            },
+            {
+                "id": "grandchild-1",
+                "post_id": 41,
+                "user_screen_name": "孙回复者",
+                "text": "孙回复",
+                "root_id": "root-1",
+                "parent_id": "child-1",
+                "depth": 2,
+            },
+            {
+                "id": "root-2",
+                "post_id": 41,
+                "user_screen_name": "第二个根评论者",
+                "text": "第二个根评论",
+                "root_id": "root-2",
+                "parent_id": None,
+                "depth": 0,
+            },
+        ])
+        conn.commit()
+
+    def test_renders_multilevel_comment_tree(self, db_path, conn):
+        self._save_tree(conn)
+
+        from web.main import create_app
+        resp = TestClient(create_app(db_path)).get("/posts/41")
+
+        assert resp.status_code == 200
+        html = resp.text
+        assert "根评论" in html
+        assert "子回复" in html
+        assert "孙回复" in html
+        assert "第二个根评论" in html
+        # 孙回复应嵌套在子回复之下（按出现顺序验证层级）
+        assert html.index("根评论") < html.index("子回复") < html.index("孙回复")
+        # 缩进层级体现递归嵌套
+        assert "孙回复" in html
+        assert html.count("comment-replies") >= 2
+
+    def test_comment_tree_groups_under_root(self, db_path, conn):
+        self._save_tree(conn)
+
+        from web.main import _build_comment_tree
+        conn2 = __import__("weiback.writer", fromlist=["connect"]).connect(db_path)
+        try:
+            comments = [dict(r) for r in conn2.execute(
+                "SELECT * FROM comments WHERE post_id=41 ORDER BY rowid"
+            ).fetchall()]
+            media = {}
+            tree = _build_comment_tree(comments, media)
+        finally:
+            conn2.close()
+
+        assert [c["id"] for c in tree] == ["root-1", "root-2"]
+        root = tree[0]
+        assert [c["id"] for c in root["replies"]] == ["child-1"]
+        child = root["replies"][0]
+        assert [c["id"] for c in child["replies"]] == ["grandchild-1"]
+        assert tree[1]["replies"] == []

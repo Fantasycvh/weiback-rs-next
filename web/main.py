@@ -328,24 +328,20 @@ def _get_media(conn, owner_type: str, owner_id: str) -> list[dict]:
 
 
 def _build_comment_tree(comments: list[dict], media: dict[str, list[dict]]) -> list[dict]:
-    roots: list[dict] = []
-    roots_by_id: dict[str, dict] = {}
-    replies: list[dict] = []
+    by_id: dict[str, dict] = {}
     for comment in comments:
         comment["media"] = media.get(comment["id"], [])
         comment["replies"] = []
-        if comment["depth"] == 0 or comment["root_id"] == comment["id"]:
-            roots.append(comment)
-            roots_by_id[comment["id"]] = comment
-        else:
-            replies.append(comment)
+        by_id[comment["id"]] = comment
 
-    for reply in replies:
-        root = roots_by_id.get(reply["root_id"])
-        if root is None:
-            roots.append(reply)
+    roots: list[dict] = []
+    for comment in comments:
+        parent_id = comment.get("parent_id")
+        parent = by_id.get(parent_id) if parent_id else None
+        if parent is None or parent is comment:
+            roots.append(comment)
         else:
-            root["replies"].append(reply)
+            parent["replies"].append(comment)
     return roots
 
 

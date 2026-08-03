@@ -267,6 +267,157 @@ class TestSyncUser:
         }
 
 
+class TestParseChildCommentCreatedAt:
+    def test_parses_weibo_time_string(self):
+        from weiback.collector import _to_rfc3339
+        from weiback.weibo_adapter import parse_child_comment
+
+        raw = {
+            "id": "c200000000000000001",
+            "text": "回复",
+            "created_at": "Sat Aug 01 03:10:00 +0800 2026",
+            "user": {"id": "2000000011", "screen_name": "回复用户A"},
+        }
+        parsed = parse_child_comment(raw)
+        assert parsed.created_at is not None
+        assert "+08:00" in _to_rfc3339(parsed.created_at)
+
+    def test_missing_created_at_is_none(self):
+        from weiback.weibo_adapter import parse_child_comment
+
+        parsed = parse_child_comment({"id": "c1", "text": "无时间"})
+        assert parsed.created_at is None
+
+
+class TestCommentToDictStringCreatedAt:
+    def test_string_created_at_does_not_crash(self):
+        from weiback.collector import _comment_to_dict
+
+        comment = MockPost(
+            id="c_001",
+            text="说得好",
+            created_at="Fri Jul 31 12:00:00 +0800 2026",
+        )
+        d = _comment_to_dict(comment, post_id=1001)
+        assert d["created_at"] is not None
+        assert "+08:00" in d["created_at"]
+
+    def test_iso_string_created_at_preserved(self):
+        from weiback.collector import _comment_to_dict
+
+        comment = MockPost(id="c_002", text="ISO", created_at="2026-07-31T12:00:00+08:00")
+        d = _comment_to_dict(comment, post_id=1001)
+        assert d["created_at"].startswith("2026-07-31T12:00:00")
+
+
+class TestBackfillBuildsTree:
+    def test_reply_comments_get_tree_structure(self, conn):
+        from weiback.collector import backfill_comments
+        from weiback.writer import save_posts
+
+        save_posts(conn, [{"id": 200, "uid": 7, "text": "正文", "created_at": ""}])
+        root = MockPost(id="r1", text="一级评论", reply_id=None)
+        child = MockPost(id="c1", text="回复一级", reply_id="r1")
+
+        class Client:
+            def get_comments(self, post_id, page=1, use_proxy=True):
+                return [root, child], {"max": 1, "total_number": 2}
+
+        backfill_comments(conn, Client(), limit=1, post_delay=(0, 0), max_pages=None)
+
+        rows = conn.execute(
+            "SELECT id, root_id, parent_id, depth FROM comments ORDER BY id"
+        ).fetchall()
+        assert [dict(row) for row in rows] == [
+            {"id": "c1", "root_id": "r1", "parent_id": "r1", "depth": 1},
+            {"id": "r1", "root_id": "r1", "parent_id": None, "depth": 0},
+        ]
+
+    def test_tree_rows_resolves_forward_and_nested_reply_chains(self, conn):
+        from weiback.collector import _comment_tree_rows
+
+        root = MockPost(id="r1", text="根评论", reply_id=None)
+        child = MockPost(id="c1", text="回复根", reply_id="r1")
+        grandchild = MockPost(id="g1", text="回复回复", reply_id="c1")
+        rows = _comment_tree_rows([root, child, grandchild], 200)
+
+        by_id = {r["id"]: r for r in rows}
+        assert by_id["r1"]["root_id"] == "r1"
+        assert by_id["r1"]["parent_id"] is None
+        assert by_id["r1"]["depth"] == 0
+        assert by_id["c1"]["root_id"] == "r1"
+        assert by_id["c1"]["parent_id"] == "r1"
+        assert by_id["c1"]["depth"] == 1
+        assert by_id["g1"]["root_id"] == "r1"
+        assert by_id["g1"]["parent_id"] == "c1"
+        assert by_id["g1"]["depth"] == 2
+
+    def test_tree_rows_child_before_parent_still_resolves(self, conn):
+        from weiback.collector import _comment_tree_rows
+
+        child = MockPost(id="c1", text="先出现的回复", reply_id="r1")
+        root = MockPost(id="r1", text="后出现的根", reply_id=None)
+        rows = _comment_tree_rows([child, root], 200)
+
+        by_id = {r["id"]: r for r in rows}
+        assert by_id["c1"]["parent_id"] == "r1"
+        assert by_id["c1"]["depth"] == 1
+        assert by_id["c1"]["root_id"] == "r1"
+
+
+class TestBackfillAutoFetchReplies:
+    def test_auto_fetches_replies_for_roots_with_children(self, conn):
+        from weiback.collector import backfill_comments
+        from weiback.writer import save_posts
+
+        save_posts(conn, [{"id": 300, "uid": 7, "text": "正文", "created_at": ""}])
+        root = MockPost(id="r1", text="一级评论", reply_id=None, child_count=3)
+
+        class Client:
+            def get_comments(self, post_id, page=1, use_proxy=True):
+                return [root], {"max": 1, "total_number": 1}
+
+            def _request(self, url, params, use_proxy=True):
+                assert "hotFlowChild" in url
+                assert params["cid"] == "r1"
+                return {
+                    "data": [{
+                        "id": "re-1",
+                        "text": "自动抓的二级回复",
+                        "created_at": "Sat Aug 01 03:10:00 +0800 2026",
+                        "user": {"id": "9", "screen_name": "回复者"},
+                    }],
+                    "max_id": 0,
+                    "max_id_type": 0,
+                }
+
+        backfill_comments(conn, Client(), limit=1, post_delay=(0, 0), max_pages=None)
+
+        saved = conn.execute(
+            "SELECT id, root_id, parent_id, depth, created_at FROM comments WHERE id='re-1'"
+        ).fetchone()
+        assert saved is not None
+        assert dict(saved)["depth"] == 1
+        assert dict(saved)["root_id"] == "r1"
+        assert dict(saved)["created_at"] is not None
+
+    def test_root_without_children_skips_reply_fetch(self, conn):
+        from weiback.collector import backfill_comments
+        from weiback.writer import save_posts
+
+        save_posts(conn, [{"id": 301, "uid": 7, "text": "正文", "created_at": ""}])
+        root = MockPost(id="r2", text="无回复", reply_id=None)
+
+        class Client:
+            def get_comments(self, post_id, page=1, use_proxy=True):
+                return [root], {"max": 1, "total_number": 1}
+
+            def _request(self, url, params, use_proxy=True):
+                raise AssertionError("不应抓取无回复评论的二级回复")
+
+        backfill_comments(conn, Client(), limit=1, post_delay=(0, 0), max_pages=None)
+
+
 class TestFetchCommentReplies:
     def test_follows_cursor_and_saves_comment_tree(self, conn):
         from weiback.collector import fetch_comment_replies
@@ -302,7 +453,7 @@ class TestFetchCommentReplies:
         ).fetchall()
         assert [dict(row) for row in rows] == [
             {"id": "child-1", "root_id": "root-1", "parent_id": "root-1", "depth": 1},
-            {"id": "child-2", "root_id": "root-1", "parent_id": "child-1", "depth": 1},
+            {"id": "child-2", "root_id": "root-1", "parent_id": "child-1", "depth": 2},
         ]
         progress = conn.execute(
             "SELECT status, max_id, fetched_count FROM comment_reply_progress WHERE root_comment_id='root-1'"
@@ -351,6 +502,36 @@ class TestFetchCommentReplies:
         ) == 0
         assert seen[0]["max_id"] == 99
         assert seen[0]["max_id_type"] == 1
+
+    def test_reply_to_existing_child_gets_nested_depth(self, conn):
+        from weiback.collector import fetch_comment_replies
+
+        responses = [
+            {
+                "data": [self._raw_comment("child-1", reply_id="root-1")],
+                "max_id": 12,
+                "max_id_type": 0,
+            },
+            {
+                "data": [self._raw_comment("grand-1", reply_id="child-1")],
+                "max_id": 0,
+                "max_id_type": 0,
+            },
+        ]
+
+        class Client:
+            def _request(self, url, params, use_proxy=True):
+                return responses.pop(0)
+
+        fetch_comment_replies(conn, Client(), 100, "root-1", page_delay=0)
+        grand = conn.execute(
+            "SELECT root_id, parent_id, depth FROM comments WHERE id='grand-1'"
+        ).fetchone()
+        assert dict(grand) == {
+            "root_id": "root-1",
+            "parent_id": "child-1",
+            "depth": 2,
+        }
 
     @staticmethod
     def _raw_comment(comment_id, reply_id=None):

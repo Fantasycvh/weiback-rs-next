@@ -6,7 +6,7 @@ from datetime import datetime, timezone, timedelta
 
 from . import writer
 from .task_manager import TaskManager, TaskType
-from .weibo_adapter import parse_child_comment, unpack_child_comment_page
+from .weibo_adapter import parse_child_comment, parse_weibo_datetime, unpack_child_comment_page
 
 logger = logging.getLogger(__name__)
 
@@ -87,13 +87,16 @@ def _comment_to_dict(
 ) -> dict:
     comment_id = str(comment.id) if comment.id else f"{post_id}_{hash(comment)}"
     reply_id = getattr(comment, "reply_id", None)
+    created = getattr(comment, "created_at", None)
+    if not isinstance(created, datetime):
+        created = parse_weibo_datetime(created)
     return {
         "id": comment_id,
         "post_id": post_id,
         "user_id": getattr(comment, "user_id", None),
         "user_screen_name": getattr(comment, "user_screen_name", None),
         "text": getattr(comment, "text", None),
-        "created_at": _to_rfc3339(comment.created_at) if hasattr(comment, "created_at") and comment.created_at else None,
+        "created_at": _to_rfc3339(created) if created else None,
         "like_count": getattr(comment, "like_counts", 0) or 0,
         "reply_id": reply_id,
         "root_id": root_id or comment_id,
@@ -105,9 +108,95 @@ def _comment_to_dict(
         "liked": bool(getattr(comment, "liked", False)),
         "reply_text": getattr(comment, "reply_text", None),
         "pic_url": getattr(comment, "pic_url", None),
-        "child_count": getattr(comment, "child_count", 0) or 0,
+        "child_count": _comment_child_count(comment),
         "raw_data": _json_value(getattr(comment, "raw_data", None)),
     }
+
+
+def _comment_child_count(comment) -> int:
+    """Determine whether a comment has child replies worth fetching.
+
+    Prefers an explicit ``child_count``, then falls back to a
+    ``total_number`` nested in the comment's raw payload (both are how
+    Weibo reports the number of replies under a comment). Accepts both
+    objects and the row dicts produced by :func:`_comment_to_dict`.
+    """
+    if isinstance(comment, dict):
+        value = comment.get("child_count") or 0
+        if value:
+            return int(value)
+        raw = comment.get("raw_data")
+        if isinstance(raw, dict):
+            value = raw.get("total_number") or raw.get("child_count") or 0
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return 0
+        return 0
+    value = getattr(comment, "child_count", 0) or 0
+    if value:
+        return int(value)
+    raw = getattr(comment, "raw_data", None)
+    if isinstance(raw, dict):
+        value = raw.get("total_number") or raw.get("child_count") or 0
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+def _comment_tree_rows(comments, post_id: int) -> list[dict]:
+    """Build comment dicts while assigning root_id/parent_id/depth.
+
+    A comment whose ``reply_id`` points at another comment in the same
+    page becomes its child (depth + 1); otherwise it is treated as a
+    top-level root comment. ``reply_id`` pointing at a not-yet-seen id is
+    resolved in a second pass so chains built within one page work.
+    """
+    seen: dict[str, dict] = {}
+    ordered: list[dict] = []
+    unresolved: list[tuple[str, dict]] = []
+
+    for comment in comments:
+        if not comment:
+            continue
+        row = _comment_to_dict(comment, post_id)
+        reply_id = row["reply_id"]
+        if not reply_id:
+            row["root_id"] = row["id"]
+            row["parent_id"] = None
+            row["depth"] = 0
+            seen[row["id"]] = row
+            ordered.append(row)
+        else:
+            unresolved.append((str(reply_id), row))
+
+    changed = True
+    while unresolved and changed:
+        changed = False
+        remaining = []
+        for reply_id, row in unresolved:
+            parent = seen.get(reply_id)
+            if parent is None:
+                remaining.append((reply_id, row))
+                continue
+            row["root_id"] = parent["root_id"] or parent["id"]
+            row["parent_id"] = parent["id"]
+            row["depth"] = parent["depth"] + 1
+            seen[row["id"]] = row
+            ordered.append(row)
+            changed = True
+        unresolved = remaining
+
+    for reply_id, row in unresolved:
+        row["root_id"] = row["id"]
+        row["parent_id"] = None
+        row["depth"] = 0
+        seen.setdefault(row["id"], row)
+        ordered.append(row)
+
+    return ordered
 
 
 def _to_rfc3339(dt: datetime) -> str:
@@ -194,7 +283,7 @@ def sync_user(conn, client, uid: str, max_pages: int | None = None, with_comment
                     writer.save_video(conn, video_url, "", tree_post_id)
 
             if with_comments and getattr(post, "comments", None):
-                comments = [_comment_to_dict(c, post_id) for c in post.comments if c]
+                comments = _comment_tree_rows(post.comments, post_id)
                 writer.save_comments(conn, comments)
                 writer.mark_comments_synced(conn, post_id)
 
@@ -230,6 +319,7 @@ def backfill_comments(conn, client, limit: int = 50, post_delay: tuple[float, fl
         total_fetched = int(progress["fetched_count"] or 0) if progress else 0
         pages_this_run = 0
         got_comments = False
+        root_comments: list[tuple[str, object]] = []
 
         while max_pages is None or pages_this_run < max_pages:
             try:
@@ -238,12 +328,13 @@ def backfill_comments(conn, client, limit: int = 50, post_delay: tuple[float, fl
                 )
                 pages_this_run += 1
                 if comments:
-                    writer.save_comments(
-                        conn,
-                        [_comment_to_dict(c, row["id"]) for c in comments],
-                    )
+                    rows = _comment_tree_rows(comments, row["id"])
+                    writer.save_comments(conn, rows)
                     got_comments = True
-                    total_fetched += len(comments)
+                    total_fetched += len(rows)
+                    root_comments.extend(
+                        (str(r["id"]), r) for r in rows if r["depth"] == 0
+                    )
 
                 next_page = page + 1
                 max_page = int(pagination.get("max", 0) or 0)
@@ -281,12 +372,82 @@ def backfill_comments(conn, client, limit: int = 50, post_delay: tuple[float, fl
 
         if got_comments:
             fetched += 1
+            try:
+                _backfill_replies_for_post(
+                    conn, client, int(post_id), root_comments, page_delay=0.0
+                )
+            except Exception as e:
+                logger.warning(
+                    "[%d/%d] 帖子 %s 二级回复自动回补失败: %s",
+                    i,
+                    len(posts),
+                    post_id,
+                    e,
+                )
 
         if post_delay and i < len(posts):
             time.sleep(random.uniform(*post_delay))
 
     logger.info("评论回补完成: 处理 %d 帖, 有评论 %d 帖", len(posts), fetched)
     return fetched
+
+
+def _backfill_replies_for_post(
+    conn,
+    client,
+    post_id: int,
+    root_comments: list[tuple[str, object]],
+    *,
+    page_delay: float = DEFAULT_PAGE_DELAY,
+) -> int:
+    """Fetch replies for root comments that report child replies.
+
+    ``root_comments`` carries ``(comment_id, row_dict)`` pairs collected
+    during the page walk so we do not need to re-query the DB; the row
+    dict is used only for ``child_count``.
+    """
+    if not root_comments:
+        return 0
+    fetched = 0
+    for comment_id, row in root_comments:
+        child_count = _comment_child_count(row)
+        if child_count <= 0:
+            continue
+        try:
+            fetched += fetch_comment_replies(
+                conn,
+                client,
+                post_id,
+                str(comment_id),
+                page_delay=page_delay,
+            )
+        except Exception as e:
+            logger.warning("评论 %s 二级回复抓取失败: %s", comment_id, e)
+    return fetched
+
+
+def _existing_comment_depth(
+    conn, parent_id: str, post_id: int, fallback_root_id: str
+) -> int:
+    """Return depth of an already-stored comment, so nested replies nest.
+
+    If ``parent_id`` points at an existing comment of this post we return
+    ``parent.depth + 1``; otherwise the reply is a direct child of the
+    root comment (depth 1).
+    """
+    try:
+        row = conn.execute(
+            "SELECT depth FROM comments WHERE id=? AND post_id=?",
+            (parent_id, post_id),
+        ).fetchone()
+    except Exception:
+        return 1
+    if row is None:
+        return 1
+    try:
+        return int(row[0]) + 1
+    except (TypeError, ValueError):
+        return 1
 
 
 def fetch_comment_replies(
@@ -326,13 +487,16 @@ def fetch_comment_replies(
                 parsed = parse_child_comment(raw)
                 reply_id = getattr(parsed, "reply_id", None)
                 parent_id = str(reply_id) if reply_id else root_comment_id
+                depth = _existing_comment_depth(
+                    conn, parent_id, post_id, root_comment_id
+                )
                 comments.append(
                     _comment_to_dict(
                         parsed,
                         post_id,
                         root_id=root_comment_id,
                         parent_id=parent_id,
-                        depth=1,
+                        depth=depth,
                     )
                 )
 
