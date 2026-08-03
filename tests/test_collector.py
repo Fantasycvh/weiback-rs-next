@@ -23,6 +23,18 @@ class MockPost:
             setattr(self, k, v)
 
 
+def _mock_user():
+    return MockPost(
+        screen_name="作者",
+        avatar_hd=None,
+        avatar_large=None,
+        profile_image_url=None,
+        domain=None,
+        following=False,
+        follow_me=False,
+    )
+
+
 class TestPicUrlsToList:
     def test_with_urls(self):
         from weiback.collector import _pic_urls_to_list
@@ -314,17 +326,6 @@ class TestMatchContentType:
 
 
 class TestSyncUserContentType:
-    def _user(self):
-        return MockPost(
-            screen_name="作者",
-            avatar_hd=None,
-            avatar_large=None,
-            profile_image_url=None,
-            domain=None,
-            following=False,
-            follow_me=False,
-        )
-
     def test_filters_posts_by_content_type(self, conn):
         from weiback.collector import sync_user
 
@@ -340,10 +341,7 @@ class TestSyncUserContentType:
 
         class Client:
             def get_user_by_uid(self, uid):
-                return self._user()
-
-            def _user(self):
-                return TestSyncUserContentType._user(self)
+                return _mock_user()
 
             def get_user_posts(self, **kwargs):
                 return [picture, video, article] if kwargs["page"] == 1 else []
@@ -366,7 +364,7 @@ class TestSyncUserContentType:
 
         class Client:
             def get_user_by_uid(self, uid):
-                return TestSyncUserContentType._user(None)
+                return _mock_user()
 
             def get_user_posts(self, **kwargs):
                 return [repost, original] if kwargs["page"] == 1 else []
@@ -386,7 +384,7 @@ class TestSyncUserContentType:
 
         class Client:
             def get_user_by_uid(self, uid):
-                return TestSyncUserContentType._user(None)
+                return _mock_user()
 
             def get_user_posts(self, **kwargs):
                 seen.update(kwargs)
@@ -404,11 +402,19 @@ class TestBackfillPostComments:
         from weiback.writer import save_posts
 
         save_posts(conn, [{"id": 410, "uid": 7, "text": "正文", "created_at": ""}])
-        root = MockPost(id="r1", text="一级评论", reply_id=None)
 
         class Client:
-            def get_comments(self, post_id, page=1, use_proxy=True):
-                return [root], {"max": 1, "total_number": 1}
+            def _request(self, url, params, use_proxy=True, headers=None):
+                return {
+                    "ok": 1,
+                    "data": [{
+                        "id": "r1",
+                        "text": "一级评论",
+                        "created_at": "Fri Jul 31 12:00:00 +0800 2026",
+                        "user": {"id": "9", "screen_name": "评论者"},
+                    }],
+                    "max_id": 0,
+                }
 
         assert backfill_post_comments(conn, Client(), 410) is True
         rows = conn.execute("SELECT id, depth FROM comments").fetchall()
@@ -421,6 +427,210 @@ class TestBackfillPostComments:
             pass
 
         assert backfill_post_comments(conn, Client(), 9999) is False
+
+
+class TestParseChildCommentReplyCompat:
+    def test_reply_comment_id_fallback(self):
+        from weiback.weibo_adapter import parse_child_comment
+
+        parsed = parse_child_comment({"id": "x", "text": "回复", "reply_comment_id": "p1"})
+        assert parsed.reply_id == "p1"
+
+    def test_reply_id_takes_precedence(self):
+        from weiback.weibo_adapter import parse_child_comment
+
+        parsed = parse_child_comment(
+            {"id": "x", "text": "回复", "reply_id": "r1", "reply_comment_id": "p1"}
+        )
+        assert parsed.reply_id == "r1"
+
+
+class TestSyncUserLastIdBreakpoint:
+    def test_stops_when_page_only_has_old_posts(self, conn):
+        from weiback.collector import sync_user
+        from weiback.writer import save_posts
+
+        save_posts(conn, [{"id": 1000, "uid": 7, "text": "旧帖", "created_at": ""}])
+        old = MockPost(id="900", user_id="7", text="旧", created_at=None,
+                       retweeted_status=None)
+        seen = []
+
+        class Client:
+            def get_user_by_uid(self, uid):
+                return _mock_user()
+
+            def get_user_posts(self, **kwargs):
+                seen.append(kwargs["page"])
+                return [old] if kwargs["page"] == 1 else []
+
+        count = sync_user(conn, Client(), "7")
+
+        assert count == 0
+        assert seen == [1]
+        saved = {r[0] for r in conn.execute("SELECT id FROM posts").fetchall()}
+        assert saved == {1000}
+
+    def test_still_fetches_newer_posts_then_stops(self, conn):
+        from weiback.collector import sync_user
+        from weiback.writer import save_posts
+
+        save_posts(conn, [{"id": 1000, "uid": 7, "text": "旧帖", "created_at": ""}])
+        newer = MockPost(id="1005", user_id="7", text="新帖", created_at=None,
+                         retweeted_status=None)
+        older = MockPost(id="999", user_id="7", text="旧", created_at=None,
+                         retweeted_status=None)
+        seen = []
+
+        class Client:
+            def get_user_by_uid(self, uid):
+                return _mock_user()
+
+            def get_user_posts(self, **kwargs):
+                seen.append(kwargs["page"])
+                if kwargs["page"] == 1:
+                    return [newer, older]
+                return []
+
+        count = sync_user(conn, Client(), "7")
+
+        assert count == 1
+        assert seen == [1, 2]
+        saved = {r[0] for r in conn.execute("SELECT id FROM posts").fetchall()}
+        assert saved == {1000, 1005}
+
+    def test_manual_pages_ignores_last_id(self, conn):
+        from weiback.collector import sync_user
+        from weiback.writer import save_posts
+
+        save_posts(conn, [{"id": 1000, "uid": 7, "text": "旧帖", "created_at": ""}])
+        older = MockPost(id="900", user_id="7", text="旧", created_at=None,
+                         retweeted_status=None)
+        seen = []
+
+        class Client:
+            def get_user_by_uid(self, uid):
+                return _mock_user()
+
+            def get_user_posts(self, **kwargs):
+                seen.append(kwargs["page"])
+                return [older] if kwargs["page"] == 1 else []
+
+        count = sync_user(conn, Client(), "7", max_pages=2)
+
+        assert seen == [1, 2]
+        assert count == 1
+
+
+class TestSyncUserFilteredEmptyContinues:
+    def test_continues_when_page_fully_filtered(self, conn):
+        from weiback.collector import sync_user
+
+        text_post = MockPost(id="3001", user_id="7", text="纯文字", created_at=None,
+                             retweeted_status=None, pic_urls=[])
+        pic_post = MockPost(id="3002", user_id="7", text="有图", created_at=None,
+                            retweeted_status=None, pic_urls=["a.jpg"])
+        seen = []
+
+        class Client:
+            def get_user_by_uid(self, uid):
+                return MockPost(screen_name="作者", avatar_hd=None, avatar_large=None,
+                                profile_image_url=None, domain=None,
+                                following=False, follow_me=False)
+
+            def get_user_posts(self, **kwargs):
+                seen.append(kwargs["page"])
+                if kwargs["page"] == 1:
+                    return [text_post]
+                if kwargs["page"] == 2:
+                    return [pic_post]
+                return []
+
+        count = sync_user(conn, Client(), "7", max_pages=5, content_type="picture")
+
+        assert seen == [1, 2, 3]
+        assert count == 1
+        saved = {r[0] for r in conn.execute("SELECT id FROM posts").fetchall()}
+        assert saved == {3002}
+
+
+class TestBackfillBuildComments:
+    @staticmethod
+    def _raw_comment(comment_id):
+        return {
+            "id": comment_id,
+            "text": f"评论{comment_id}",
+            "created_at": "Fri Jul 31 12:00:00 +0800 2026",
+            "user": {"id": "9", "screen_name": "评论者"},
+        }
+
+    def test_backfill_uses_buildcomments_and_follows_max_id(self, conn):
+        from weiback.collector import backfill_post_comments
+        from weiback.writer import save_posts
+
+        save_posts(conn, [{"id": 500, "uid": 7, "text": "正文", "created_at": ""}])
+        responses = [
+            {"ok": 1, "data": [self._raw_comment("c1"), self._raw_comment("c2")],
+             "max_id": "abc123"},
+            {"ok": 1, "data": [self._raw_comment("c3")], "max_id": 0},
+        ]
+        seen = []
+
+        class Client:
+            def _request(self, url, params, use_proxy=True, headers=None):
+                seen.append((url, params, headers))
+                return responses.pop(0)
+
+        assert backfill_post_comments(conn, Client(), 500) is True
+
+        assert all("buildComments" in u for u, _, _ in seen)
+        assert seen[0][1]["is_reload"] == "1"
+        assert "max_id" not in seen[0][1]
+        assert seen[1][1]["is_reload"] == "0"
+        assert seen[1][1]["max_id"] == "abc123"
+        assert seen[0][2] == {"Referer": "https://weibo.com/"}
+        rows = conn.execute("SELECT id, depth FROM comments ORDER BY id").fetchall()
+        assert {r["id"]: r["depth"] for r in rows} == {"c1": 0, "c2": 0, "c3": 0}
+        progress = conn.execute(
+            "SELECT status, cursor, fetched_count FROM comments_sync_progress "
+            "WHERE post_id=500"
+        ).fetchone()
+        assert dict(progress) == {
+            "status": "complete",
+            "cursor": "0",
+            "fetched_count": 3,
+        }
+
+    def test_business_error_marks_failed(self, conn):
+        from weiback.collector import backfill_post_comments
+        from weiback.writer import save_posts
+
+        save_posts(conn, [{"id": 501, "uid": 7, "text": "正文", "created_at": ""}])
+
+        class Client:
+            def _request(self, url, params, use_proxy=True, headers=None):
+                return {"ok": -100, "msg": "登录已过期"}
+
+        assert backfill_post_comments(conn, Client(), 501) is False
+        progress = conn.execute(
+            "SELECT status, error_message FROM comments_sync_progress WHERE post_id=501"
+        ).fetchone()
+        assert progress["status"] == "failed"
+
+    def test_empty_page_completes(self, conn):
+        from weiback.collector import backfill_post_comments
+        from weiback.writer import save_posts
+
+        save_posts(conn, [{"id": 502, "uid": 7, "text": "正文", "created_at": ""}])
+
+        class Client:
+            def _request(self, url, params, use_proxy=True, headers=None):
+                return {"ok": 1, "data": [], "max_id": 0}
+
+        assert backfill_post_comments(conn, Client(), 502) is False
+        progress = conn.execute(
+            "SELECT status FROM comments_sync_progress WHERE post_id=502"
+        ).fetchone()
+        assert progress["status"] == "complete"
 
 
 class TestParseChildCommentCreatedAt:
@@ -472,12 +682,23 @@ class TestBackfillBuildsTree:
         from weiback.writer import save_posts
 
         save_posts(conn, [{"id": 200, "uid": 7, "text": "正文", "created_at": ""}])
-        root = MockPost(id="r1", text="一级评论", reply_id=None)
-        child = MockPost(id="c1", text="回复一级", reply_id="r1")
+
+        def _raw(comment_id, reply_id=None):
+            return {
+                "id": comment_id,
+                "text": "评论",
+                "reply_id": reply_id,
+                "created_at": "Fri Jul 31 12:00:00 +0800 2026",
+                "user": {"id": "9", "screen_name": "评论者"},
+            }
 
         class Client:
-            def get_comments(self, post_id, page=1, use_proxy=True):
-                return [root, child], {"max": 1, "total_number": 2}
+            def _request(self, url, params, use_proxy=True, headers=None):
+                return {
+                    "ok": 1,
+                    "data": [_raw("r1"), _raw("c1", reply_id="r1")],
+                    "max_id": 0,
+                }
 
         backfill_comments(conn, Client(), limit=1, post_delay=(0, 0), max_pages=None)
 
@@ -527,24 +748,31 @@ class TestBackfillAutoFetchReplies:
         from weiback.writer import save_posts
 
         save_posts(conn, [{"id": 300, "uid": 7, "text": "正文", "created_at": ""}])
-        root = MockPost(id="r1", text="一级评论", reply_id=None, child_count=3)
 
         class Client:
-            def get_comments(self, post_id, page=1, use_proxy=True):
-                return [root], {"max": 1, "total_number": 1}
-
-            def _request(self, url, params, use_proxy=True):
-                assert "hotFlowChild" in url
-                assert params["cid"] == "r1"
+            def _request(self, url, params, use_proxy=True, headers=None):
+                if "hotFlowChild" in url:
+                    assert params["cid"] == "r1"
+                    return {
+                        "data": [{
+                            "id": "re-1",
+                            "text": "自动抓的二级回复",
+                            "created_at": "Sat Aug 01 03:10:00 +0800 2026",
+                            "user": {"id": "9", "screen_name": "回复者"},
+                        }],
+                        "max_id": 0,
+                        "max_id_type": 0,
+                    }
                 return {
+                    "ok": 1,
                     "data": [{
-                        "id": "re-1",
-                        "text": "自动抓的二级回复",
-                        "created_at": "Sat Aug 01 03:10:00 +0800 2026",
-                        "user": {"id": "9", "screen_name": "回复者"},
+                        "id": "r1",
+                        "text": "一级评论",
+                        "total_number": 3,
+                        "created_at": "Sat Aug 01 03:00:00 +0800 2026",
+                        "user": {"id": "9", "screen_name": "评论者"},
                     }],
                     "max_id": 0,
-                    "max_id_type": 0,
                 }
 
         backfill_comments(conn, Client(), limit=1, post_delay=(0, 0), max_pages=None)
@@ -562,14 +790,21 @@ class TestBackfillAutoFetchReplies:
         from weiback.writer import save_posts
 
         save_posts(conn, [{"id": 301, "uid": 7, "text": "正文", "created_at": ""}])
-        root = MockPost(id="r2", text="无回复", reply_id=None)
 
         class Client:
-            def get_comments(self, post_id, page=1, use_proxy=True):
-                return [root], {"max": 1, "total_number": 1}
-
-            def _request(self, url, params, use_proxy=True):
-                raise AssertionError("不应抓取无回复评论的二级回复")
+            def _request(self, url, params, use_proxy=True, headers=None):
+                if "hotFlowChild" in url:
+                    raise AssertionError("不应抓取无回复评论的二级回复")
+                return {
+                    "ok": 1,
+                    "data": [{
+                        "id": "r2",
+                        "text": "无回复",
+                        "created_at": "Sat Aug 01 03:00:00 +0800 2026",
+                        "user": {"id": "9", "screen_name": "评论者"},
+                    }],
+                    "max_id": 0,
+                }
 
         backfill_comments(conn, Client(), limit=1, post_delay=(0, 0), max_pages=None)
 
@@ -709,59 +944,66 @@ class TestFetchCommentReplies:
 
 
 class TestBackfillComments:
-    def test_failure_keeps_next_page_and_retry_completes(self, conn):
+    def test_failure_keeps_next_cursor_and_retry_completes(self, conn):
         from weiback.collector import backfill_comments
         from weiback.writer import save_posts
 
         save_posts(conn, [{"id": 100, "uid": 7, "text": "正文", "created_at": ""}])
-        first_comment = MockPost(id="c1", text="第一页", reply_id=None)
+
+        def _raw(comment_id):
+            return {
+                "id": comment_id,
+                "text": "评论",
+                "created_at": "Fri Jul 31 12:00:00 +0800 2026",
+                "user": {"id": "9", "screen_name": "评论者"},
+            }
 
         class FailingClient:
             def __init__(self):
-                self.pages = []
+                self.cursors = []
 
-            def get_comments(self, post_id, page=1, use_proxy=True):
-                self.pages.append(page)
-                if page == 1:
-                    return [first_comment], {"max": 3, "total_number": 2}
+            def _request(self, url, params, use_proxy=True, headers=None):
+                self.cursors.append(params.get("max_id"))
+                if params.get("max_id") in (None, "0"):
+                    return {"ok": 1, "data": [_raw("c1")], "max_id": "abc123"}
                 raise RuntimeError("rate limited")
 
         failing = FailingClient()
         assert backfill_comments(
             conn, failing, limit=1, post_delay=(0, 0), max_pages=None
         ) == 1
-        assert failing.pages == [1, 2]
+        assert failing.cursors == [None, "abc123"]
         progress = conn.execute(
             "SELECT status, cursor, fetched_count, error_message "
             "FROM comments_sync_progress WHERE post_id=100"
         ).fetchone()
         assert progress["status"] == "failed"
-        assert progress["cursor"] == "2"
+        assert progress["cursor"] == "abc123"
         assert progress["fetched_count"] == 1
         assert "rate limited" in progress["error_message"]
 
-        second_comment = MockPost(id="c2", text="第二页", reply_id=None)
-
         class RetryClient:
             def __init__(self):
-                self.pages = []
+                self.cursors = []
 
-            def get_comments(self, post_id, page=1, use_proxy=True):
-                self.pages.append(page)
-                return [second_comment], {"max": 2, "total_number": 2}
+            def _request(self, url, params, use_proxy=True, headers=None):
+                self.cursors.append(params.get("max_id"))
+                if params.get("max_id") == "abc123":
+                    return {"ok": 1, "data": [_raw("c2")], "max_id": 0}
+                return {"ok": 1, "data": [_raw("c1")], "max_id": "abc123"}
 
         retry = RetryClient()
         assert backfill_comments(
             conn, retry, limit=1, post_delay=(0, 0), max_pages=None
         ) == 1
-        assert retry.pages == [2]
+        assert retry.cursors == ["abc123"]
         progress = conn.execute(
             "SELECT status, cursor, fetched_count, error_message "
             "FROM comments_sync_progress WHERE post_id=100"
         ).fetchone()
         assert dict(progress) == {
             "status": "complete",
-            "cursor": "3",
+            "cursor": "0",
             "fetched_count": 2,
             "error_message": None,
         }
@@ -774,24 +1016,34 @@ class TestBackfillComments:
 
         class Client:
             def __init__(self):
-                self.pages = []
+                self.cursors = []
 
-            def get_comments(self, post_id, page=1, use_proxy=True):
-                self.pages.append(page)
-                comment = MockPost(id=f"c{page}", text="评论", reply_id=None)
-                return [comment], {"max": 3, "total_number": 3}
+            def _request(self, url, params, use_proxy=True, headers=None):
+                self.cursors.append(params.get("max_id"))
+                if params.get("max_id") in (None, "0"):
+                    return {"ok": 1, "data": [TestBackfillComments._raw("c1")], "max_id": "p1"}
+                return {"ok": 1, "data": [TestBackfillComments._raw("c2")], "max_id": 0}
 
         client = Client()
         backfill_comments(conn, client, limit=1, post_delay=(0, 0), max_pages=1)
         backfill_comments(conn, client, limit=1, post_delay=(0, 0), max_pages=1)
 
-        assert client.pages == [1, 2]
+        assert client.cursors == [None, "p1"]
         progress = conn.execute(
             "SELECT status, cursor, fetched_count FROM comments_sync_progress "
             "WHERE post_id=101"
         ).fetchone()
         assert dict(progress) == {
-            "status": "running",
-            "cursor": "3",
+            "status": "complete",
+            "cursor": "0",
             "fetched_count": 2,
+        }
+
+    @staticmethod
+    def _raw(comment_id):
+        return {
+            "id": comment_id,
+            "text": "评论",
+            "created_at": "Fri Jul 31 12:00:00 +0800 2026",
+            "user": {"id": "9", "screen_name": "评论者"},
         }

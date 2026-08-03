@@ -6,13 +6,21 @@ from datetime import datetime, timezone, timedelta
 
 from . import writer
 from .task_manager import TaskManager, TaskType
-from .weibo_adapter import parse_child_comment, parse_weibo_datetime, unpack_child_comment_page
+from .weibo_adapter import (
+    parse_child_comment,
+    parse_weibo_datetime,
+    unpack_build_comments_page,
+    unpack_child_comment_page,
+)
 
 logger = logging.getLogger(__name__)
 
 TZ_CST = timezone(timedelta(hours=8))
 
 DEFAULT_PAGE_DELAY = 3.0
+
+_COMMENTS_URL = "https://weibo.com/ajax/statuses/buildComments"
+_COMMENTS_REFERER = "https://weibo.com/"
 
 
 def _pic_urls_to_list(post) -> list[str]:
@@ -208,6 +216,19 @@ def _to_rfc3339(dt: datetime) -> str:
 SAFETY_MAX_PAGES = 1000
 
 
+def _drop_synced_posts(posts: list, last_id: int) -> list:
+    """截断已同步过的旧帖（微博按 id 倒序返回，遇到 <= last_id 即停）。"""
+    kept: list = []
+    for post in posts:
+        try:
+            if int(post.id) <= last_id:
+                break
+        except (TypeError, ValueError):
+            pass
+        kept.append(post)
+    return kept
+
+
 def _match_content_type(post, content_type: str) -> bool:
     """本地判断微博是否属于指定内容类型。
 
@@ -266,7 +287,12 @@ def sync_user(conn, client, uid: str, max_pages: int | None = None, with_comment
         )
 
     new_count = 0
-    page_limit = max_pages if max_pages and max_pages > 0 else SAFETY_MAX_PAGES
+    if max_pages is not None and max_pages > 0:
+        manual = True
+        page_limit: int = max_pages
+    else:
+        manual = False
+        page_limit = SAFETY_MAX_PAGES
     for page in range(1, page_limit + 1):
         try:
             posts = client.get_user_posts(
@@ -282,13 +308,26 @@ def sync_user(conn, client, uid: str, max_pages: int | None = None, with_comment
                 time.sleep(page_delay)
             continue
 
+        if not posts:
+            if not manual:
+                logger.info("翻页结束: uid=%s, 第 %d 页无数据", uid, page)
+            break
+
+        # 增量断点：仅定时/全量同步（未指定页数）启用
+        if not manual and last_id:
+            posts = _drop_synced_posts(posts, last_id)
+            if not posts:
+                logger.info("已达已同步断点: uid=%s 第 %d 页无新帖", uid, page)
+                break
+
         if content_type and content_type != "all":
             posts = [p for p in posts if _match_content_type(p, content_type)]
 
         if not posts:
-            if max_pages is None:
-                logger.info("翻页结束: uid=%s, 第 %d 页无数据", uid, page)
-            break
+            # 该页有数据但全部被类型过滤掉，继续翻页
+            if page_delay:
+                time.sleep(page_delay)
+            continue
 
         batch = []
         batch_ids: set[int] = set()
@@ -361,11 +400,33 @@ def backfill_comments(conn, client, limit: int = 50, post_delay: tuple[float, fl
     return fetched
 
 
+def _fetch_comments_page(client, post_id: str, max_id: str) -> tuple[list[dict], str]:
+    """Fetch one buildComments page; returns (raw_items, next_max_id)."""
+    params = {
+        "is_reload": "1",
+        "id": post_id,
+        "is_show_bulletin": "2",
+        "is_mix": "0",
+        "count": "20",
+        "flow": "0",
+    }
+    if max_id not in ("", "0", None):
+        params["is_reload"] = "0"
+        params["max_id"] = max_id
+    response = client._request(
+        _COMMENTS_URL,
+        params=params,
+        use_proxy=True,
+        headers={"Referer": _COMMENTS_REFERER},
+    )
+    return unpack_build_comments_page(response)
+
+
 def _backfill_one_post(conn, client, row: dict, *, max_pages: int | None = None) -> bool:
     """回补单个帖子的全部评论页与二级回复。返回是否抓到评论。"""
     post_id = str(row["id"])
     progress = writer.get_comments_progress(conn, row["id"])
-    page = int(progress["cursor"] or 1) if progress else 1
+    cursor = progress["cursor"] if progress else "0"
     total_fetched = int(progress["fetched_count"] or 0) if progress else 0
     pages_this_run = 0
     got_comments = False
@@ -373,12 +434,11 @@ def _backfill_one_post(conn, client, row: dict, *, max_pages: int | None = None)
 
     while max_pages is None or pages_this_run < max_pages:
         try:
-            comments, pagination = client.get_comments(
-                post_id, page=page, use_proxy=True
-            )
+            raw_comments, next_max_id = _fetch_comments_page(client, post_id, cursor)
             pages_this_run += 1
-            if comments:
-                rows = _comment_tree_rows(comments, row["id"])
+            if raw_comments:
+                parsed = [c for c in (parse_child_comment(r) for r in raw_comments) if c]
+                rows = _comment_tree_rows(parsed, row["id"])
                 writer.save_comments(conn, rows)
                 got_comments = True
                 total_fetched += len(rows)
@@ -386,18 +446,16 @@ def _backfill_one_post(conn, client, row: dict, *, max_pages: int | None = None)
                     (str(r["id"]), r) for r in rows if r["depth"] == 0
                 )
 
-            next_page = page + 1
-            max_page = int(pagination.get("max", 0) or 0)
-            complete = not comments or (max_page > 0 and page >= max_page)
+            complete = not raw_comments or next_max_id in ("", "0", None)
             writer.save_comments_progress(
                 conn,
                 post_id=row["id"],
                 status="complete" if complete else "running",
-                cursor=str(next_page),
+                cursor=next_max_id or "0",
                 fetched_count=total_fetched,
             )
             conn.commit()
-            page = next_page
+            cursor = next_max_id or "0"
             if complete:
                 break
         except Exception as e:
@@ -405,12 +463,12 @@ def _backfill_one_post(conn, client, row: dict, *, max_pages: int | None = None)
                 conn,
                 post_id=row["id"],
                 status="failed",
-                cursor=str(page),
+                cursor=cursor,
                 fetched_count=total_fetched,
                 error_message=str(e),
             )
             conn.commit()
-            logger.warning("帖子 %s 评论第 %d 页抓取失败: %s", post_id, page, e)
+            logger.warning("帖子 %s 评论第 %d 页抓取失败: %s", post_id, pages_this_run, e)
             break
 
     if got_comments:
