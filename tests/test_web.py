@@ -321,6 +321,102 @@ class TestCreateApp:
             task_manager.get_and_clear_errors()
 
 
+class TestManualBackup:
+    def test_backup_page_returns_html(self, db_path):
+        from web.main import create_app
+        resp = TestClient(create_app(db_path)).get("/backup")
+        assert resp.status_code == 200
+        assert "手动抓取" in resp.text
+        assert "开始备份" in resp.text
+
+    def test_backup_page_lists_monitored_users(self, db_path, conn):
+        from weiback.writer import add_monitored_user
+
+        add_monitored_user(conn, "123456", "测试用户")
+        from web.main import create_app
+        resp = TestClient(create_app(db_path)).get("/backup")
+
+        assert resp.status_code == 200
+        assert "测试用户" in resp.text
+        assert 'value="123456"' in resp.text
+
+    def test_backup_start_runs_sync_with_selected_options(self, db_path, conn, monkeypatch):
+        import time
+        from web.main import create_app
+
+        captured = {}
+
+        def fake_sync(conn, client, uid, **kw):
+            captured["uid"] = uid
+            captured.update(kw)
+            return 3
+
+        monkeypatch.setattr("weiback.browser.setup_playwright", lambda: None)
+        monkeypatch.setattr("weiback.collector.sync_user", fake_sync)
+
+        class FakeClient:
+            pass
+
+        monkeypatch.setattr("crawl4weibo.WeiboClient", FakeClient)
+
+        resp = TestClient(create_app(db_path), follow_redirects=False).post(
+            "/backup/start",
+            data={
+                "uid": "999",
+                "content_type": "original",
+                "pages": "3",
+                "with_comments": "1",
+                "comment_limit": "20",
+            },
+        )
+        assert resp.status_code == 303
+        assert resp.headers["location"] == "/backup"
+
+        deadline = time.time() + 5
+        while time.time() < deadline and "content_type" not in captured:
+            time.sleep(0.05)
+        assert captured["uid"] == "999"
+        assert captured["content_type"] == "original"
+        assert captured["max_pages"] == 3
+        assert captured["with_comments"] is True
+        assert captured["comment_limit"] == 20
+
+    def test_fetch_post_comments_runs_backfill(self, db_path, conn, monkeypatch):
+        import time
+        from web.main import create_app
+
+        _save_post(conn, id=77, uid=100, text="待回补评论")
+        captured = {}
+
+        def fake_backfill(conn, client, post_id, **kw):
+            captured["post_id"] = post_id
+            return True
+
+        monkeypatch.setattr("weiback.browser.setup_playwright", lambda: None)
+        monkeypatch.setattr("weiback.collector.backfill_post_comments", fake_backfill)
+
+        class FakeClient:
+            pass
+
+        monkeypatch.setattr("crawl4weibo.WeiboClient", FakeClient)
+
+        resp = TestClient(create_app(db_path), follow_redirects=False).post(
+            "/posts/77/fetch-comments"
+        )
+        assert resp.status_code == 303
+        assert resp.headers["location"] == "/posts/77"
+
+        deadline = time.time() + 5
+        while time.time() < deadline and "post_id" not in captured:
+            time.sleep(0.05)
+        assert captured["post_id"] == 77
+
+    def test_fetch_post_comments_missing_post_404(self, db_path):
+        from web.main import create_app
+        resp = TestClient(create_app(db_path)).post("/posts/8888/fetch-comments")
+        assert resp.status_code == 404
+
+
 class TestCommentTreeRendering:
     def _save_tree(self, conn):
         from weiback.writer import save_comments

@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from weiback import writer, collector
-from weiback.task_manager import TaskManager
+from weiback.task_manager import TaskManager, TaskType
 
 logger = logging.getLogger("web")
 TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
@@ -222,6 +222,103 @@ def create_app(
             return RedirectResponse(f"/posts/{root['post_id']}", status_code=303)
         finally:
             conn.close()
+
+    @app.get("/backup", response_class=HTMLResponse)
+    async def backup_page(request: Request):
+        conn = get_conn()
+        users = writer.get_all_monitored_users(conn)
+        conn.close()
+        return templates.TemplateResponse(
+            request,
+            "backup.html",
+            {"users": users},
+        )
+
+    @app.post("/backup/start")
+    async def backup_start(
+        uid: str = Form(...),
+        content_type: str = Form("all"),
+        pages: int = Form(1),
+        with_comments: str | None = Form(None),
+        comment_limit: int = Form(10),
+    ):
+        if not uid.strip():
+            raise HTTPException(status_code=400, detail="uid 不能为空")
+        try:
+            TaskManager().start_task(
+                TaskType.SYNC_USER,
+                f"手动备份用户 {uid.strip()}（{content_type}）",
+                total=max(1, pages),
+            )
+        except RuntimeError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+
+        def _run():
+            conn = get_conn()
+            try:
+                if client_factory is not None:
+                    client = client_factory()
+                else:
+                    from crawl4weibo import WeiboClient
+                    from weiback.browser import setup_playwright
+
+                    setup_playwright()
+                    client = WeiboClient()
+                try:
+                    count = collector.sync_user(
+                        conn,
+                        client,
+                        uid.strip(),
+                        max_pages=max(1, pages),
+                        with_comments=bool(with_comments),
+                        comment_limit=max(1, min(comment_limit, 100)),
+                        content_type=content_type,
+                        task_manager=TaskManager(),
+                    )
+                    TaskManager().finish_task()
+                    logger.info("手动备份完成: uid=%s 新增 %d 条", uid, count)
+                except Exception as e:
+                    TaskManager().fail_task(str(e))
+                    logger.exception("手动备份失败 uid=%s", uid)
+            finally:
+                conn.close()
+
+        threading.Thread(target=_run, daemon=True).start()
+        return RedirectResponse("/backup", status_code=303)
+
+    @app.post("/posts/{post_id}/fetch-comments")
+    async def fetch_post_comments(post_id: int):
+        conn = get_conn()
+        try:
+            post_row = conn.execute(
+                "SELECT 1 FROM posts WHERE id=?", (post_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        if post_row is None:
+            raise HTTPException(status_code=404, detail="微博不存在")
+
+        def _run():
+            conn = get_conn()
+            try:
+                if client_factory is not None:
+                    client = client_factory()
+                else:
+                    from crawl4weibo import WeiboClient
+                    from weiback.browser import setup_playwright
+
+                    setup_playwright()
+                    client = WeiboClient()
+                try:
+                    got = collector.backfill_post_comments(conn, client, post_id)
+                    logger.info("单帖评论回补完成: post=%s got=%s", post_id, got)
+                except Exception as e:
+                    logger.exception("单帖评论回补失败 post=%s", post_id)
+            finally:
+                conn.close()
+
+        threading.Thread(target=_run, daemon=True).start()
+        return RedirectResponse(f"/posts/{post_id}", status_code=303)
 
     @app.post("/sync/now")
     async def sync_now():

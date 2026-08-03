@@ -23,7 +23,12 @@
 </article>
 {% endmacro %}
 
-<p style="margin-bottom:1rem;"><a href="/posts">返回微博列表</a></p>
+<p style="margin-bottom:1rem;">
+    <a href="/posts">返回微博列表</a>
+    <form method="post" action="/posts/{{ post.id }}/fetch-comments" style="display:inline; margin-left:1rem;">
+        <button type="submit" class="btn btn-sm">回补该帖评论</button>
+    </form>
+</p>
 
 <article class="card">
     <h2>{{ post.screen_name or post.uid }}</h2>

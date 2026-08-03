@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}WeiBack - 手动抓取{% endblock %}
+{% block content %}
+
+<div class="card">
+    <h2>手动抓取</h2>
+    <p style="color:#777; font-size:0.9rem; margin-bottom:1rem;">
+        按用户、内容类型和页数范围抓取微博。抓取在后台执行，可通过「概览」页的立即同步按钮下方的任务状态查看进度。
+    </p>
+    <form method="post" action="/backup/start" style="display:flex; flex-direction:column; gap:0.75rem; max-width:480px;">
+        <div>
+            <label>用户</label>
+            <select name="uid">
+                {% for u in users %}
+                <option value="{{ u.uid }}">{{ u.screen_name or u.uid }} ({{ u.uid }})</option>
+                {% endfor %}
+            </select>
+            <p style="color:#999; font-size:0.85rem; margin-top:0.25rem;">
+                仅列出监控用户；如需抓取其他用户请先在「监控用户」页添加。
+            </p>
+        </div>
+        <div>
+            <label>内容类型</label>
+            <select name="content_type">
+                <option value="all">全部</option>
+                <option value="original">原创</option>
+                <option value="picture">图片</option>
+                <option value="video">视频</option>
+                <option value="article">长文</option>
+            </select>
+        </div>
+        <div>
+            <label>抓取页数</label>
+            <input type="number" name="pages" value="5" min="1" max="1000" required>
+        </div>
+        <div>
+            <label style="display:flex; align-items:center; gap:0.5rem;">
+                <input type="checkbox" name="with_comments" value="1"> 一并抓取评论
+            </label>
+        </div>
+        <div>
+            <label>每帖评论条数（抓评论时有效）</label>
+            <input type="number" name="comment_limit" value="10" min="1" max="100">
+        </div>
+        <div>
+            <button type="submit" class="btn btn-primary">开始备份</button>
+        </div>
+    </form>
+</div>
+
+{% endblock %}

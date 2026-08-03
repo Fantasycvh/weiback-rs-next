@@ -208,8 +208,33 @@ def _to_rfc3339(dt: datetime) -> str:
 SAFETY_MAX_PAGES = 1000
 
 
+def _match_content_type(post, content_type: str) -> bool:
+    """本地判断微博是否属于指定内容类型。
+
+    - all: 全部
+    - original: 原创（非转发）
+    - picture: 含图片
+    - video: 含视频
+    - article: 长文
+    """
+    if content_type in ("all", None, ""):
+        return True
+    if content_type == "original":
+        if getattr(post, "retweeted_status", None) is not None:
+            return False
+        return bool(getattr(post, "is_original", True))
+    if content_type == "picture":
+        return bool(_pic_urls_to_list(post))
+    if content_type == "video":
+        return bool(getattr(post, "video_url", None))
+    if content_type == "article":
+        return bool(getattr(post, "is_long_text", False))
+    return True
+
+
 def sync_user(conn, client, uid: str, max_pages: int | None = None, with_comments: bool = False,
-              task_manager: TaskManager | None = None, page_delay: float | None = None) -> int:
+              task_manager: TaskManager | None = None, page_delay: float | None = None,
+              content_type: str = "all", comment_limit: int = 10) -> int:
     self_uid = int(uid)
     last_id = writer.get_last_post_id(conn, self_uid)
     logger.info("同步 uid=%s (最后ID=%s, max_pages=%s)", uid, last_id, max_pages or "不限")
@@ -246,15 +271,19 @@ def sync_user(conn, client, uid: str, max_pages: int | None = None, with_comment
         try:
             posts = client.get_user_posts(
                 uid=uid, page=page, expand=True,
-                with_comments=with_comments, comment_limit=10,
+                with_comments=with_comments, comment_limit=comment_limit,
             )
         except Exception as e:
             logger.warning("第 %d 页获取失败: %s", page, e)
             if task_manager:
                 task_manager.report_error("fetch_page", str(e), f"page_{page}")
+
             if page_delay:
                 time.sleep(page_delay)
             continue
+
+        if content_type and content_type != "all":
+            posts = [p for p in posts if _match_content_type(p, content_type)]
 
         if not posts:
             if max_pages is None:
@@ -313,83 +342,97 @@ def backfill_comments(conn, client, limit: int = 50, post_delay: tuple[float, fl
 
     fetched = 0
     for i, row in enumerate(posts, 1):
-        post_id = str(row["id"])
-        progress = writer.get_comments_progress(conn, row["id"])
-        page = int(progress["cursor"] or 1) if progress else 1
-        total_fetched = int(progress["fetched_count"] or 0) if progress else 0
-        pages_this_run = 0
-        got_comments = False
-        root_comments: list[tuple[str, object]] = []
-
-        while max_pages is None or pages_this_run < max_pages:
-            try:
-                comments, pagination = client.get_comments(
-                    post_id, page=page, use_proxy=True
-                )
-                pages_this_run += 1
-                if comments:
-                    rows = _comment_tree_rows(comments, row["id"])
-                    writer.save_comments(conn, rows)
-                    got_comments = True
-                    total_fetched += len(rows)
-                    root_comments.extend(
-                        (str(r["id"]), r) for r in rows if r["depth"] == 0
-                    )
-
-                next_page = page + 1
-                max_page = int(pagination.get("max", 0) or 0)
-                complete = not comments or (max_page > 0 and page >= max_page)
-                writer.save_comments_progress(
-                    conn,
-                    post_id=row["id"],
-                    status="complete" if complete else "running",
-                    cursor=str(next_page),
-                    fetched_count=total_fetched,
-                )
-                conn.commit()
-                page = next_page
-                if complete:
-                    break
-            except Exception as e:
-                writer.save_comments_progress(
-                    conn,
-                    post_id=row["id"],
-                    status="failed",
-                    cursor=str(page),
-                    fetched_count=total_fetched,
-                    error_message=str(e),
-                )
-                conn.commit()
-                logger.warning(
-                    "[%d/%d] 帖子 %s 评论第 %d 页抓取失败: %s",
-                    i,
-                    len(posts),
-                    post_id,
-                    page,
-                    e,
-                )
-                break
-
-        if got_comments:
-            fetched += 1
-            try:
-                _backfill_replies_for_post(
-                    conn, client, int(post_id), root_comments, page_delay=0.0
-                )
-            except Exception as e:
-                logger.warning(
-                    "[%d/%d] 帖子 %s 二级回复自动回补失败: %s",
-                    i,
-                    len(posts),
-                    post_id,
-                    e,
-                )
+        try:
+            if _backfill_one_post(conn, client, row, max_pages=max_pages):
+                fetched += 1
+        except Exception as e:
+            logger.warning(
+                "[%d/%d] 帖子 %s 评论回补失败: %s",
+                i,
+                len(posts),
+                row["id"],
+                e,
+            )
 
         if post_delay and i < len(posts):
             time.sleep(random.uniform(*post_delay))
 
     logger.info("评论回补完成: 处理 %d 帖, 有评论 %d 帖", len(posts), fetched)
     return fetched
+
+
+def _backfill_one_post(conn, client, row: dict, *, max_pages: int | None = None) -> bool:
+    """回补单个帖子的全部评论页与二级回复。返回是否抓到评论。"""
+    post_id = str(row["id"])
+    progress = writer.get_comments_progress(conn, row["id"])
+    page = int(progress["cursor"] or 1) if progress else 1
+    total_fetched = int(progress["fetched_count"] or 0) if progress else 0
+    pages_this_run = 0
+    got_comments = False
+    root_comments: list[tuple[str, object]] = []
+
+    while max_pages is None or pages_this_run < max_pages:
+        try:
+            comments, pagination = client.get_comments(
+                post_id, page=page, use_proxy=True
+            )
+            pages_this_run += 1
+            if comments:
+                rows = _comment_tree_rows(comments, row["id"])
+                writer.save_comments(conn, rows)
+                got_comments = True
+                total_fetched += len(rows)
+                root_comments.extend(
+                    (str(r["id"]), r) for r in rows if r["depth"] == 0
+                )
+
+            next_page = page + 1
+            max_page = int(pagination.get("max", 0) or 0)
+            complete = not comments or (max_page > 0 and page >= max_page)
+            writer.save_comments_progress(
+                conn,
+                post_id=row["id"],
+                status="complete" if complete else "running",
+                cursor=str(next_page),
+                fetched_count=total_fetched,
+            )
+            conn.commit()
+            page = next_page
+            if complete:
+                break
+        except Exception as e:
+            writer.save_comments_progress(
+                conn,
+                post_id=row["id"],
+                status="failed",
+                cursor=str(page),
+                fetched_count=total_fetched,
+                error_message=str(e),
+            )
+            conn.commit()
+            logger.warning("帖子 %s 评论第 %d 页抓取失败: %s", post_id, page, e)
+            break
+
+    if got_comments:
+        try:
+            _backfill_replies_for_post(
+                conn, client, int(post_id), root_comments, page_delay=0.0
+            )
+        except Exception as e:
+            logger.warning("帖子 %s 二级回复自动回补失败: %s", post_id, e)
+    return got_comments
+
+
+def backfill_post_comments(
+    conn, client, post_id: int, max_pages: int | None = None
+) -> bool:
+    """回补单个帖子的评论（手动触发）。返回是否抓到评论。"""
+    row = conn.execute(
+        "SELECT id FROM posts WHERE id=?", (post_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    return _backfill_one_post(conn, client, dict(row), max_pages=max_pages)
 
 
 def _backfill_replies_for_post(

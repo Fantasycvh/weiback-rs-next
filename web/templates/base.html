@@ -63,6 +63,7 @@
         <a href="/" class="{% if request.url.path == '/' %}active{% endif %}">概览</a>
         <a href="/users" class="{% if request.url.path == '/users' %}active{% endif %}">监控用户</a>
         <a href="/posts" class="{% if request.url.path == '/posts' %}active{% endif %}">微博列表</a>
+        <a href="/backup" class="{% if request.url.path == '/backup' %}active{% endif %}">手动抓取</a>
     </nav>
     <div class="container">
         {% block content %}{% endblock %}

@@ -267,6 +267,162 @@ class TestSyncUser:
         }
 
 
+class TestMatchContentType:
+    def test_all_matches_everything(self):
+        from weiback.collector import _match_content_type
+        assert _match_content_type(MockPost(id="1"), "all") is True
+        assert _match_content_type(MockPost(id="1", text="x"), "all") is True
+
+    def test_original_excludes_retweets(self):
+        from weiback.collector import _match_content_type
+        rt = MockPost(id="9")
+        post = MockPost(id="1", retweeted_status=rt)
+        assert _match_content_type(post, "original") is False
+
+    def test_original_matches_plain_post(self):
+        from weiback.collector import _match_content_type
+        post = MockPost(id="1", retweeted_status=None)
+        assert _match_content_type(post, "original") is True
+
+    def test_original_ignores_retweet_with_own_picture(self):
+        from weiback.collector import _match_content_type
+        rt = MockPost(id="9")
+        post = MockPost(id="1", retweeted_status=rt, pic_urls=["a.jpg"])
+        assert _match_content_type(post, "original") is False
+
+    def test_picture_requires_pic_urls(self):
+        from weiback.collector import _match_content_type
+        assert _match_content_type(MockPost(id="1", pic_urls=["a.jpg"]), "picture") is True
+        assert _match_content_type(MockPost(id="2", pic_urls=[]), "picture") is False
+        assert _match_content_type(MockPost(id="3"), "picture") is False
+
+    def test_video_requires_video_url(self):
+        from weiback.collector import _match_content_type
+        assert _match_content_type(MockPost(id="1", video_url="x.mp4"), "video") is True
+        assert _match_content_type(MockPost(id="2"), "video") is False
+
+    def test_article_requires_long_text(self):
+        from weiback.collector import _match_content_type
+        assert _match_content_type(MockPost(id="1", is_long_text=True), "article") is True
+        assert _match_content_type(MockPost(id="2", is_long_text=False), "article") is False
+        assert _match_content_type(MockPost(id="3"), "article") is False
+
+    def test_unknown_type_falls_back_to_all(self):
+        from weiback.collector import _match_content_type
+        assert _match_content_type(MockPost(id="1"), "unknown") is True
+        assert _match_content_type(MockPost(id="2"), "") is True
+
+
+class TestSyncUserContentType:
+    def _user(self):
+        return MockPost(
+            screen_name="作者",
+            avatar_hd=None,
+            avatar_large=None,
+            profile_image_url=None,
+            domain=None,
+            following=False,
+            follow_me=False,
+        )
+
+    def test_filters_posts_by_content_type(self, conn):
+        from weiback.collector import sync_user
+
+        picture = MockPost(id="201", user_id="7", text="图片微博", created_at=None,
+                           pic_urls=["a.jpg"], video_url=None, is_long_text=False,
+                           retweeted_status=None)
+        video = MockPost(id="202", user_id="7", text="视频微博", created_at=None,
+                         pic_urls=[], video_url="v.mp4", is_long_text=False,
+                         retweeted_status=None)
+        article = MockPost(id="203", user_id="7", text="长文微博", created_at=None,
+                           pic_urls=[], video_url=None, is_long_text=True,
+                           retweeted_status=None)
+
+        class Client:
+            def get_user_by_uid(self, uid):
+                return self._user()
+
+            def _user(self):
+                return TestSyncUserContentType._user(self)
+
+            def get_user_posts(self, **kwargs):
+                return [picture, video, article] if kwargs["page"] == 1 else []
+
+        count = sync_user(conn, Client(), "7", max_pages=2, content_type="picture")
+
+        assert count == 1
+        ids = {r[0] for r in conn.execute("SELECT id FROM posts").fetchall()}
+        assert ids == {201}
+
+    def test_original_skips_retweet_and_its_chain(self, conn):
+        from weiback.collector import sync_user
+
+        retweeted = MockPost(id="301", user_id="8", text="原文", created_at=None,
+                             retweeted_status=None)
+        repost = MockPost(id="300", user_id="7", text="转发", created_at=None,
+                          retweeted_status=retweeted)
+        original = MockPost(id="302", user_id="7", text="原创", created_at=None,
+                            retweeted_status=None)
+
+        class Client:
+            def get_user_by_uid(self, uid):
+                return TestSyncUserContentType._user(None)
+
+            def get_user_posts(self, **kwargs):
+                return [repost, original] if kwargs["page"] == 1 else []
+
+        count = sync_user(conn, Client(), "7", max_pages=2, content_type="original")
+
+        assert count == 1
+        ids = {r[0] for r in conn.execute("SELECT id FROM posts").fetchall()}
+        assert ids == {302}
+
+    def test_comment_limit_passed_to_client(self, conn):
+        from weiback.collector import sync_user
+
+        post = MockPost(id="401", user_id="7", text="正文", created_at=None,
+                        retweeted_status=None)
+        seen = {}
+
+        class Client:
+            def get_user_by_uid(self, uid):
+                return TestSyncUserContentType._user(None)
+
+            def get_user_posts(self, **kwargs):
+                seen.update(kwargs)
+                return [post] if kwargs["page"] == 1 else []
+
+        sync_user(conn, Client(), "7", max_pages=2, with_comments=True, comment_limit=30)
+
+        assert seen["with_comments"] is True
+        assert seen["comment_limit"] == 30
+
+
+class TestBackfillPostComments:
+    def test_backfills_single_post_comments(self, conn):
+        from weiback.collector import backfill_post_comments
+        from weiback.writer import save_posts
+
+        save_posts(conn, [{"id": 410, "uid": 7, "text": "正文", "created_at": ""}])
+        root = MockPost(id="r1", text="一级评论", reply_id=None)
+
+        class Client:
+            def get_comments(self, post_id, page=1, use_proxy=True):
+                return [root], {"max": 1, "total_number": 1}
+
+        assert backfill_post_comments(conn, Client(), 410) is True
+        rows = conn.execute("SELECT id, depth FROM comments").fetchall()
+        assert {r["id"]: r["depth"] for r in rows} == {"r1": 0}
+
+    def test_backfill_missing_post_returns_false(self, conn):
+        from weiback.collector import backfill_post_comments
+
+        class Client:
+            pass
+
+        assert backfill_post_comments(conn, Client(), 9999) is False
+
+
 class TestParseChildCommentCreatedAt:
     def test_parses_weibo_time_string(self):
         from weiback.collector import _to_rfc3339
